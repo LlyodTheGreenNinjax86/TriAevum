@@ -1663,6 +1663,30 @@ TEST(Oot3dPresentationPacing,
     EXPECT_EQ(interpolated3x.Composition.Interpolation, NativeVisualInterpolationMode::Fixed3x);
     EXPECT_EQ(interpolated3x.Composition.FixedSampleMultiplier, 3U);
 
+    const auto interpolated4x = ResolvePresentationPacingPolicy(FrameRateMode::Interpolated4x);
+    EXPECT_TRUE(interpolated4x.Enabled);
+    EXPECT_EQ(interpolated4x.TargetRateHz, 120U);
+    EXPECT_EQ(interpolated4x.Composition.Interpolation, NativeVisualInterpolationMode::Fixed4x);
+    EXPECT_EQ(interpolated4x.Composition.FixedSampleMultiplier, 4U);
+
+    const auto interpolated5x = ResolvePresentationPacingPolicy(FrameRateMode::Interpolated5x);
+    EXPECT_TRUE(interpolated5x.Enabled);
+    EXPECT_EQ(interpolated5x.TargetRateHz, 150U);
+    EXPECT_EQ(interpolated5x.Composition.Interpolation, NativeVisualInterpolationMode::Fixed5x);
+    EXPECT_EQ(interpolated5x.Composition.FixedSampleMultiplier, 5U);
+
+    const auto interpolated8x = ResolvePresentationPacingPolicy(FrameRateMode::Interpolated8x);
+    EXPECT_TRUE(interpolated8x.Enabled);
+    EXPECT_EQ(interpolated8x.TargetRateHz, 240U);
+    EXPECT_EQ(interpolated8x.Composition.Interpolation, NativeVisualInterpolationMode::Fixed8x);
+    EXPECT_EQ(interpolated8x.Composition.FixedSampleMultiplier, 8U);
+
+    const auto interpolated10x = ResolvePresentationPacingPolicy(FrameRateMode::Interpolated10x);
+    EXPECT_TRUE(interpolated10x.Enabled);
+    EXPECT_EQ(interpolated10x.TargetRateHz, 300U);
+    EXPECT_EQ(interpolated10x.Composition.Interpolation, NativeVisualInterpolationMode::Fixed10x);
+    EXPECT_EQ(interpolated10x.Composition.FixedSampleMultiplier, 10U);
+
     const auto uncapped =
         ResolvePresentationPacingPolicy(FrameRateMode::Uncapped);
     EXPECT_FALSE(uncapped.Enabled);

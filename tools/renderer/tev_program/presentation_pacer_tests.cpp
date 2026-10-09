@@ -5,7 +5,7 @@
 int main() {
     using namespace Oot3dNativeGame;
     using namespace std::chrono_literals;
-    for (unsigned rate : {30U, 60U, 90U}) {
+    for (unsigned rate : {30U, 60U, 90U, 120U, 150U, 240U, 300U}) {
         const auto period = std::chrono::nanoseconds(1'000'000'000 / rate);
         if (ResolveNativePacerDeadlineAction(-1ns, period) != NativePacerDeadlineAction::Wait) return 1;
         if (ResolveNativePacerDeadlineAction(period * 2, period) != NativePacerDeadlineAction::CarryDebt) return 2;

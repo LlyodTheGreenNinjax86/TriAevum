@@ -64,6 +64,10 @@ constexpr EnumNames<FrameRateMode> kFrameRateNames{
     {FrameRateMode::Original30, "Original30"},
     {FrameRateMode::Interpolated2x, "Interpolated2x"},
     {FrameRateMode::Interpolated3x, "Interpolated3x"},
+    {FrameRateMode::Interpolated4x, "Interpolated4x"},
+    {FrameRateMode::Interpolated5x, "Interpolated5x"},
+    {FrameRateMode::Interpolated8x, "Interpolated8x"},
+    {FrameRateMode::Interpolated10x, "Interpolated10x"},
     {FrameRateMode::Uncapped, "Uncapped"},
     {FrameRateMode::Interpolated2x, "Fixed60"},
 };

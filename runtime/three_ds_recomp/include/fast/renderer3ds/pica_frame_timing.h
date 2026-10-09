@@ -10,6 +10,10 @@ enum class PicaVisualInterpolationMode : uint8_t {
     Disabled,
     Fixed2x,
     Fixed3x,
+    Fixed4x,
+    Fixed5x,
+    Fixed8x,
+    Fixed10x,
     Adaptive,
 };
 
@@ -28,6 +32,14 @@ enum class PicaFrameTemporalSampleKind : uint8_t {
             return "fixed_2x";
         case PicaVisualInterpolationMode::Fixed3x:
             return "fixed_3x";
+        case PicaVisualInterpolationMode::Fixed4x:
+            return "fixed_4x";
+        case PicaVisualInterpolationMode::Fixed5x:
+            return "fixed_5x";
+        case PicaVisualInterpolationMode::Fixed8x:
+            return "fixed_8x";
+        case PicaVisualInterpolationMode::Fixed10x:
+            return "fixed_10x";
         case PicaVisualInterpolationMode::Adaptive:
             return "adaptive";
     }
@@ -48,7 +60,11 @@ struct PicaFrameCompositionPolicy {
 
     [[nodiscard]] constexpr bool FixedMultiplier() const noexcept {
         return Interpolation == PicaVisualInterpolationMode::Fixed2x ||
-               Interpolation == PicaVisualInterpolationMode::Fixed3x;
+               Interpolation == PicaVisualInterpolationMode::Fixed3x ||
+               Interpolation == PicaVisualInterpolationMode::Fixed4x ||
+               Interpolation == PicaVisualInterpolationMode::Fixed5x ||
+               Interpolation == PicaVisualInterpolationMode::Fixed8x ||
+               Interpolation == PicaVisualInterpolationMode::Fixed10x;
     }
 };
 
