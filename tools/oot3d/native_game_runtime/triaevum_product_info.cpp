@@ -11,9 +11,10 @@
 
 void WriteTriAevumProductInfo(std::ostream& output) {
     using namespace Fast::Oot3d;
-    auto graphics = GraphicsSettingsService::Preset(GraphicsPreset::Authentic);
-    // Title-owned style and source texture rules must not change the shared
-    // renderer's Authentic preset. Existing installations retain their config.
+    // A new installation starts from the Enhanced preset with the title's grass
+    // source texture rules, which no preset owns. Existing installations
+    // retain their config.
+    auto graphics = GraphicsSettingsService::Preset(GraphicsPreset::Enhanced);
     const auto defaults = nlohmann::json::parse(
 #include "triaevum_product_graphics.inc"
     );
@@ -34,6 +35,8 @@ void WriteTriAevumProductInfo(std::ostream& output) {
         {"private_title_loaded", false},
 #endif
         {"capabilities", {{"nri", kTriAevumProductNri},
+                          {"experimental_global_illumination", kTriAevumProductExperimentalGi},
+                          {"developer_tools", kTriAevumProductDeveloperTools},
 #ifdef OOT3D_NATIVE_A32_WINDOW_AVAILABLE
                           {"f1", true}, {"topscreen", true}}},
 #else

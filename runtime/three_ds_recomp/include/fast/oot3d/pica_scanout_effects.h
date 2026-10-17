@@ -13,7 +13,7 @@ namespace Fast::Oot3d {
 struct PicaScanoutPushConstants {
     uint32_t FlipY = 0;
     uint32_t AaMode = 0;
-    uint32_t Cacao = 0;
+    uint32_t AmbientOcclusion = 0;
     uint32_t Outline = 0;
     float InvWidth = 1.0F;
     float InvHeight = 1.0F;
@@ -51,7 +51,7 @@ struct PicaScanoutPolicyInput {
     uint32_t Width = 1;
     uint32_t Height = 1;
     uint32_t HiZMipCount = 1;
-    bool CacaoAvailable = false;
+    bool AmbientOcclusionAvailable = false;
     bool OutlineAvailable = false;
     bool ReflectionsAvailable = false;
     bool TemporalOutput = false;
@@ -67,8 +67,17 @@ struct PicaScanoutPolicyInput {
 [[nodiscard]] PicaScanoutPushConstants BuildPicaScanoutPushConstants(
     const PicaScanoutPolicyInput& input);
 [[nodiscard]] std::string BuildPicaScanoutVertexShader();
+// The composed source domain decides the pixel mapping: presentation reads the
+// packed native display surface in its physical-screen orientation, while an
+// offscreen consumer samples the same surface domain its own source lives in.
+enum class PicaScanoutOrientation : uint8_t {
+    PhysicalScreen,
+    Surface,
+};
 [[nodiscard]] std::string BuildPicaScanoutFragmentShader(
     bool separateSampler = false,
-    std::optional<int> diagnosticMode = std::nullopt);
+    std::optional<int> diagnosticMode = std::nullopt,
+    PicaScanoutOrientation orientation =
+        PicaScanoutOrientation::PhysicalScreen);
 
 } // namespace Fast::Oot3d

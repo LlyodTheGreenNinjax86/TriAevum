@@ -2,6 +2,7 @@
 
 #include "fast/oot3d/pica_rigid_motion.h"
 
+#include <cstdlib>
 #include <bit>
 #include <cstddef>
 #include <functional>
@@ -13,6 +14,13 @@
 
 namespace Fast::Oot3d {
 namespace {
+bool FaceNormalGuideDiagnosticRequested() {
+    static const bool requested = [] {
+        const char* value = std::getenv("OOT3D_GRAPHICS_FACE_NORMAL_GUIDE");
+        return value != nullptr && value[0] == '1';
+    }();
+    return requested;
+}
 
 void HashCombine(size_t& seed, size_t value) noexcept {
     seed ^= value + 0x9e3779b97f4a7c15ULL + (seed << 6U) +
@@ -65,7 +73,6 @@ struct InstrumentationKey {
     uint64_t CanonicalIdentity = 0;
     uint32_t ReflectionReflectivity = 0;
     uint32_t ReflectionRoughness = 0;
-    uint32_t ReflectionMaterialClass = 0;
     uint32_t RequestedFeatures = 0;
     uint16_t FramebufferWidth = 0;
     uint16_t FramebufferHeight = 0;
@@ -75,6 +82,8 @@ struct InstrumentationKey {
     uint8_t ColorWriteMask = 0;
     uint8_t CompositionDomain = 0;
     uint8_t DepthCompare = 0;
+    uint8_t PbrState = 0;
+    uint8_t ReliefTexture = 0xffU;
 
     bool operator==(const InstrumentationKey&) const = default;
 };
@@ -84,7 +93,6 @@ struct InstrumentationKeyHash {
         size_t result = std::hash<uint64_t>{}(key.CanonicalIdentity);
         HashCombine(result, key.ReflectionReflectivity);
         HashCombine(result, key.ReflectionRoughness);
-        HashCombine(result, key.ReflectionMaterialClass);
         HashCombine(result, key.RequestedFeatures);
         HashCombine(result, key.FramebufferWidth);
         HashCombine(result, key.FramebufferHeight);
@@ -94,6 +102,8 @@ struct InstrumentationKeyHash {
         HashCombine(result, key.ColorWriteMask);
         HashCombine(result, key.CompositionDomain);
         HashCombine(result, key.DepthCompare);
+        HashCombine(result, key.PbrState);
+        HashCombine(result, key.ReliefTexture);
         return result;
     }
 };
@@ -108,16 +118,36 @@ PicaShaderInstrumentationFeature ResolvePicaDrawInstrumentationFeatures(
     const bool sceneDraw =
         request.Draw.CompositionDomain ==
         ::Oot3d::Renderer::PicaCompositionDomain::Scene;
+    if (sceneDraw && Renderer3ds::PicaCompositionReceivesSurfaceLighting(request.Draw.CompositionLayer) &&
+        request.Draw.FragmentOperationMode != 3U &&
+        request.Draw.PerspectiveProjection && request.SurfaceLightingAvailable &&
+        (UsesFullSceneLighting(effects.SurfaceLighting) ||
+         (effects.SurfaceLighting == SurfaceLightingMode::NativePbr && request.Pbr.TextureSlot < 3U)) &&
+        request.TemporalVertexProgram.Hooks.SurfaceProgram() != nullptr &&
+        request.FragmentShaderHooks.Supports(PicaShaderHook::PicaLighting) &&
+        request.FragmentShaderHooks.Supports(PicaShaderHook::AfterNativeTev) &&
+        request.FragmentShaderHooks.Has(PicaShaderSemantic::ViewVector) &&
+        request.FragmentShaderHooks.Has(PicaShaderSemantic::PrimaryColorInput)) {
+        features |= PicaShaderInstrumentationFeature::NativePerPixelLighting;
+        if (UsesPbrMaterials(effects.SurfaceLighting) && request.Pbr.TextureSlot < 3U)
+            features |= PicaShaderInstrumentationFeature::PbrMaterial;
+    }
     if (sceneDraw && request.Draw.FragmentOperationMode != 3U &&
-        effects.Toon != ToonMode::Off) {
+        effects.Toon != ToonMode::Off &&
+        !HasPicaShaderInstrumentationFeature(features, PicaShaderInstrumentationFeature::PbrMaterial)) {
         features |= PicaShaderInstrumentationFeature::Toon;
     }
+    // Every scene draw overwrites motion provenance. Missing typed vertex
+    // programs still write invalid/rigid/camera provenance without clip inputs.
     if (sceneDraw && request.TemporalMotionEnabled) {
-        features |= PicaShaderInstrumentationFeature::TemporalVertex;
+        if (request.TemporalVertexProgram.ValidFor(request.VertexShaderSource))
+            features |= PicaShaderInstrumentationFeature::TemporalVertex;
         features |= PicaShaderInstrumentationFeature::ReactiveMask;
         features |= PicaShaderInstrumentationFeature::RigidMotionGuide;
     }
     if (sceneDraw && request.Draw.DirectionalShadowReceiver &&
+        UsesFullSceneLighting(effects.SurfaceLighting) &&
+        HasPicaShaderInstrumentationFeature(features, PicaShaderInstrumentationFeature::NativePerPixelLighting) &&
         request.Draw.FragmentOperationMode == 0U &&
         request.Draw.DepthTestEnabled && request.Draw.DepthWriteEnabled &&
         (request.Draw.ColorWriteMask & 0x7U) != 0U &&
@@ -125,35 +155,71 @@ PicaShaderInstrumentationFeature ResolvePicaDrawInstrumentationFeatures(
         features |=
             PicaShaderInstrumentationFeature::DirectionalShadowLighting;
     }
+    if (sceneDraw && request.Draw.PointShadowReceiver &&
+        effects.PointShadows.Mode == PointShadowMode::CubeMaps &&
+        UsesFullSceneLighting(effects.SurfaceLighting) &&
+        HasPicaShaderInstrumentationFeature(features, PicaShaderInstrumentationFeature::NativePerPixelLighting) &&
+        request.Draw.PerspectiveProjection) {
+        features |= PicaShaderInstrumentationFeature::PointShadowLighting;
+    }
     if (sceneDraw &&
-        effects.AmbientOcclusion == AmbientOcclusionMode::Cacao &&
+        effects.AmbientOcclusion != AmbientOcclusionMode::Off &&
         request.Draw.FragmentOperationMode == 0U &&
         request.Draw.DepthTestEnabled && request.Draw.DepthWriteEnabled &&
         (request.Draw.ColorWriteMask & 0x7U) != 0U) {
         features |=
             PicaShaderInstrumentationFeature::AmbientOcclusionGuide;
     }
+    // GI coverage: overlays attenuate the albedo guide's alpha.
     if (sceneDraw &&
-        (effects.AmbientOcclusion == AmbientOcclusionMode::Cacao ||
-         (effects.Toon != ToonMode::Off &&
-          effects.ToonStyle.OutlineEnabled))) {
-        features |= PicaShaderInstrumentationFeature::SceneDomainGuide;
-    }
-    if (sceneDraw &&
-        (effects.AmbientOcclusion == AmbientOcclusionMode::Cacao ||
+        (effects.AmbientOcclusion != AmbientOcclusionMode::Off ||
          (effects.Toon != ToonMode::Off &&
           effects.ToonStyle.OutlineEnabled) ||
-         effects.Reflections != ReflectionMode::Off)) {
+         effects.GlobalIllumination.Mode != GlobalIlluminationMode::Off)) {
+        features |= PicaShaderInstrumentationFeature::SceneDomainGuide;
+    }
+    // GI traces from the normal guide.
+    if (sceneDraw &&
+        (effects.AmbientOcclusion != AmbientOcclusionMode::Off ||
+         (effects.Toon != ToonMode::Off &&
+          effects.ToonStyle.OutlineEnabled) ||
+         effects.Reflections != ReflectionMode::Off ||
+         effects.GlobalIllumination.Mode != GlobalIlluminationMode::Off)) {
         features |= PicaShaderInstrumentationFeature::NormalGuide;
+    }
+    // AO texture relief belongs to the depth-writing world surfaces the AO
+    // providers shade, with one colour texture to derive it from.
+    if (HasPicaShaderInstrumentationFeature(features, PicaShaderInstrumentationFeature::NormalGuide) &&
+        effects.AmbientOcclusion != AmbientOcclusionMode::Off &&
+        effects.AoRelief != AoTextureRelief::Off && request.ReliefTexture < 3U &&
+        request.Draw.PerspectiveProjection && request.Draw.FragmentOperationMode == 0U &&
+        request.Draw.DepthTestEnabled && request.Draw.DepthWriteEnabled &&
+        (request.Draw.ColorWriteMask & 0x7U) != 0U) {
+        features |= PicaShaderInstrumentationFeature::NormalGuideTextureRelief;
     }
     if (sceneDraw && request.Draw.DepthWriteEnabled && effects.Toon != ToonMode::Off &&
         effects.ToonStyle.OutlineEnabled) {
         features |=
             PicaShaderInstrumentationFeature::NativeFogGuide | PicaShaderInstrumentationFeature::OutlineGeometryGuide;
     }
-    if (sceneDraw && effects.Reflections != ReflectionMode::Off) {
+    // The face normal of the visible surface, for its readers;
+    // OOT3D_GRAPHICS_FACE_NORMAL_GUIDE=1 also publishes it (diagnostics) for
+    // draws that already publish guides.
+    if (sceneDraw && request.Draw.DepthWriteEnabled && features != PicaShaderInstrumentationFeature::None &&
+        (EffectsReadFaceNormal(effects) || GlobalIlluminationReadsFaceNormal(effects.GlobalIllumination) ||
+         FaceNormalGuideDiagnosticRequested())) {
+        features |= PicaShaderInstrumentationFeature::FaceNormalGuide;
+    }
+    // GI specular (Brixelizer GI) is a reflection source resolved through the
+    // same guide.
+    if (sceneDraw && (effects.Reflections != ReflectionMode::Off ||
+                      (effects.GlobalIllumination.Mode == GlobalIlluminationMode::BrixelizerGi &&
+                       effects.GlobalIllumination.Specular))) {
         features |=
             PicaShaderInstrumentationFeature::ReflectionMaterialGuide;
+    }
+    if (sceneDraw && effects.GlobalIllumination.Mode != GlobalIlluminationMode::Off) {
+        features |= PicaShaderInstrumentationFeature::DiffuseAlbedoGuide;
     }
     return features;
 }
@@ -174,6 +240,12 @@ InstrumentationKey BuildInstrumentationKey(
     key.CompositionDomain = static_cast<uint8_t>(
         request.Draw.CompositionDomain);
     key.DepthCompare = static_cast<uint8_t>(request.Draw.DepthCompare);
+    if (HasPicaShaderInstrumentationFeature(requestedFeatures, PicaShaderInstrumentationFeature::PbrMaterial))
+        key.PbrState = request.Pbr.TextureSlot | (request.Pbr.NativeFragmentLighting ? 4U : 0U) |
+            (request.Pbr.NativeAttenuationLuts ? 8U : 0U) | (request.Pbr.SeamSoftening ? 16U : 0U);
+    if (HasPicaShaderInstrumentationFeature(requestedFeatures,
+                                            PicaShaderInstrumentationFeature::NormalGuideTextureRelief))
+        key.ReliefTexture = request.ReliefTexture;
     const auto& blend = request.Draw.Blend;
     key.BlendStateBits =
         static_cast<uint32_t>(blend.EquationRgb) |
@@ -195,9 +267,6 @@ InstrumentationKey BuildInstrumentationKey(
                 request.ReflectionProfile->Reflectivity);
         key.ReflectionRoughness =
             std::bit_cast<uint32_t>(request.ReflectionProfile->Roughness);
-        key.ReflectionMaterialClass =
-            std::bit_cast<uint32_t>(
-                request.ReflectionProfile->MaterialClass);
     }
     return key;
 }
@@ -216,26 +285,44 @@ PicaShaderPipelineResult BuildInstrumentedVariant(
         result.Domain = PicaShaderDomain::Instrumented;
     };
 
-    if (HasPicaShaderInstrumentationFeature(
-            requestedFeatures,
-            PicaShaderInstrumentationFeature::TemporalVertex)) {
-        auto temporal = BuildPicaTemporalVertexInstrumentation(
+    const bool temporalRequested = HasPicaShaderInstrumentationFeature(
+        requestedFeatures, PicaShaderInstrumentationFeature::TemporalVertex);
+    const bool surfaceRequested = HasPicaShaderInstrumentationFeature(
+        requestedFeatures, PicaShaderInstrumentationFeature::NativePerPixelLighting);
+    // The normal guide reads the authored vertex normal wherever the typed
+    // program exposes it, whatever the lighting mode: never a normal
+    // reconstructed from depth derivatives when the model supplies its own.
+    const bool guideNormalRequested =
+        HasPicaShaderInstrumentationFeature(requestedFeatures, PicaShaderInstrumentationFeature::NormalGuide) &&
+        request.TemporalVertexProgram.Hooks.SurfaceProgram() != nullptr &&
+        request.TemporalVertexProgram.Hooks.TransformProgram() != nullptr;
+    auto fragmentFeatures = requestedFeatures;
+    bool surfaceNormalInput = false;
+    if (temporalRequested || surfaceRequested || guideNormalRequested) {
+        auto vertex = BuildPicaVertexInstrumentation(
             result.VertexShaderSource, result.VertexShaderKey,
-            request.TemporalVertexProgram);
-        result.TemporalVertexApplied = temporal.Applied;
-        result.DirectTemporalVertexProgramUsed =
-            temporal.UsedProvidedProgram;
-        if (temporal.Applied) {
-            result.VertexShaderSource = std::move(temporal.Source);
-            result.VertexShaderKey = temporal.FragmentKey;
-            apply(PicaShaderInstrumentationFeature::TemporalVertex);
+            request.TemporalVertexProgram, temporalRequested, surfaceRequested || guideNormalRequested);
+        result.TemporalVertexApplied = vertex.TemporalApplied;
+        result.DirectTemporalVertexProgramUsed = temporalRequested && vertex.UsedProvidedProgram;
+        if (vertex.Applied) {
+            result.VertexShaderSource = std::move(vertex.Source);
+            result.VertexShaderKey = vertex.FragmentKey;
+            if (vertex.TemporalApplied) apply(PicaShaderInstrumentationFeature::TemporalVertex);
+        }
+        surfaceNormalInput = vertex.SurfaceApplied;
+        result.SurfaceVertexApplied = vertex.SurfaceApplied;
+        if (!vertex.SurfaceApplied) {
+            fragmentFeatures = static_cast<PicaShaderInstrumentationFeature>(
+                static_cast<uint32_t>(fragmentFeatures) &
+                ~static_cast<uint32_t>(PicaShaderInstrumentationFeature::NativePerPixelLighting |
+                                      PicaShaderInstrumentationFeature::PbrMaterial));
         }
     }
 
     const auto fragment = BuildPicaFragmentInstrumentationVariant({
         result.FragmentShaderSource,
         result.FragmentShaderKey,
-        requestedFeatures,
+        fragmentFeatures,
         {
             request.Draw.FramebufferWidth,
             request.Draw.FramebufferHeight,
@@ -247,11 +334,13 @@ PicaShaderPipelineResult BuildInstrumentedVariant(
             request.Draw.CompositionDomain,
             request.Draw.DepthCompare,
             request.Draw.PerspectiveProjection,
+            request.Draw.IsolatedLighting,
         },
         {
-            effects.AmbientOcclusion == AmbientOcclusionMode::Cacao,
+            effects.AmbientOcclusion != AmbientOcclusionMode::Off,
             effects.Toon != ToonMode::Off &&
                 effects.ToonStyle.OutlineEnabled,
+            effects.GlobalIllumination.Mode != GlobalIlluminationMode::Off,
         },
         request.ReflectionProfile.has_value()
             ? &*request.ReflectionProfile
@@ -260,6 +349,11 @@ PicaShaderPipelineResult BuildInstrumentedVariant(
         effects.Toon,
         &effects.ToonStyle,
         true,
+        request.Pbr,
+        surfaceNormalInput,
+        request.ReliefTexture,
+        AoTextureReliefGain(effects.AoRelief),
+        result.TemporalVertexApplied,
     });
     result.ToonEligibility = fragment.ToonEligibility;
     result.ToonMaterialPath = fragment.ToonMaterialPath;
@@ -271,7 +365,9 @@ PicaShaderPipelineResult BuildInstrumentedVariant(
     result.ReactiveCoverage = fragment.ReactiveCoverage;
     result.Reactive = fragment.Reactive;
     result.RigidMotionApplied = fragment.RigidMotionApplied;
+    result.TypedNormalGuide = fragment.Applied() && fragment.TypedNormalGuide;
     result.FragmentOutputs = fragment.Outputs;
+    result.Decisions = fragment.Decisions;
     result.DirectFragmentHooksUsed =
         canonical.DirectCanonicalFragmentHooksUsed &&
         fragment.UsedProvidedHooks;
@@ -297,6 +393,12 @@ PicaShaderInstrumentationFeature ResolvePicaShaderProfileFeatures(
     bool directionalShadowLightingEnabled) noexcept {
     PicaShaderInstrumentationFeature features =
         PicaShaderInstrumentationFeature::None;
+    if (effects.SurfaceLighting != SurfaceLightingMode::Native) {
+        features |= PicaShaderInstrumentationFeature::NativePerPixelLighting;
+    }
+    if (UsesPbrMaterials(effects.SurfaceLighting)) {
+        features |= PicaShaderInstrumentationFeature::PbrMaterial;
+    }
     if (effects.Toon != ToonMode::Off) {
         features |= PicaShaderInstrumentationFeature::Toon;
     }
@@ -305,32 +407,47 @@ PicaShaderInstrumentationFeature ResolvePicaShaderProfileFeatures(
         features |= PicaShaderInstrumentationFeature::ReactiveMask;
         features |= PicaShaderInstrumentationFeature::RigidMotionGuide;
     }
-    if (directionalShadowLightingEnabled) {
+    if (directionalShadowLightingEnabled && UsesFullSceneLighting(effects.SurfaceLighting)) {
         features |=
             PicaShaderInstrumentationFeature::DirectionalShadowLighting;
     }
-    if (effects.AmbientOcclusion == AmbientOcclusionMode::Cacao) {
+    if (effects.AmbientOcclusion != AmbientOcclusionMode::Off) {
         features |=
             PicaShaderInstrumentationFeature::AmbientOcclusionGuide;
     }
-    if (effects.AmbientOcclusion == AmbientOcclusionMode::Cacao ||
-        (effects.Toon != ToonMode::Off &&
-         effects.ToonStyle.OutlineEnabled)) {
-        features |= PicaShaderInstrumentationFeature::SceneDomainGuide;
-    }
-    if (effects.AmbientOcclusion == AmbientOcclusionMode::Cacao ||
+    if (effects.AmbientOcclusion != AmbientOcclusionMode::Off ||
         (effects.Toon != ToonMode::Off &&
          effects.ToonStyle.OutlineEnabled) ||
-        effects.Reflections != ReflectionMode::Off) {
+        effects.GlobalIllumination.Mode != GlobalIlluminationMode::Off) {
+        features |= PicaShaderInstrumentationFeature::SceneDomainGuide;
+    }
+    if (effects.AmbientOcclusion != AmbientOcclusionMode::Off ||
+        (effects.Toon != ToonMode::Off &&
+         effects.ToonStyle.OutlineEnabled) ||
+        effects.Reflections != ReflectionMode::Off ||
+        effects.GlobalIllumination.Mode != GlobalIlluminationMode::Off) {
         features |= PicaShaderInstrumentationFeature::NormalGuide;
+    }
+    if (effects.AmbientOcclusion != AmbientOcclusionMode::Off &&
+        effects.AoRelief != AoTextureRelief::Off) {
+        features |= PicaShaderInstrumentationFeature::NormalGuideTextureRelief;
     }
     if (effects.Toon != ToonMode::Off && effects.ToonStyle.OutlineEnabled) {
         features |=
             PicaShaderInstrumentationFeature::NativeFogGuide | PicaShaderInstrumentationFeature::OutlineGeometryGuide;
     }
-    if (effects.Reflections != ReflectionMode::Off) {
+    if (features != PicaShaderInstrumentationFeature::None &&
+        (EffectsReadFaceNormal(effects) || GlobalIlluminationReadsFaceNormal(effects.GlobalIllumination) ||
+         FaceNormalGuideDiagnosticRequested()))
+        features |= PicaShaderInstrumentationFeature::FaceNormalGuide;
+    if (effects.Reflections != ReflectionMode::Off ||
+        (effects.GlobalIllumination.Mode == GlobalIlluminationMode::BrixelizerGi &&
+         effects.GlobalIllumination.Specular)) {
         features |=
             PicaShaderInstrumentationFeature::ReflectionMaterialGuide;
+    }
+    if (effects.GlobalIllumination.Mode != GlobalIlluminationMode::Off) {
+        features |= PicaShaderInstrumentationFeature::DiffuseAlbedoGuide;
     }
     return features;
 }
@@ -398,6 +515,25 @@ class PicaShaderPipelineCache::Impl final {
                     request.FragmentShaderKey &&
                 entry->Result.VertexShaderSourceIdentity == vertexSource &&
                 entry->Result.FragmentShaderSourceIdentity == fragmentSource) {
+                if (!entry->Result.DirectCanonicalFragmentHooksUsed &&
+                    request.FragmentShaderHooks.ValidFor(request.FragmentShaderSource)) {
+                    if (request.FragmentShaderHooks.Outputs !=
+                        entry->Result.CanonicalFragmentHooks.Outputs) {
+                        ++CanonicalOutputContractRejects;
+                        throw std::logic_error(
+                            "typed PICA fragment hooks contradict audited native outputs");
+                    }
+                    // A restored replay can populate this source before the live
+                    // frontend supplies its authoritative semantic contract.
+                    entry->Result.CanonicalFragmentHooks = request.FragmentShaderHooks;
+                    entry->Result.DirectCanonicalFragmentHooksUsed = true;
+                    entry->Result.DirectFragmentHooksUsed = true;
+                    entry->Result.GrassTexture0Sampled =
+                        request.FragmentShaderHooks.SamplesTexture(0U);
+                    // Re-key derived variants without invalidating references
+                    // held by draws already recorded in the current frame.
+                    entry->Identity = NextCanonicalIdentity++;
+                }
                 ++CanonicalHits;
                 CanonicalSourceIdentityFastHits +=
                     suppliedVertexIdentity + suppliedFragmentIdentity;
@@ -499,15 +635,11 @@ const PicaShaderPipelineResult& PicaShaderPipelineCache::Resolve(
     const PicaShaderInstrumentationFeature requestedFeatures =
         ResolvePicaDrawInstrumentationFeatures(request, effects);
 
-    if (HasPicaShaderInstrumentationFeature(
-            requestedFeatures,
-            PicaShaderInstrumentationFeature::TemporalVertex) &&
+    if (request.TemporalMotionEnabled &&
+        request.Draw.CompositionDomain == ::Oot3d::Renderer::PicaCompositionDomain::Scene &&
         !request.TemporalVertexProgram.ValidFor(
             request.VertexShaderSource)) {
         ++mImpl->TypedInstrumentationContractRejects;
-        throw std::logic_error(
-            "temporal PICA instrumentation requires the typed "
-            "frontend vertex program");
     }
 
     if (request.RequireNativeFidelity) {

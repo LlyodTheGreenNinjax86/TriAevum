@@ -8,9 +8,9 @@
 namespace Fast::Oot3d {
 namespace {
 
-[[nodiscard]] constexpr uint32_t ResourceBit(
+[[nodiscard]] constexpr uint64_t ResourceBit(
     EffectResource resource) noexcept {
-    return 1U << static_cast<uint32_t>(resource);
+    return uint64_t{1} << static_cast<uint32_t>(resource);
 }
 
 inline constexpr uint64_t kOot3dTransientStorageNamespace =
@@ -53,12 +53,16 @@ EffectPhysicalResidency ClassifyEffectResourceResidency(
     switch (resource) {
         case EffectResource::PicaSceneFrame:
         case EffectResource::NativeSceneView:
+        case EffectResource::PreparedShadowCasters:
         case EffectResource::ExtensionGeometry:
+        case EffectResource::SceneDistanceField:
             return EffectPhysicalResidency::Semantic;
         case EffectResource::SceneColor:
+        case EffectResource::SceneBeforeUi:
         case EffectResource::NativeDepth:
         case EffectResource::NativeShadow2D:
         case EffectResource::PresentationOutput:
+        case EffectResource::SceneComposition:
             return EffectPhysicalResidency::ExternalImage;
         case EffectResource::NormalGuide:
         case EffectResource::MaterialGuide:
@@ -66,13 +70,22 @@ EffectPhysicalResidency ClassifyEffectResourceResidency(
         case EffectResource::AmbientGuide:
         case EffectResource::FogGuide:
         case EffectResource::OutlineGeometryGuide:
+        case EffectResource::DiffuseAlbedoGuide:
             return EffectPhysicalResidency::NativeAttachment;
         case EffectResource::TemporalColor:
         case EffectResource::DirectionalShadowHistory:
         case EffectResource::DirectionalShadowMap:
+        case EffectResource::DirectionalShadowStaticCache:
+        case EffectResource::DirectionalShadowStaticHistory:
+        case EffectResource::PointShadowHistory:
+        case EffectResource::PointShadowMap:
+        case EffectResource::ContactShadowHistory:
+        case EffectResource::ContactShadowMap:
             return EffectPhysicalResidency::TemporalHistory;
         case EffectResource::HierarchicalDepth:
         case EffectResource::AmbientOcclusion:
+        case EffectResource::DiffuseIllumination:
+        case EffectResource::SpecularIllumination:
         case EffectResource::ReflectionColor:
         case EffectResource::OutlineColor:
         case EffectResource::MotionVectors:
@@ -93,10 +106,19 @@ EffectTransientStorageClass ClassifyEffectTransientStorage(
     switch (resource) {
         case EffectResource::DirectionalShadowMap:
         case EffectResource::DirectionalShadowHistory:
+        case EffectResource::DirectionalShadowStaticCache:
+        case EffectResource::DirectionalShadowStaticHistory:
+        case EffectResource::PointShadowHistory:
+        case EffectResource::PointShadowMap:
             return EffectTransientStorageClass::ShadowDepth;
         case EffectResource::HierarchicalDepth:
             return EffectTransientStorageClass::DepthPyramid;
+        case EffectResource::ContactShadowHistory:
+        case EffectResource::ContactShadowMap:
+            return EffectTransientStorageClass::SinglePlaneImage;
         case EffectResource::AmbientOcclusion:
+        case EffectResource::DiffuseIllumination:
+        case EffectResource::SpecularIllumination:
         case EffectResource::ReflectionColor:
         case EffectResource::OutlineColor:
         case EffectResource::MotionVectors:

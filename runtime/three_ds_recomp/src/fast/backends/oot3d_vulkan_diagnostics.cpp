@@ -1,3 +1,4 @@
+#include "fast/renderer3ds/virtual_shadow_map.h"
 #include "fast/backends/oot3d_vulkan_diagnostics.h"
 #include "fast/oot3d/pica_scene_frame.h"
 #include "fast/renderer3ds/pica_composition_schedule.h"
@@ -80,12 +81,14 @@ nlohmann::json FrameToJson(const Oot3dVulkanFrameDiagnostics& frame) {
                             frame.Gpu.ToonRasterMilliseconds);
     PutOptionalMilliseconds(gpu, "grass_ms",
                             frame.Gpu.GrassMilliseconds);
-    PutOptionalMilliseconds(gpu, "cacao_ms",
-                            frame.Gpu.CacaoMilliseconds);
+    PutOptionalMilliseconds(gpu, "ambient_occlusion_ms",
+                            frame.Gpu.AmbientOcclusionMilliseconds);
     PutOptionalMilliseconds(gpu, "depth_preparation_ms",
                             frame.Gpu.DepthPreparationMilliseconds);
     PutOptionalMilliseconds(gpu, "reflection_ms",
                             frame.Gpu.ReflectionMilliseconds);
+    PutOptionalMilliseconds(gpu, "global_illumination_ms",
+                            frame.Gpu.GlobalIlluminationMilliseconds);
     PutOptionalMilliseconds(gpu, "motion_vectors_ms",
                             frame.Gpu.MotionVectorsMilliseconds);
     PutOptionalMilliseconds(gpu, "scene_composite_ms",
@@ -542,6 +545,27 @@ nlohmann::json FrameToJson(const Oot3dVulkanFrameDiagnostics& frame) {
           frame.NriDirectionalShadowLightDirectionY },
         { "nri_directional_shadow_light_direction_z",
           frame.NriDirectionalShadowLightDirectionZ },
+        {"nri_vsm_requested_pages", frame.NriVirtualShadowRequestedPageCount},
+        {"nri_vsm_resident_pages", frame.NriVirtualShadowResidentPageCount},
+        {"nri_vsm_reused_pages", frame.NriVirtualShadowReusedPageCount},
+        {"nri_vsm_updated_pages", frame.NriVirtualShadowUpdatedPageCount},
+        {"nri_vsm_static_updated_pages", frame.NriVirtualShadowStaticUpdatedPageCount},
+        {"nri_vsm_static_reused_pages", frame.NriVirtualShadowStaticReusedPageCount},
+        {"nri_vsm_empty_pages", frame.NriVirtualShadowEmptyPageCount},
+        {"nri_vsm_evicted_pages", frame.NriVirtualShadowEvictedPageCount},
+        {"nri_vsm_unmapped_pages", frame.NriVirtualShadowUnmappedPageCount},
+        {"nri_vsm_atlas_bytes", frame.NriVirtualShadowAtlasBytes},
+        {"nri_vsm_pending_pages", frame.NriVirtualShadowPendingPageCount},
+        {"nri_vsm_keyframe_displayed_layouts", frame.NriVirtualShadowKeyframeDisplayedLayoutCount},
+        {"nri_vsm_keyframe_construction_pages", frame.NriVirtualShadowKeyframeConstructionPageCount},
+        {"nri_vsm_keyframe_construction_budget", frame.NriVirtualShadowKeyframeConstructionBudget},
+        {"nri_vsm_keyframe_cuts", frame.NriVirtualShadowKeyframeCutCount},
+        {"nri_vsm_keyframe_rotations", frame.NriVirtualShadowKeyframeRotationCount},
+        {"nri_vsm_keyframe_weight", frame.NriVirtualShadowKeyframeWeight},
+        {"nri_vsm_keyframe_lag_degrees", frame.NriVirtualShadowKeyframeLagDegrees},
+        {"nri_vsm_keyframe_direction_x", frame.NriVirtualShadowKeyframeDirectionX},
+        {"nri_vsm_keyframe_direction_y", frame.NriVirtualShadowKeyframeDirectionY},
+        {"nri_vsm_keyframe_direction_z", frame.NriVirtualShadowKeyframeDirectionZ},
         { "nri_directional_shadow_receiver_eligible_draw_count",
           frame.NriDirectionalShadowReceiverEligibleDrawCount },
         { "nri_directional_shadow_receiver_lighting_available_draw_count",
@@ -570,6 +594,33 @@ nlohmann::json FrameToJson(const Oot3dVulkanFrameDiagnostics& frame) {
           frame.NriDirectionalShadowScheduleDuplicateCount },
         { "nri_directional_shadow_schedule_surface_end_count",
           frame.NriDirectionalShadowScheduleSurfaceEndCount },
+        { "nri_directional_shadow_prepared_draw_count",
+          frame.NriDirectionalShadowPreparedDrawCount },
+        { "nri_directional_shadow_prepared_caster_count",
+          frame.NriDirectionalShadowPreparedCasterCount },
+        { "nri_directional_shadow_prepared_transient_count",
+          frame.NriDirectionalShadowPreparedTransientCount },
+        { "nri_directional_shadow_prepared_reuse_count",
+          frame.NriDirectionalShadowPreparedReuseCount },
+        { "nri_directional_shadow_prepared_map_count",
+          frame.NriDirectionalShadowPreparedMapCount },
+        { "nri_directional_shadow_prepared_map_before_opaque_count",
+          frame.NriDirectionalShadowPreparedMapBeforeOpaqueCount },
+        { "nri_directional_shadow_prepared_alpha_caster_count",
+          frame.NriDirectionalShadowPreparedAlphaCasterCount },
+        { "nri_directional_shadow_prepared_alpha_rejected_count",
+          frame.NriDirectionalShadowPreparedAlphaRejectedCount },
+        { "nri_directional_shadow_alpha_caster_draw_count",
+          frame.NriDirectionalShadowAlphaCasterDrawCount },
+        { "nri_point_shadow_map_attempt_count", frame.NriPointShadowMapAttemptCount },
+        { "nri_point_shadow_map_count", frame.NriPointShadowMapCount },
+        { "nri_point_shadow_candidate_light_count", frame.NriPointShadowCandidateLightCount },
+        { "nri_point_shadow_light_count", frame.NriPointShadowLightCount },
+        { "nri_point_shadow_rendered_light_count", frame.NriPointShadowRenderedLightCount },
+        { "nri_point_shadow_caster_draw_count", frame.NriPointShadowCasterDrawCount },
+        { "nri_point_shadow_alpha_caster_draw_count", frame.NriPointShadowAlphaCasterDrawCount },
+        { "nri_point_shadow_receiver_draw_count", frame.NriPointShadowReceiverDrawCount },
+        { "nri_point_shadow_receiver_bound_draw_count", frame.NriPointShadowReceiverBoundDrawCount },
         { "display_transfer_count", frame.DisplayTransferCount },
         { "scanout_count", frame.ScanoutCount },
         { "overlay_count", frame.OverlayCount },
@@ -578,18 +629,18 @@ nlohmann::json FrameToJson(const Oot3dVulkanFrameDiagnostics& frame) {
         { "outline_occlusion_draw_count", frame.OutlineOcclusionDrawCount },
         { "pica_material_toon_draw_count",
           frame.PicaMaterialToonDrawCount },
-        { "cacao_pass_count", frame.CacaoPassCount },
-        { "cacao_output_nri_owned", frame.CacaoOutputNriOwned },
-        { "cacao_normal_guide_pass_count",
-          frame.CacaoNormalGuidePassCount },
-        { "cacao_ambient_guide_draw_count",
-          frame.CacaoAmbientGuideDrawCount },
-        { "cacao_ambient_rgb_guide_draw_count",
-          frame.CacaoAmbientRgbGuideDrawCount },
-        { "cacao_ambient_fallback_guide_draw_count",
-          frame.CacaoAmbientFallbackGuideDrawCount },
-        { "cacao_ambient_composite_count",
-          frame.CacaoAmbientCompositeCount },
+        { "ambient_occlusion_pass_count", frame.AmbientOcclusionPassCount },
+        { "ambient_occlusion_output_nri_owned", frame.AmbientOcclusionOutputNriOwned },
+        { "ambient_occlusion_normal_guide_pass_count",
+          frame.AmbientOcclusionNormalGuidePassCount },
+        { "ambient_occlusion_ambient_guide_draw_count",
+          frame.AmbientOcclusionAmbientGuideDrawCount },
+        { "ambient_occlusion_ambient_rgb_guide_draw_count",
+          frame.AmbientOcclusionAmbientRgbGuideDrawCount },
+        { "ambient_occlusion_ambient_fallback_guide_draw_count",
+          frame.AmbientOcclusionAmbientFallbackGuideDrawCount },
+        { "ambient_occlusion_ambient_composite_count",
+          frame.AmbientOcclusionAmbientCompositeCount },
         { "hiz_pass_count", frame.HiZPassCount },
         { "hiz_mip_count", frame.HiZMipCount },
         { "hiz_depth_convention", frame.HiZDepthConvention },
@@ -714,6 +765,21 @@ nlohmann::json FrameToJson(const Oot3dVulkanFrameDiagnostics& frame) {
         { "fsr_output_height", frame.FsrOutputHeight },
         { "fsr_history_reset_count", frame.FsrHistoryResetCount },
         { "fsr_nri_dispatched", frame.FsrNriDispatched },
+        { "upscaler_guide_resample_count", frame.UpscalerGuideResampleCount },
+        { "mxao_temporal_pass_count", frame.MxaoTemporalPassCount },
+        { "mxao_temporal_history_valid_count", frame.MxaoTemporalHistoryValidCount },
+        { "before_ui_anti_aliasing_count", frame.BeforeUiAntiAliasingCount },
+        { "before_ui_anti_aliasing_unavailable_count", frame.BeforeUiAntiAliasingUnavailableCount },
+        { "scene_before_ui_snapshot_count", frame.SceneBeforeUiSnapshotCount },
+        { "scene_before_ui_transfer_count", frame.SceneBeforeUiTransferCount },
+        { "native_ui_overlay_count", frame.NativeUiOverlayCount },
+        { "whole_target_ui_draw_count", frame.WholeTargetUiDrawCount },
+        { "screen_content_draw_count", frame.ScreenContentDrawCount },
+        { "own_picture_draw_count", frame.OwnPictureDrawCount },
+        { "picture_bar_rect_count", frame.PictureBarRectCount },
+        { "picture_overlay_draw_count", frame.PictureOverlayDrawCount },
+        { "upscaler_guide_width", frame.UpscalerGuideWidth },
+        { "upscaler_guide_height", frame.UpscalerGuideHeight },
         { "dlss_upscale_pass_count", frame.DlssUpscalePassCount },
         { "dlss_input_width", frame.DlssInputWidth },
         { "dlss_input_height", frame.DlssInputHeight },
@@ -777,8 +843,16 @@ nlohmann::json FrameToJson(const Oot3dVulkanFrameDiagnostics& frame) {
         { "temporal_jitter_draw_count", frame.TemporalJitterDrawCount },
         { "rigid_motion_draw_count", frame.RigidMotionDrawCount },
         { "exact_motion_draw_count", frame.ExactMotionDrawCount },
+        { "motion_provenance_draw_counts", frame.MotionProvenanceDrawCounts },
+        { "temporal_match_reason_draw_counts", frame.TemporalMatchReasonDrawCounts },
         { "deformed_motion_draw_count", frame.DeformedMotionDrawCount },
+        { "repeated_identity_motion_draw_count", frame.RepeatedIdentityMotionDrawCount },
         { "grass_motion_blade_count", frame.GrassMotionBladeCount },
+        { "normal_guide_draw_count", frame.NormalGuideDrawCount },
+        { "typed_normal_guide_draw_count", frame.TypedNormalGuideDrawCount },
+        { "ao_relief_candidate_draw_count", frame.AoReliefCandidateDrawCount },
+        { "ao_relief_texture_draw_count", frame.AoReliefTextureDrawCount },
+        { "ao_relief_applied_draw_count", frame.AoReliefAppliedDrawCount },
         { "first_submission_id", frame.FirstSubmissionId },
         { "last_submission_id", frame.LastSubmissionId },
         { "last_render_target_namespace", frame.LastRenderTargetNamespace },
@@ -1516,13 +1590,41 @@ void Oot3dVulkanDiagnostics::RecordPicaShaderSelection(
         typedInstrumentationContractRejects);
 }
 
-void Oot3dVulkanDiagnostics::RecordNriDirectionalShadow(uint32_t casterCount, bool nativeLight) {
+void Oot3dVulkanDiagnostics::RecordNriDirectionalShadow(uint32_t casterCount, bool nativeLight,
+                                                        uint32_t alphaCasterCount) {
     if (!mActiveFrame.has_value()) {
         return;
     }
     ++mActiveFrame->NriDirectionalShadowPassCount;
     mActiveFrame->NriDirectionalShadowCasterCount += casterCount;
+    mActiveFrame->NriDirectionalShadowAlphaCasterDrawCount += alphaCasterCount;
     mActiveFrame->NriDirectionalShadowNativeLight |= nativeLight;
+}
+
+void Oot3dVulkanDiagnostics::RecordNriPointShadowMap(bool executed, uint32_t candidateLights,
+                                                     uint32_t lights, uint32_t renderedLights,
+                                                     uint32_t casterDraws, uint32_t alphaCasterDraws) {
+    if (!mActiveFrame.has_value()) {
+        return;
+    }
+    ++mActiveFrame->NriPointShadowMapAttemptCount;
+    mActiveFrame->NriPointShadowCandidateLightCount += candidateLights;
+    if (!executed) {
+        return;
+    }
+    ++mActiveFrame->NriPointShadowMapCount;
+    mActiveFrame->NriPointShadowLightCount += lights;
+    mActiveFrame->NriPointShadowRenderedLightCount += renderedLights;
+    mActiveFrame->NriPointShadowCasterDrawCount += casterDraws;
+    mActiveFrame->NriPointShadowAlphaCasterDrawCount += alphaCasterDraws;
+}
+
+void Oot3dVulkanDiagnostics::RecordNriPointShadowReceiver(bool bound) {
+    if (!mActiveFrame.has_value()) {
+        return;
+    }
+    ++mActiveFrame->NriPointShadowReceiverDrawCount;
+    mActiveFrame->NriPointShadowReceiverBoundDrawCount += bound ? 1U : 0U;
 }
 
 void Oot3dVulkanDiagnostics::RecordNriDirectionalShadowAttempt(uint32_t queuedCasters,
@@ -1565,6 +1667,43 @@ void Oot3dVulkanDiagnostics::RecordNriDirectionalShadowLightSelection(
         mActiveFrame->NriDirectionalShadowLightDirectionY = directionY;
         mActiveFrame->NriDirectionalShadowLightDirectionZ = directionZ;
     }
+}
+
+void Oot3dVulkanDiagnostics::RecordNriVirtualShadowPages(
+    const Renderer3ds::VirtualShadowPageStatistics& pages, uint32_t updated, uint64_t atlasBytes) {
+    if (!mActiveFrame) return;
+    auto& frame = *mActiveFrame;
+    frame.NriVirtualShadowRequestedPageCount += pages.Requested;
+    frame.NriVirtualShadowResidentPageCount += pages.Resident;
+    frame.NriVirtualShadowReusedPageCount += pages.Reused;
+    frame.NriVirtualShadowUpdatedPageCount += updated;
+    frame.NriVirtualShadowStaticUpdatedPageCount += pages.StaticUpdated;
+    frame.NriVirtualShadowStaticReusedPageCount += pages.StaticReused;
+    frame.NriVirtualShadowEmptyPageCount += pages.Empty;
+    frame.NriVirtualShadowEvictedPageCount += pages.Evicted;
+    frame.NriVirtualShadowUnmappedPageCount += pages.Unmapped;
+    frame.NriVirtualShadowAtlasBytes += atlasBytes;
+    frame.NriVirtualShadowPendingPageCount += pages.Pending;
+}
+
+void Oot3dVulkanDiagnostics::RecordNriVirtualShadowKeyframes(
+    uint32_t displayedLayouts, float newerWeight, uint32_t constructionPages, uint32_t constructionBudget,
+    bool cut, bool rotated, const std::array<float, 3>& displayedDirection, float lagDegrees) {
+    if (!mActiveFrame) return;
+    auto& frame = *mActiveFrame;
+    // Several targets: the one that displays the most layouts describes the frame.
+    if (displayedLayouts >= frame.NriVirtualShadowKeyframeDisplayedLayoutCount) {
+        frame.NriVirtualShadowKeyframeDisplayedLayoutCount = displayedLayouts;
+        frame.NriVirtualShadowKeyframeWeight = newerWeight;
+        frame.NriVirtualShadowKeyframeLagDegrees = lagDegrees;
+        frame.NriVirtualShadowKeyframeDirectionX = displayedDirection[0];
+        frame.NriVirtualShadowKeyframeDirectionY = displayedDirection[1];
+        frame.NriVirtualShadowKeyframeDirectionZ = displayedDirection[2];
+    }
+    frame.NriVirtualShadowKeyframeConstructionPageCount += constructionPages;
+    frame.NriVirtualShadowKeyframeConstructionBudget += constructionBudget;
+    frame.NriVirtualShadowKeyframeCutCount += cut ? 1U : 0U;
+    frame.NriVirtualShadowKeyframeRotationCount += rotated ? 1U : 0U;
 }
 
 void Oot3dVulkanDiagnostics::RecordNriDirectionalShadowReceiver(
@@ -1616,6 +1755,45 @@ void Oot3dVulkanDiagnostics::RecordNriDirectionalShadowSchedule(
         duplicate ? 1U : 0U;
     mActiveFrame->NriDirectionalShadowScheduleSurfaceEndCount +=
         surfaceEnd ? 1U : 0U;
+}
+
+void Oot3dVulkanDiagnostics::RecordNriDirectionalShadowPreparation(
+    bool caster, bool transient) {
+    if (!mActiveFrame.has_value()) {
+        return;
+    }
+    ++mActiveFrame->NriDirectionalShadowPreparedDrawCount;
+    mActiveFrame->NriDirectionalShadowPreparedCasterCount += caster ? 1U : 0U;
+    mActiveFrame->NriDirectionalShadowPreparedTransientCount +=
+        transient ? 1U : 0U;
+}
+
+void Oot3dVulkanDiagnostics::RecordNriDirectionalShadowPreparedAlpha(bool prepared) {
+    if (!mActiveFrame.has_value()) {
+        return;
+    }
+    if (prepared) {
+        ++mActiveFrame->NriDirectionalShadowPreparedAlphaCasterCount;
+    } else {
+        ++mActiveFrame->NriDirectionalShadowPreparedAlphaRejectedCount;
+    }
+}
+
+void Oot3dVulkanDiagnostics::RecordNriDirectionalShadowPreparedReuse() {
+    if (!mActiveFrame.has_value()) {
+        return;
+    }
+    ++mActiveFrame->NriDirectionalShadowPreparedReuseCount;
+}
+
+void Oot3dVulkanDiagnostics::RecordNriDirectionalShadowPreparedMap(
+    bool beforeOpaque) {
+    if (!mActiveFrame.has_value()) {
+        return;
+    }
+    ++mActiveFrame->NriDirectionalShadowPreparedMapCount;
+    mActiveFrame->NriDirectionalShadowPreparedMapBeforeOpaqueCount +=
+        beforeOpaque ? 1U : 0U;
 }
 
 void Oot3dVulkanDiagnostics::RecordDisplayTransfer(bool present, uint32_t spatialAaMode, uint32_t msaaSamples) {
@@ -1749,6 +1927,54 @@ void Oot3dVulkanDiagnostics::RecordFsrUpscale(
     mActiveFrame->FsrNriDispatched |= executed;
 }
 
+void Oot3dVulkanDiagnostics::RecordUpscalerGuides(
+    bool resampled, uint32_t guideWidth, uint32_t guideHeight) {
+    if (!mActiveFrame.has_value()) return;
+    if (resampled) ++mActiveFrame->UpscalerGuideResampleCount;
+    mActiveFrame->UpscalerGuideWidth = guideWidth;
+    mActiveFrame->UpscalerGuideHeight = guideHeight;
+}
+
+void Oot3dVulkanDiagnostics::RecordMxaoTemporal(bool temporal, bool historyValid) {
+    if (!mActiveFrame.has_value()) return;
+    if (temporal) ++mActiveFrame->MxaoTemporalPassCount;
+    if (temporal && historyValid) ++mActiveFrame->MxaoTemporalHistoryValidCount;
+}
+
+void Oot3dVulkanDiagnostics::RecordBeforeUiAntiAliasing(bool applied, bool unavailable) {
+    if (!mActiveFrame.has_value()) return;
+    if (applied) ++mActiveFrame->BeforeUiAntiAliasingCount;
+    if (unavailable) ++mActiveFrame->BeforeUiAntiAliasingUnavailableCount;
+}
+
+void Oot3dVulkanDiagnostics::RecordSceneBeforeUi(bool snapshot, bool transferred) {
+    if (!mActiveFrame.has_value()) return;
+    if (snapshot) ++mActiveFrame->SceneBeforeUiSnapshotCount;
+    if (transferred) ++mActiveFrame->SceneBeforeUiTransferCount;
+}
+
+void Oot3dVulkanDiagnostics::RecordWholeTargetUiDraw(bool screenContent) {
+    if (!mActiveFrame.has_value()) return;
+    ++mActiveFrame->WholeTargetUiDrawCount;
+    if (screenContent) ++mActiveFrame->ScreenContentDrawCount;
+}
+
+void Oot3dVulkanDiagnostics::RecordOwnPictureDraw(uint32_t barRects) {
+    if (!mActiveFrame.has_value()) return;
+    ++mActiveFrame->OwnPictureDrawCount;
+    mActiveFrame->PictureBarRectCount += barRects;
+}
+
+void Oot3dVulkanDiagnostics::RecordPictureOverlayDraw() {
+    if (!mActiveFrame.has_value()) return;
+    ++mActiveFrame->PictureOverlayDrawCount;
+}
+
+void Oot3dVulkanDiagnostics::RecordNativeUiOverlay() {
+    if (!mActiveFrame.has_value()) return;
+    ++mActiveFrame->NativeUiOverlayCount;
+}
+
 void Oot3dVulkanDiagnostics::RecordDlssUpscale(
     bool executed, bool historyReset, uint32_t inputWidth,
     uint32_t inputHeight, uint32_t outputWidth, uint32_t outputHeight) {
@@ -1849,14 +2075,37 @@ void Oot3dVulkanDiagnostics::SetPresentationState(
     mPresentationState = state;
 }
 
+void Oot3dVulkanDiagnostics::RecordTemporalCorrespondence(uint32_t reason, uint32_t provenance) {
+    if (!mActiveFrame.has_value()) return;
+    if (reason < mActiveFrame->TemporalMatchReasonDrawCounts.size())
+        ++mActiveFrame->TemporalMatchReasonDrawCounts[reason];
+    if (provenance < mActiveFrame->MotionProvenanceDrawCounts.size())
+        ++mActiveFrame->MotionProvenanceDrawCounts[provenance];
+}
+
 void Oot3dVulkanDiagnostics::RecordTemporalDraw(
-    bool rigidMotionValid, bool exactMotionValid, bool deformedMotionValid) {
+    bool rigidMotionValid, bool exactMotionValid, bool deformedMotionValid,
+    bool repeatedIdentity) {
     if (!mActiveFrame.has_value()) return;
     ++mActiveFrame->TemporalJitterDrawCount;
     mActiveFrame->RigidMotionDrawCount += rigidMotionValid ? 1U : 0U;
     mActiveFrame->ExactMotionDrawCount += exactMotionValid ? 1U : 0U;
     mActiveFrame->DeformedMotionDrawCount +=
         deformedMotionValid ? 1U : 0U;
+    mActiveFrame->RepeatedIdentityMotionDrawCount += repeatedIdentity ? 1U : 0U;
+}
+
+void Oot3dVulkanDiagnostics::RecordNormalGuideDraw(bool typedNormal, bool relief) {
+    if (!mActiveFrame.has_value()) return;
+    ++mActiveFrame->NormalGuideDrawCount;
+    mActiveFrame->TypedNormalGuideDrawCount += typedNormal ? 1U : 0U;
+    mActiveFrame->AoReliefAppliedDrawCount += relief ? 1U : 0U;
+}
+
+void Oot3dVulkanDiagnostics::RecordAoReliefDraw(bool reliefTexture) {
+    if (!mActiveFrame.has_value()) return;
+    ++mActiveFrame->AoReliefCandidateDrawCount;
+    mActiveFrame->AoReliefTextureDrawCount += reliefTexture ? 1U : 0U;
 }
 
 void Oot3dVulkanDiagnostics::RecordGrassMotion(uint32_t bladeCount) {
@@ -1885,33 +2134,33 @@ void Oot3dVulkanDiagnostics::RecordToonDraw(
     }
 }
 
-void Oot3dVulkanDiagnostics::RecordCacaoPass(bool outputNriOwned,
+void Oot3dVulkanDiagnostics::RecordAmbientOcclusionPass(bool outputNriOwned,
                                               bool picaNormalGuide) {
     if (mActiveFrame.has_value()) {
-        ++mActiveFrame->CacaoPassCount;
-        mActiveFrame->CacaoOutputNriOwned =
-            mActiveFrame->CacaoOutputNriOwned || outputNriOwned;
+        ++mActiveFrame->AmbientOcclusionPassCount;
+        mActiveFrame->AmbientOcclusionOutputNriOwned =
+            mActiveFrame->AmbientOcclusionOutputNriOwned || outputNriOwned;
         if (picaNormalGuide) {
-            ++mActiveFrame->CacaoNormalGuidePassCount;
+            ++mActiveFrame->AmbientOcclusionNormalGuidePassCount;
         }
     }
 }
 
-void Oot3dVulkanDiagnostics::RecordCacaoAmbientGuideDraw(
+void Oot3dVulkanDiagnostics::RecordAmbientOcclusionAmbientGuideDraw(
     bool exactRgb) {
     if (mActiveFrame.has_value()) {
-        ++mActiveFrame->CacaoAmbientGuideDrawCount;
+        ++mActiveFrame->AmbientOcclusionAmbientGuideDrawCount;
         if (exactRgb) {
-            ++mActiveFrame->CacaoAmbientRgbGuideDrawCount;
+            ++mActiveFrame->AmbientOcclusionAmbientRgbGuideDrawCount;
         } else {
-            ++mActiveFrame->CacaoAmbientFallbackGuideDrawCount;
+            ++mActiveFrame->AmbientOcclusionAmbientFallbackGuideDrawCount;
         }
     }
 }
 
-void Oot3dVulkanDiagnostics::RecordCacaoAmbientComposite() {
+void Oot3dVulkanDiagnostics::RecordAmbientOcclusionAmbientComposite() {
     if (mActiveFrame.has_value()) {
-        ++mActiveFrame->CacaoAmbientCompositeCount;
+        ++mActiveFrame->AmbientOcclusionAmbientCompositeCount;
     }
 }
 

@@ -16,19 +16,26 @@ namespace {
 [[nodiscard]] constexpr bool IsPicaGuideOutput(EffectResource resource) noexcept {
     return resource == EffectResource::NormalGuide || resource == EffectResource::MaterialGuide ||
            resource == EffectResource::RigidMotionGuide || resource == EffectResource::AmbientGuide ||
-           resource == EffectResource::FogGuide || resource == EffectResource::OutlineGeometryGuide;
+           resource == EffectResource::FogGuide || resource == EffectResource::OutlineGeometryGuide ||
+           resource == EffectResource::DiffuseAlbedoGuide;
 }
 
 [[nodiscard]] constexpr bool IsExternalResource(EffectResource resource) noexcept {
     return resource == EffectResource::PicaSceneFrame || resource == EffectResource::NativeSceneView ||
-           resource == EffectResource::SceneColor || resource == EffectResource::NativeDepth ||
+           resource == EffectResource::PreparedShadowCasters ||
+           resource == EffectResource::SceneColor || resource == EffectResource::SceneBeforeUi ||
+           resource == EffectResource::NativeDepth ||
            resource == EffectResource::NativeShadow2D ||
-           resource == EffectResource::DirectionalShadowHistory;
+           resource == EffectResource::DirectionalShadowHistory ||
+           resource == EffectResource::DirectionalShadowStaticHistory ||
+           resource == EffectResource::PointShadowHistory ||
+           resource == EffectResource::ContactShadowHistory;
 }
 
 [[nodiscard]] constexpr bool IsSemanticResource(EffectResource resource) noexcept {
     return resource == EffectResource::PicaSceneFrame || resource == EffectResource::NativeSceneView ||
-           resource == EffectResource::ExtensionGeometry;
+           resource == EffectResource::PreparedShadowCasters ||
+           resource == EffectResource::ExtensionGeometry || resource == EffectResource::SceneDistanceField;
 }
 
 inline constexpr uint64_t kOot3dEffectResourceNamespace =
@@ -86,12 +93,24 @@ BuildEffectResourceDeclaration(EffectResource resource) noexcept {
             return PicaAuxiliaryOutput::FogGuide;
         case EffectResource::OutlineGeometryGuide:
             return PicaAuxiliaryOutput::OutlineGeometryGuide;
+        case EffectResource::DiffuseAlbedoGuide:
+            return PicaAuxiliaryOutput::DiffuseAlbedoGuide;
         default:
             return PicaAuxiliaryOutput::None;
     }
 }
 
 [[nodiscard]] bool ValidateContract(const EffectPass& pass, std::string& error) {
+    // A fallback producer reads only imported data (checked at compile), so
+    // its primary anchor may be as early as the opaque boundary.
+    if (pass.FallbackStage &&
+        (pass.Contract != EffectContractKind::AuxiliaryOutput ||
+         StageOrder(pass.Stage) < StageOrder(EffectStage::BeforeOpaque) ||
+         StageOrder(*pass.FallbackStage) <= StageOrder(pass.Stage) ||
+         StageOrder(*pass.FallbackStage) > StageOrder(EffectStage::BeforeUi))) {
+        error = "invalid auxiliary export fallback stage: " + pass.Name;
+        return false;
+    }
     bool writesResource = false;
     std::unordered_set<EffectResource> declaredResources;
     for (const auto& use : pass.Resources) {
@@ -267,6 +286,30 @@ CompiledEffectGraph EffectGraph::Compile() const {
         if (pass.Enabled && !ValidateContract(pass, result.Error)) {
             return result;
         }
+        if (!pass.Enabled || !pass.FallbackStage) continue;
+        // Imports remain externally owned and exports remain live through graph
+        // completion. A delayed producer must not invalidate a same-frame read
+        // or a transient resource lifetime compiled at its primary stage.
+        for (const auto& use : pass.Resources) {
+            if ((ReadsEffectResource(use.Access) && !IsExternalResource(use.Resource)) ||
+                (WritesEffectResource(use.Access) &&
+                 (!IsAuxiliarySceneData(use.Resource) ||
+                  std::find(mExports.begin(), mExports.end(), use.Resource) == mExports.end()))) {
+                result.Error = "fallback pass requires imported inputs and auxiliary exports: " + name;
+                return result;
+            }
+            if (!WritesEffectResource(use.Access)) continue;
+            for (const auto& [otherName, other] : mPasses) {
+                if (!other.Enabled || otherName == name) continue;
+                if (std::any_of(other.Resources.begin(), other.Resources.end(),
+                                [&](const EffectResourceUse& read) {
+                                    return read.Resource == use.Resource && ReadsEffectResource(read.Access);
+                                })) {
+                    result.Error = "fallback export has a same-frame consumer: " + name;
+                    return result;
+                }
+            }
+        }
     }
 
     std::vector<std::string> schedule;
@@ -299,7 +342,8 @@ CompiledEffectGraph EffectGraph::Compile() const {
                 return false;
             }
             if (dependencyPass->second.Enabled &&
-                StageOrder(dependencyPass->second.Stage) > StageOrder(found->second.Stage)) {
+                StageOrder(dependencyPass->second.FallbackStage.value_or(dependencyPass->second.Stage)) >
+                    StageOrder(found->second.Stage)) {
                 result.Error = "effect dependency crosses stages " + dependency + " -> " + name;
                 return false;
             }
@@ -308,7 +352,8 @@ CompiledEffectGraph EffectGraph::Compile() const {
         }
         mark = Mark::Visited;
         result.Order.push_back(name);
-        result.Passes.push_back({ name, found->second.Stage, found->second.Contract, found->second.Resources });
+        result.Passes.push_back({ name, found->second.Stage, found->second.Contract, found->second.Resources,
+                                  found->second.FallbackStage });
         return true;
     };
 
@@ -412,11 +457,14 @@ std::string_view PicaExtensionPassName(PicaExtensionPass pass) noexcept {
         case PicaExtensionPass::Guides: return "PicaAuxiliaryOutputs";
         case PicaExtensionPass::DirectionalShadowLighting: return "DirectionalShadowLighting";
         case PicaExtensionPass::DirectionalShadowMap: return "DirectionalShadowMap";
+        case PicaExtensionPass::PointShadowLighting: return "PointShadowLighting";
+        case PicaExtensionPass::PointShadowMap: return "PointShadowMap";
         case PicaExtensionPass::AmbientOcclusion: return "AmbientOcclusion";
         case PicaExtensionPass::Reflections: return "Reflections";
         case PicaExtensionPass::TemporalReconstruction: return "TemporalReconstruction";
         case PicaExtensionPass::InteractiveGrass: return "InteractiveGrass";
         case PicaExtensionPass::ToonOutline: return "ToonOutline";
+        case PicaExtensionPass::SceneDistanceField: return "SceneDistanceField";
         case PicaExtensionPass::Count: return {};
     }
     return {};
@@ -430,10 +478,11 @@ bool PicaExtensionPassEnabled(const CompiledEffectGraph& graph,
 CompiledEffectGraph BuildPicaExtensionGraph(const PicaAttachmentFeatureRequests& requests) {
     EffectGraph graph;
     std::vector<EffectResourceUse> guideOutputs;
-    if (requests.AmbientOcclusion || requests.ToonOutline || requests.Reflections) {
+    if (requests.AmbientOcclusion || requests.ToonOutline || requests.Reflections ||
+        requests.GlobalIllumination) {
         guideOutputs.push_back(Write(EffectResource::NormalGuide));
     }
-    if (requests.Reflections || requests.TemporalReconstruction) {
+    if (requests.Reflections || requests.TemporalReconstruction || requests.GlobalIllumination) {
         guideOutputs.push_back(Write(EffectResource::MaterialGuide));
     }
     if (requests.TemporalReconstruction || requests.ToonOutline) {
@@ -444,27 +493,74 @@ CompiledEffectGraph BuildPicaExtensionGraph(const PicaAttachmentFeatureRequests&
     }
     if (requests.ToonOutline) {
         guideOutputs.push_back(Write(EffectResource::FogGuide));
+    }
+    // The geometry guide carries the outline's native normal and depth and
+    // the face normal of the visible surface.
+    if (requests.ToonOutline || requests.FaceNormal) {
         guideOutputs.push_back(Write(EffectResource::OutlineGeometryGuide));
+    }
+    if (requests.GlobalIllumination) {
+        guideOutputs.push_back(Write(EffectResource::DiffuseAlbedoGuide));
     }
     graph.Add({ .Name = std::string(PicaExtensionPassName(PicaExtensionPass::Guides)),
                 .Enabled = !guideOutputs.empty(),
                 .Stage = EffectStage::NativeLighting,
                 .Contract = EffectContractKind::AuxiliaryOutput,
                 .Resources = std::move(guideOutputs) });
+    // Contact shadows: the shadow map producer also writes the screen-space
+    // visibility of its light, and the receivers read it.
+    const bool contactShadows = requests.DirectionalShadows && requests.ContactShadows;
+    std::vector<EffectResourceUse> shadowLightingResources{ Read(EffectResource::NativeSceneView),
+                                                            Read(EffectResource::DirectionalShadowHistory) };
+    if (contactShadows)
+        shadowLightingResources.push_back(Read(EffectResource::ContactShadowHistory));
     graph.Add({ .Name = std::string(PicaExtensionPassName(PicaExtensionPass::DirectionalShadowLighting)),
                 .Enabled = requests.DirectionalShadows,
                 .Stage = EffectStage::NativeLighting,
                 .Contract = EffectContractKind::LightingContributor,
-                .Resources = { Read(EffectResource::NativeSceneView),
-                               Read(EffectResource::DirectionalShadowHistory) } });
+                .Resources = std::move(shadowLightingResources) });
+    // This sample's casters are prepared before the sequence executes, so the
+    // map is complete before the first opaque receiver samples it. The late
+    // anchor remains for targets that publish no opaque boundary.
+    std::vector<EffectResourceUse> shadowMapResources{ Read(EffectResource::PreparedShadowCasters),
+                                                       Read(EffectResource::DirectionalShadowHistory),
+                                                       Read(EffectResource::DirectionalShadowStaticHistory),
+                                                       Write(EffectResource::DirectionalShadowStaticCache),
+                                                       Write(EffectResource::DirectionalShadowMap) };
+    if (contactShadows) {
+        shadowMapResources.push_back(Read(EffectResource::ContactShadowHistory));
+        shadowMapResources.push_back(Write(EffectResource::ContactShadowMap));
+    }
     graph.Add({ .Name = std::string(PicaExtensionPassName(PicaExtensionPass::DirectionalShadowMap)),
                 .Enabled = requests.DirectionalShadows,
-                .Stage = EffectStage::AfterOpaque,
+                .Stage = EffectStage::BeforeOpaque,
                 .Contract = EffectContractKind::AuxiliaryOutput,
-                .Resources = { Read(EffectResource::PicaSceneFrame), Read(EffectResource::NativeSceneView),
-                               Write(EffectResource::DirectionalShadowMap) } });
+                .Resources = std::move(shadowMapResources),
+                .FallbackStage = EffectStage::BeforeUi });
     if (requests.DirectionalShadows) {
         graph.Export(EffectResource::DirectionalShadowMap);
+        graph.Export(EffectResource::DirectionalShadowStaticCache);
+        if (contactShadows)
+            graph.Export(EffectResource::ContactShadowMap);
+    }
+    // Point lights: receivers read the published cube atlas; the producer
+    // renders it from the same prepared casters at the opaque boundary.
+    graph.Add({ .Name = std::string(PicaExtensionPassName(PicaExtensionPass::PointShadowLighting)),
+                .Enabled = requests.PointShadows,
+                .Stage = EffectStage::NativeLighting,
+                .Contract = EffectContractKind::LightingContributor,
+                .Resources = { Read(EffectResource::NativeSceneView),
+                               Read(EffectResource::PointShadowHistory) } });
+    graph.Add({ .Name = std::string(PicaExtensionPassName(PicaExtensionPass::PointShadowMap)),
+                .Enabled = requests.PointShadows,
+                .Stage = EffectStage::BeforeOpaque,
+                .Contract = EffectContractKind::AuxiliaryOutput,
+                .Resources = { Read(EffectResource::PreparedShadowCasters),
+                               Read(EffectResource::PointShadowHistory),
+                               Write(EffectResource::PointShadowMap) },
+                .FallbackStage = EffectStage::BeforeUi });
+    if (requests.PointShadows) {
+        graph.Export(EffectResource::PointShadowMap);
     }
     graph.Add({ .Name = std::string(PicaExtensionPassName(PicaExtensionPass::AmbientOcclusion)),
                 .DependsOn = { std::string(PicaExtensionPassName(PicaExtensionPass::Guides)) },
@@ -491,12 +587,20 @@ CompiledEffectGraph BuildPicaExtensionGraph(const PicaAttachmentFeatureRequests&
                                Read(EffectResource::MaterialGuide), Read(EffectResource::RigidMotionGuide),
                                Write(EffectResource::MotionVectors),
                                Write(EffectResource::ReactiveMask) } });
+    std::vector<EffectResourceUse> grassResources{
+        Read(EffectResource::PicaSceneFrame), Read(EffectResource::NativeSceneView),
+        Write(EffectResource::ExtensionGeometry)};
+    // Its coarse grid reads the static casters' depth (no actor shadows) and
+    // its refinement near the actors the composed map.
+    if (requests.DirectionalShadows) {
+        grassResources.push_back(Read(EffectResource::DirectionalShadowHistory));
+        grassResources.push_back(Read(EffectResource::DirectionalShadowStaticHistory));
+    }
     graph.Add({ .Name = std::string(PicaExtensionPassName(PicaExtensionPass::InteractiveGrass)),
                 .Enabled = requests.InteractiveGrass,
                 .Stage = EffectStage::BeforeTransparent,
                 .Contract = EffectContractKind::GeometryProvider,
-                .Resources = { Read(EffectResource::PicaSceneFrame), Read(EffectResource::NativeSceneView),
-                               Write(EffectResource::ExtensionGeometry) } });
+                .Resources = std::move(grassResources) });
     if (requests.InteractiveGrass) {
         graph.Export(EffectResource::ExtensionGeometry);
     }
@@ -507,6 +611,14 @@ CompiledEffectGraph BuildPicaExtensionGraph(const PicaAttachmentFeatureRequests&
                 .Contract = EffectContractKind::ComposerPass,
                 .Resources = { Read(EffectResource::NativeDepth), Read(EffectResource::OutlineGeometryGuide),
                                Read(EffectResource::NormalGuide), Read(EffectResource::RigidMotionGuide) } });
+    // The distance field voxelizes the native opaque geometry of the frame; it
+    // changes no native target and publishes a persistent field (a
+    // screen-space GI gathers from the guides instead).
+    graph.Add({ .Name = std::string(PicaExtensionPassName(PicaExtensionPass::SceneDistanceField)),
+                .Enabled = requests.GlobalIllumination && !requests.ScreenSpaceGlobalIllumination,
+                .Stage = EffectStage::AfterOpaque,
+                .Contract = EffectContractKind::Observer,
+                .Resources = { Read(EffectResource::PicaSceneFrame), Read(EffectResource::NativeSceneView) } });
     return graph.Compile();
 }
 

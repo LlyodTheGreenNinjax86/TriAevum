@@ -2,8 +2,11 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <optional>
 #include <string>
 #include <vector>
+
+#include <nlohmann/json_fwd.hpp>
 
 #include "oot3d/renderer/pica_render_backend.h"
 #include "oot3d_native_frame_rate.h"
@@ -24,6 +27,10 @@ struct NativeA32SavestateCompatibility {
     std::string CodeBinSha256;
     std::string ProcessName;
     std::string A32SourceSnapshotId;
+    // The simulation rate is part of the game moment (a launch option, not a
+    // setting): a state is refused before anything is restored when it was
+    // saved at the other rate. Unset skips the check.
+    std::optional<GameplayTimingMode> GameplayTiming;
 };
 
 // Host-side TopScreen routing survives across guest refreshes even though it
@@ -74,6 +81,25 @@ struct NativeA32SavestateRuntimeState {
     bool PicaPresentationStateAvailable = false;
     Oot3d::Renderer::PicaPresentationStateSnapshot
         PicaPresentationState;
+    // Graphics-free form: the game's render targets live in emulated memory
+    // like on hardware (VRAM), and only their identities travel here (pixel
+    // vectors empty). The writer patches GuestMemoryOverlays (virtual
+    // address, native bytes) into its copy of the memory; the live process is
+    // never written. The texture cache and display images are then absent and
+    // rebuilt from memory by the restoring renderer.
+    bool PicaGuestFramebuffersAvailable = false;
+    std::vector<Oot3d::Renderer::PicaRenderTargetColorSnapshot>
+        PicaGuestFramebuffers;
+    struct GuestMemoryOverlay {
+        uint32_t VirtualAddress = 0;
+        std::vector<uint8_t> Bytes;
+    };
+    std::vector<GuestMemoryOverlay> GuestMemoryOverlays;
+    // Optional copy of the host settings (a JSON object owned by the window
+    // session), written by a "state + settings" save. The game moment above
+    // never depends on it.
+    bool HostSettingsAvailable = false;
+    std::string HostSettingsJson;
 };
 
 struct NativeA32SavestateIoResult {
@@ -120,5 +146,12 @@ bool LoadNativeA32State(
     NativeA32DspHle& dspHle,
     NativeA32SavestateIoResult* result = nullptr,
     std::string* error = nullptr);
+
+// The document of a state file of either container version, checked against
+// its header and checksum but not against a runtime (tools and diagnostics).
+bool ReadNativeA32StateDocument(const std::filesystem::path& path,
+                                nlohmann::json& document,
+                                NativeA32SavestateIoResult* result = nullptr,
+                                std::string* error = nullptr);
 
 } // namespace Oot3dNativeGame

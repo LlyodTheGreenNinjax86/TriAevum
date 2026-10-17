@@ -70,6 +70,12 @@ class Oot3dGraphicsSettingsPersistence final
         return context != nullptr && context->GetConfig() != nullptr &&
             context->GetConfig()->SetBlock("Graphics", graphics);
     }
+
+    bool StoreGraphicsPresets(const nlohmann::json& presets) override {
+        auto* context = Ship::Context::GetRawInstance();
+        return context != nullptr && context->GetConfig() != nullptr &&
+            context->GetConfig()->SetBlock("GraphicsPresets", presets);
+    }
 };
 
 class Oot3dGraphicsSettingsWindow final : public Ship::GuiWindow {
@@ -94,6 +100,7 @@ class Oot3dGraphicsSettingsWindow final : public Ship::GuiWindow {
                 maximum);
         }
         GuiWindow::Draw();
+        if (!IsVisible()) Oot3d::EndGraphicsSettingsPreviews();
     }
 
   protected:
@@ -114,6 +121,19 @@ class Oot3dDisplayConfirmationWindow final : public Ship::GuiWindow {
         SetVisibility(Oot3d::GraphicsSettingsRuntime::Instance().PresentationStatus().Phase ==
                       Oot3d::PresentationTransactionPhase::AwaitingConfirmation);
         Oot3d::DrawDisplayConfirmation();
+    }
+  protected:
+    void InitElement() override {}
+    void UpdateElement() override {}
+    void DrawElement() override {}
+};
+
+class Oot3dHostNoticeWindow final : public Ship::GuiWindow {
+  public:
+    Oot3dHostNoticeWindow() : GuiWindow("", false, "Host notice") {}
+    void Draw() override {
+        SetVisibility(Oot3d::HostNoticeActive());
+        Oot3d::DrawHostNotice();
     }
   protected:
     void InitElement() override {}
@@ -212,6 +232,7 @@ void Fast3dGui::Init(GuiWindowInitData windowImpl) {
             std::make_shared<Oot3dGraphicsSettingsPersistence>());
         AddGuiWindow(std::make_shared<Oot3dGraphicsSettingsWindow>());
         AddGuiWindow(std::make_shared<Oot3dDisplayConfirmationWindow>());
+        AddGuiWindow(std::make_shared<Oot3dHostNoticeWindow>());
     }
 #endif
     Gui::Init();
@@ -292,6 +313,14 @@ void Fast3dGui::HandleWindowEvents(Fast::WindowEvent event) {
                     break;
                 case SDL_KEYDOWN:
                 case SDL_KEYUP:
+                    // The consolidated settings window follows the key event,
+                    // never a per-frame sample: a tap whose press and release
+                    // land inside one host iteration must still toggle it.
+                    if (sdlEvent.type == SDL_KEYDOWN &&
+                        sdlEvent.key.keysym.scancode == SDL_SCANCODE_F1 &&
+                        sdlEvent.key.repeat == 0) {
+                        ToggleOot3dGraphicsWindow();
+                    }
                     // Host renderer shortcuts must not also reach ImGui bindings.
                     if (sdlEvent.key.keysym.scancode != SDL_SCANCODE_F1 &&
                         sdlEvent.key.keysym.scancode != SDL_SCANCODE_F2) {
@@ -316,21 +345,22 @@ void Fast3dGui::HandleWindowEvents(Fast::WindowEvent event) {
     }
 }
 
+void Fast3dGui::ToggleOot3dGraphicsWindow() {
+#ifdef ENABLE_OOT3D_VULKAN
+    if (mImpl.Backend != WindowBackend::FAST3D_SDL_OOT3D_VULKAN) {
+        return;
+    }
+    const auto settingsWindow = GetGuiWindow("OOT3D Graphics");
+    if (settingsWindow != nullptr) {
+        settingsWindow->ToggleVisibility();
+    }
+#endif
+}
+
 void Fast3dGui::DrawMenu() {
     Ship::Gui::DrawMenu();
 #ifdef ENABLE_OOT3D_VULKAN
     if (mImpl.Backend == WindowBackend::FAST3D_SDL_OOT3D_VULKAN) {
-        const auto settingsWindow = GetGuiWindow("OOT3D Graphics");
-        const auto window = std::dynamic_pointer_cast<Fast3dWindow>(
-            Ship::Context::GetRawInstance()->GetWindow());
-        const bool toggleKeyDown =
-            window != nullptr &&
-            window->IsKeyDown(Ship::KbScancode::LUS_KB_F1);
-        if (settingsWindow != nullptr && toggleKeyDown &&
-            !mOot3dGraphicsToggleKeyWasDown) {
-            settingsWindow->ToggleVisibility();
-        }
-        mOot3dGraphicsToggleKeyWasDown = toggleKeyDown;
         const bool hostUiVisible = GetAnyGuiWindowVisible();
         if (hostUiVisible != mOot3dGraphicsWindowVisible) {
             mOot3dGraphicsWindowVisible = hostUiVisible;
@@ -483,6 +513,24 @@ void Fast3dGui::ImGuiBackendShutdown() {
     }
 }
 
+void Fast3dGui::SetRendererRouting(RendererRouting routing) {
+    mRendererRouting = std::move(routing);
+}
+
+namespace {
+
+// Owns a copy of one frame's draw lists for rendering after ImGui moved on.
+std::shared_ptr<ImDrawData> CloneImGuiDrawData(const ImDrawData* source) {
+    std::shared_ptr<ImDrawData> copy(new ImDrawData(*source), [](ImDrawData* data) {
+        for (ImDrawList* list : data->CmdLists) IM_DELETE(list);
+        delete data;
+    });
+    for (ImDrawList*& list : copy->CmdLists) list = list->CloneOutput();
+    return copy;
+}
+
+} // namespace
+
 void Fast3dGui::ImGuiBackendNewFrame() {
     switch (mImpl.Backend) {
 #ifdef ENABLE_OPENGL
@@ -511,7 +559,13 @@ void Fast3dGui::ImGuiBackendNewFrame() {
     if (mImpl.Backend == WindowBackend::FAST3D_SDL_OOT3D_VULKAN) {
         if (auto interpreter = mInterpreter.lock()) {
             auto* api = dynamic_cast<GfxRenderingAPIVulkan*>(interpreter->GetCurrentRenderingAPI());
-            if (api != nullptr) api->NewImGuiFrame();
+            if (api != nullptr && !mRendererRouting.Synchronous) {
+                api->NewImGuiFrame();
+            } else if (api != nullptr && !api->ImGuiBackendReady()) {
+                // Initialization and the font upload record GPU work. Once
+                // ready, the backend's new-frame step has nothing to do.
+                mRendererRouting.Synchronous([api] { api->NewImGuiFrame(); });
+            }
         }
     }
 #endif
@@ -594,7 +648,12 @@ void Fast3dGui::ImGuiRenderDrawData(ImDrawData* data) {
     if (mImpl.Backend == WindowBackend::FAST3D_SDL_OOT3D_VULKAN) {
         if (auto interpreter = mInterpreter.lock()) {
             auto* api = dynamic_cast<GfxRenderingAPIVulkan*>(interpreter->GetCurrentRenderingAPI());
-            if (api != nullptr) api->RenderImGuiDrawData(data);
+            if (api != nullptr && mRendererRouting.Deferred && data != nullptr) {
+                mRendererRouting.Deferred(
+                    [api, copy = CloneImGuiDrawData(data)] { api->RenderImGuiDrawData(copy.get()); });
+            } else if (api != nullptr) {
+                api->RenderImGuiDrawData(data);
+            }
         }
     }
 #endif

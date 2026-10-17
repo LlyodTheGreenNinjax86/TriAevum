@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <utility>
 #include <vector>
 #include <nlohmann/json.hpp>
 #include "fast/renderer3ds/pica_frame_timing.h"
@@ -46,16 +47,24 @@ void MaybeWriteFramebufferScreenshot(const Args& args, Fast::GfxRenderingAPI& ap
         grassTransition = grass.FrameId != 0U && status != state.LastGrassDiagnosticStatus;
         state.LastGrassDiagnosticStatus = status;
     }
-    if (!grassTransition && !cameraTransition && !ShouldWriteFramebufferScreenshot(args, frameCount, state)) {
+    const bool forced = !state.ForcedPath.empty();
+    if (!forced && !grassTransition && !cameraTransition && !ShouldWriteFramebufferScreenshot(args, frameCount, state)) {
         return;
     }
 
-    std::vector<uint16_t> framebuffer(static_cast<size_t>(width) * height, 0);
     if (!grassDiagnostics) grass = Fast::Oot3d::GrassRenderTelemetry::Instance().Snapshot();
-    api.ReadFramebufferToCPU(0, width, height, framebuffer.data());
-    const auto screenshotPath =
-        args.ScreenshotSequence ? ScreenshotSequenceFramePath(args.ScreenshotPath, frameCount) : args.ScreenshotPath;
-    WriteBmpFromRgba5551Framebuffer(screenshotPath, width, height, framebuffer);
+    const auto screenshotPath = forced ? std::exchange(state.ForcedPath, {})
+        : args.ScreenshotSequence ? ScreenshotSequenceFramePath(args.ScreenshotPath, frameCount) : args.ScreenshotPath;
+    // Forced (developer lab) captures keep the full 8-bit precision; the
+    // deterministic captures keep their RGBA5551 baseline.
+    std::vector<uint8_t> rgb(forced ? static_cast<size_t>(width) * height * 3u : 0U);
+    if (forced && api.ReadFramebufferRgb8ToCPU(width, height, rgb.data())) {
+        WriteBmpFromRgb8Framebuffer(screenshotPath, width, height, rgb);
+    } else {
+        std::vector<uint16_t> framebuffer(static_cast<size_t>(width) * height, 0);
+        api.ReadFramebufferToCPU(0, width, height, framebuffer.data());
+        WriteBmpFromRgba5551Framebuffer(screenshotPath, width, height, framebuffer);
+    }
     nlohmann::json metadata = {
         {"format", "triaevum_framebuffer_sample_v1"}, {"host_frame", frameCount},
         {"width", width}, {"height", height}, {"temporal_sample", nullptr},
@@ -86,8 +95,9 @@ void MaybeWriteFramebufferScreenshot(const Args& args, Fast::GfxRenderingAPI& ap
     auto metadataPath = screenshotPath;
     metadataPath += ".json";
     WriteJsonFile(metadataPath, metadata);
-    state.Written = true;
     ++state.WrittenCount;
+    if (forced) return;
+    state.Written = true;
     state.Width = width;
     state.Height = height;
 }

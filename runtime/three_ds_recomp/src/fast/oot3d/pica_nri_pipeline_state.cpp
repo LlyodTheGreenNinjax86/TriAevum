@@ -115,14 +115,7 @@ VkPrimitiveTopology ToNativeVkTopology(Renderer3ds::PicaTopology topology) {
 }
 
 bool UsesTranslucentBlend(const Renderer3ds::NativeBlendState& blend) {
-    const bool opaqueReplace =
-        blend.EquationRgb == Renderer3ds::NativeBlendEquation::Add &&
-        blend.EquationAlpha == Renderer3ds::NativeBlendEquation::Add &&
-        blend.SourceRgb == Renderer3ds::NativeBlendFactor::One &&
-        blend.DestRgb == Renderer3ds::NativeBlendFactor::Zero &&
-        blend.SourceAlpha == Renderer3ds::NativeBlendFactor::One &&
-        blend.DestAlpha == Renderer3ds::NativeBlendFactor::Zero;
-    return blend.Enabled && !opaqueReplace;
+    return !Renderer3ds::PicaBlendReplacesDestination(blend);
 }
 
 VkBlendOp ToNativeVkBlendOperation(Renderer3ds::NativeBlendEquation equation) {
@@ -243,7 +236,7 @@ Renderer3ds::NriPicaGraphicsPipelineDesc BuildPicaNriPipelineState(
     const bool sceneDomainTransparentDepthOverlay =
         outputs.SceneDomainTransparentDepthOverlay;
     const auto configureOverlayCoverage =
-        [sceneDomainBlendedOverlay](
+        [sceneDomainBlendedOverlay, &draw](
             VkPipelineColorBlendAttachmentState& state) {
             state.colorWriteMask = VK_COLOR_COMPONENT_A_BIT;
             state.blendEnable =
@@ -251,8 +244,10 @@ Renderer3ds::NriPicaGraphicsPipelineDesc BuildPicaNriPipelineState(
             if (sceneDomainBlendedOverlay) {
                 state.alphaBlendOp = VK_BLEND_OP_ADD;
                 state.srcAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
+                // Coverage follows native RGB destination transmission, not
+                // output opacity: additive particles must retain the scene.
                 state.dstAlphaBlendFactor =
-                    VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+                    ToNativeVkBlendFactor(draw.Blend.DestRgb);
             }
         };
     if (sceneDomainNormalOverlay) {
@@ -304,12 +299,21 @@ Renderer3ds::NriPicaGraphicsPipelineDesc BuildPicaNriPipelineState(
             VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
     }
     VkPipelineColorBlendAttachmentState outlineGeometryAttachment{};
-    outlineGeometryAttachment.colorWriteMask = outputs.WritesOutlineGeometryGuide ? 0xfU : 0U;
+    // Integer channels, never blended: R/A native normal and depth, G/B the
+    // visible surface's face normal and kind.
+    outlineGeometryAttachment.colorWriteMask =
+        (outputs.WritesOutlineGeometryGuide ? VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_A_BIT : 0U) |
+        (outputs.WritesFaceNormalGuide ? VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT : 0U);
     VkPipelineColorBlendAttachmentState fogAttachment{};
     fogAttachment.colorWriteMask = outputs.WritesFogGuide ? 0xfU : 0U;
+    VkPipelineColorBlendAttachmentState albedoAttachment{};
+    if (outputs.SceneDomainAlbedoOverlay)
+        configureOverlayCoverage(albedoAttachment);
+    else
+        albedoAttachment.colorWriteMask = outputs.WritesDiffuseAlbedoGuide ? 0xfU : 0U;
     std::array<VkPipelineColorBlendAttachmentState, kPicaColorAttachmentCount> colorAttachments{
         attachment,        guideAttachment, materialAttachment,       rigidMotionAttachment,
-        ambientAttachment, fogAttachment,   outlineGeometryAttachment
+        ambientAttachment, fogAttachment,   outlineGeometryAttachment, albedoAttachment
     };
     if (outlineOcclusionOnly) ConfigureOutlineOcclusionPass(depthStencil, colorAttachments);
 
@@ -336,7 +340,7 @@ Renderer3ds::NriPicaGraphicsPipelineDesc BuildPicaNriPipelineState(
     result.ColorFormats = {
         VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R8G8B8A8_UNORM,
         VK_FORMAT_R16G16B16A16_SFLOAT, VK_FORMAT_R8G8B8A8_UNORM,
-        VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R32G32B32A32_SFLOAT};
+        VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R32G32B32A32_UINT, VK_FORMAT_R16G16B16A16_UNORM};
     result.ColorAttachmentCount = attachments.ColorAttachmentCount();
     result.DepthStencilFormat = depthFormat;
     return result;

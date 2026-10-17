@@ -57,7 +57,13 @@ bool PicaCompositionSchedule::Compile(
         SetError(error, "native PICA composition sequence identity is missing");
         return false;
     }
-    if (sequence.Draws.empty()) {
+    if (sequence.Purpose != PicaCompositionPurpose::Presentation &&
+        sequence.Purpose != PicaCompositionPurpose::NativeMemory) {
+        SetError(error, "native PICA composition purpose is unsupported");
+        return false;
+    }
+    if (sequence.Draws.empty() &&
+        sequence.Purpose != PicaCompositionPurpose::NativeMemory) {
         SetError(error, "native PICA composition sequence has no draws");
         return false;
     }
@@ -89,6 +95,7 @@ bool PicaCompositionSchedule::Compile(
         mDraws.push_back(draw);
     }
     mSequenceId = sequence.SequenceId;
+    mPurpose = sequence.Purpose;
 
     for (size_t index = 0U; index < mDraws.size(); ++index) {
         const auto& draw = mDraws[index];
@@ -179,13 +186,23 @@ bool PicaCompositionSchedule::Compile(
 
         const size_t firstOpaquePosition = opaquePositions.front();
         const size_t lastOpaquePosition = opaquePositions.back();
-        // Completion of a scene-only target does not require a canonical
-        // opaque/transparent order. Mid-scene effects still need their stricter
-        // anchors; display effects may read the completed, UI-free target.
-        if (target.UiDrawCount == 0U) {
-            const size_t afterTarget = targetDraws.back() + 1U;
-            addAnchor(CompositionStage::SceneResolved, target.Target, afterTarget, true);
-            addAnchor(CompositionStage::BeforeUi, target.Target, afterTarget, true);
+        // Where opaque world drawing starts needs no contiguity: it names the
+        // target's first opaque draw, not the end of an opaque segment, so it
+        // is published even when later stage anchors are withheld.
+        addAnchor(CompositionStage::BeforeOpaque, target.Target,
+                  targetDraws[firstOpaquePosition], false);
+        // Completion of a scene prefix does not require opaque/transparent
+        // contiguity. Publish its native UI boundary only when no scene draw
+        // follows UI on this target; effects must never consume UI pixels.
+        const auto firstUi = std::find_if(targetDraws.begin(), targetDraws.end(),
+            [this](size_t index) { return mDraws[index].Domain == CompositionDomain::Ui; });
+        const bool uiTail = std::all_of(firstUi, targetDraws.end(),
+            [this](size_t index) { return mDraws[index].Domain == CompositionDomain::Ui; });
+        if (uiTail) {
+            const bool atTargetEnd = firstUi == targetDraws.end();
+            const size_t boundary = atTargetEnd ? targetDraws.back() + 1U : *firstUi;
+            addAnchor(CompositionStage::SceneResolved, target.Target, boundary, atTargetEnd);
+            addAnchor(CompositionStage::BeforeUi, target.Target, boundary, atTargetEnd);
         }
         size_t prefixEnd = firstOpaquePosition + 1U;
         while (prefixEnd < targetDraws.size() &&
@@ -253,14 +270,11 @@ bool PicaCompositionSchedule::Compile(
         }
 
         target.WorldStageIssue = PicaCompositionScheduleIssue::None;
-        const size_t beforeOpaque = targetDraws[firstOpaquePosition];
         const bool opaqueAtTargetEnd =
             lastOpaquePosition + 1U == targetDraws.size();
         const size_t afterOpaque = opaqueAtTargetEnd
             ? mDraws.size()
             : targetDraws[lastOpaquePosition + 1U];
-        addAnchor(CompositionStage::BeforeOpaque, target.Target, beforeOpaque,
-                  false);
         addAnchor(CompositionStage::AfterOpaque, target.Target, afterOpaque,
                   opaqueAtTargetEnd);
         addAnchor(CompositionStage::BeforeTransparent, target.Target, afterOpaque,
@@ -290,32 +304,7 @@ bool PicaCompositionSchedule::Compile(
                       ? false
                       : transparentAtTargetEnd);
 
-        size_t lastSceneIndex = 0U;
-        bool sceneFound = false;
-        for (const size_t drawIndex : targetDraws) {
-            if (mDraws[drawIndex].Domain == CompositionDomain::Scene) {
-                lastSceneIndex = drawIndex;
-                sceneFound = true;
-            }
-        }
-        if (sceneFound) {
-            size_t beforeUi = mDraws.size();
-            for (size_t index = lastSceneIndex + 1U;
-                 index < mDraws.size(); ++index) {
-                if (mDraws[index].Domain == CompositionDomain::Ui) {
-                    beforeUi = index;
-                    break;
-                }
-            }
-            if (FindAnchor(CompositionStage::SceneResolved, target.Target) == nullptr) {
-                addAnchor(CompositionStage::SceneResolved, target.Target, beforeUi,
-                          beforeUi == mDraws.size());
-                addAnchor(CompositionStage::BeforeUi, target.Target, beforeUi,
-                          beforeUi == mDraws.size());
-            }
-            addAnchor(CompositionStage::AfterUi, target.Target, mDraws.size(),
-                      true);
-        }
+        addAnchor(CompositionStage::AfterUi, target.Target, mDraws.size(), true);
     }
 
     mValid = true;
@@ -329,6 +318,7 @@ void PicaCompositionSchedule::Reset() noexcept {
     mPublishedGeometryAnchors.clear();
     mTargets.clear();
     mSequenceId = 0U;
+    mPurpose = PicaCompositionPurpose::Presentation;
     mConsumedDrawCount = 0U;
     mExecutionMismatchCount = 0U;
     mValid = false;
@@ -340,6 +330,14 @@ bool PicaCompositionSchedule::Valid() const noexcept {
 
 uint64_t PicaCompositionSchedule::SequenceId() const noexcept {
     return mSequenceId;
+}
+
+PicaCompositionPurpose PicaCompositionSchedule::Purpose() const noexcept {
+    return mPurpose;
+}
+
+size_t PicaCompositionSchedule::ConsumedDrawCount() const noexcept {
+    return mConsumedDrawCount;
 }
 
 std::span<const PicaCompositionRun>

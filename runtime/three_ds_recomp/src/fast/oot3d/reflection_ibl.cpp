@@ -1,11 +1,13 @@
 #include "fast/oot3d/reflection_ibl.h"
 #include "fast/oot3d/pica_surface_coordinates.h"
+#include "fast/renderer3ds/pica_material_guide.h"
 
 #include "fast/oot3d/pica_uniform_layout.h"
 
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <string>
 
 namespace Fast::Oot3d {
 namespace {
@@ -69,21 +71,43 @@ float GeometrySchlickGgx(float nDotV, float roughness) {
 
 } // namespace
 
+PicaReflectionEnvironmentAccumulator::SourceTerms
+PicaReflectionEnvironmentAccumulator::AnalyzeSource(std::string_view source) {
+    SourceTerms terms;
+    terms.Fog = source.find("fog_factor") != std::string_view::npos;
+    terms.GlobalAmbient = source.find("lighting_global_ambient") != std::string_view::npos;
+    for (size_t light = 0; light < 8U && terms.GlobalAmbient; ++light) {
+        const std::string reference = "fragment_uniforms.lighting_ambient[" + std::to_string(light) + "]";
+        if (source.find(reference) != std::string_view::npos)
+            terms.LightAmbientMask |= static_cast<uint8_t>(1U << light);
+    }
+    return terms;
+}
+
 void PicaReflectionEnvironmentAccumulator::Observe(
     uint64_t renderedFrameId, std::string_view fragmentShaderSource,
     std::span<const uint8_t> fragmentUniformBytes,
-    bool eligibleWorldDraw) {
+    bool eligibleWorldDraw, uint64_t sourceKey) {
     if (!eligibleWorldDraw || renderedFrameId == 0U) return;
+    SourceTerms terms;
+    if (sourceKey == 0U) {
+        terms = AnalyzeSource(fragmentShaderSource);
+    } else {
+        auto found = mSourceTerms.find(sourceKey);
+        if (found == mSourceTerms.end())
+            found = mSourceTerms.emplace(sourceKey, AnalyzeSource(fragmentShaderSource)).first;
+        terms = found->second;
+    }
     if (mFrameId != renderedFrameId) {
         mFrameId = renderedFrameId;
         mFogSum = {};
         mAmbientSum = {};
+        mNativeAmbientSum = {};
         mFogCount = 0;
         mAmbientCount = 0;
     }
 
-    if (fragmentShaderSource.find("fog_factor") !=
-        std::string_view::npos) {
+    if (terms.Fog) {
         bool valid = false;
         const auto fog = ReadColor(
             fragmentUniformBytes, kPicaPackedFragmentFogColorOffset, valid);
@@ -92,15 +116,28 @@ void PicaReflectionEnvironmentAccumulator::Observe(
             ++mFogCount;
         }
     }
-    if (fragmentShaderSource.find("lighting_global_ambient") !=
-        std::string_view::npos) {
+    if (terms.GlobalAmbient) {
         bool valid = false;
         const auto ambient = ReadColor(
             fragmentUniformBytes,
             kPicaPackedFragmentLightingGlobalAmbientOffset, valid);
         if (valid) {
-            for (size_t i = 0; i < ambient.size(); ++i)
+            std::array<float, 3> total = ambient;
+            // Directional OoT lights: their ambient reaches every surface.
+            for (size_t light = 0; light < 8U; ++light) {
+                if ((terms.LightAmbientMask & (1U << light)) == 0U) continue;
+                bool lightValid = false;
+                const auto lightAmbient = ReadColor(
+                    fragmentUniformBytes,
+                    kPicaPackedFragmentLightingAmbientOffset + light * kPicaPackedVec4Bytes,
+                    lightValid);
+                if (lightValid)
+                    for (size_t i = 0; i < total.size(); ++i) total[i] += lightAmbient[i];
+            }
+            for (size_t i = 0; i < ambient.size(); ++i) {
                 mAmbientSum[i] += ambient[i];
+                mNativeAmbientSum[i] += total[i];
+            }
             ++mAmbientCount;
         }
     }
@@ -125,6 +162,9 @@ PicaReflectionEnvironmentAccumulator::Resolve(uint64_t renderedFrameId) {
             : fog[i] * 0.25F;
     }
     for (size_t i = 0; i < 3; ++i) {
+        profile.NativeAmbient[i] = mAmbientCount != 0U
+            ? static_cast<float>(mNativeAmbientSum[i] / mAmbientCount)
+            : 0.0F;
         profile.Horizon[i] = mFogCount != 0U ? fog[i] : ambient[i];
         profile.Sky[i] =
             profile.Horizon[i] * 0.75F + ambient[i] * 0.25F;
@@ -366,15 +406,20 @@ layout(set=0,binding=0) uniform texture2D reflection_radiance;
 layout(set=0,binding=1) uniform texture2D normal_guide;
 layout(set=0,binding=2) uniform texture2D material_guide;
 layout(set=0,binding=3) uniform texture2D brdf_lut;
-layout(set=0,binding=4,rgba16f) uniform writeonly image2D resolved_reflection;
+layout(set=0,binding=4,rgba16f) uniform image2D resolved_reflection;
 layout(set=0,binding=5) uniform sampler resolve_sampler;
 layout(push_constant) uniform ResolveState {
     mat4 inverse_projection;
     uvec2 extent;
     float roughness_bias;
     uint surface_orientation;
+    uint fill_screen_space_misses;
+    float fallback_scale;
+    uint output_srgb;
+    uint reserved;
 } state;
-)glsl" + std::string(EffectSurfaceCoordinateShaderLibrary) + R"glsl(
+)glsl" + std::string(EffectSurfaceCoordinateShaderLibrary) +
+        std::string(Renderer3ds::PicaMaterialGuideShaderLibrary) + R"glsl(
 
 void main() {
     ivec2 pixel=ivec2(gl_GlobalInvocationID.xy);
@@ -392,12 +437,27 @@ void main() {
     float roughness=clamp(material.g+state.roughness_bias,0.0,1.0);
     vec2 brdf=texture(sampler2D(brdf_lut,resolve_sampler),
                       vec2(n_dot_v,1.0-roughness)).rg;
-    float coverage=step(0.5,material.b);
     float reflectivity=clamp(material.r,0.0,1.0);
-    float weight=coverage*reflectivity*
+    float weight=pica_reflection_weight(material)*reflectivity*
                  clamp(brdf.x+brdf.y,0.0,1.0);
-    imageStore(resolved_reflection,pixel,
-               vec4(max(radiance.rgb,vec3(0.0)),weight));
+    vec4 result=vec4(max(radiance.rgb,vec3(0.0)),weight);
+    if(state.fill_screen_space_misses!=0u){
+        // The screen-space hits stay; this radiance fills the weight they
+        // leave uncovered (misses, low confidence, screen edges).
+        vec4 screen_space=imageLoad(resolved_reflection,pixel);
+        float covered=clamp(screen_space.a,0.0,1.0);
+        float fill=clamp(weight*state.fallback_scale,0.0,1.0);
+        float total=max(fill,covered);
+        vec3 radiance_rgb=result.rgb;
+        if(state.output_srgb!=0u)
+            radiance_rgb=mix(radiance_rgb*12.92,
+                             1.055*pow(max(radiance_rgb,vec3(0.0)),vec3(1.0/2.4))-0.055,
+                             step(vec3(0.0031308),radiance_rgb));
+        result=total>1.0e-5
+            ? vec4((screen_space.rgb*covered+radiance_rgb*(total-covered))/total,total)
+            : vec4(0.0);
+    }
+    imageStore(resolved_reflection,pixel,result);
 }
 )glsl";
 }

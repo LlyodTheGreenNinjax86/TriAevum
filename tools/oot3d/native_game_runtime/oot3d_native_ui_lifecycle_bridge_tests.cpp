@@ -220,6 +220,40 @@ int main() {
   }
   Require(retainedPageRedrawEdgeCount == 2U,
           "TopScreen page-redraw edges did not retain independent ownership");
+  // System omits both redraw edges and the retained alternate-edge fallback.
+  bridge.SetTopScreenPauseEdgePresentation(
+      BuildTopScreenPauseEdgeGeometry(true, 5U, 0U, 0U, 0, 1.0F, 1.0F));
+  Require(memory.Write32(0x0055B4C4U, 0x00560400U) &&
+              memory.Write32(0x0056044CU, 0x14010000U) &&
+              memory.Write32(0x0055B4A0U, 0x00560500U) &&
+              memory.Write32(0x0056054CU, 0x14020000U) && memory.Write32(0x0050672CU, 2U),
+          "cannot seed cursor/equipment atlases for tab hints");
+  const auto pageHints = bridge.BuildTopScreenPresentation(oot3d::ui::UiSubsystem::GameplayHud);
+  for (const auto owner : {0x005E4030U, 0x005E4058U})
+    Require(std::count_if(pageHints.begin(), pageHints.end(), [=](const auto &primitive) {
+              return primitive.owner_address == owner;
+            }) == 2, "the ordinary page did not emit both tab-hint lanes");
+  Require(memory.Write32(0x0050A530U, 2U), "cannot activate System over the Items gate");
+  bridge.SetTopScreenSystemPagePresentation(true);
+  for (const bool redrawEdges : {true, false}) {
+    if (!redrawEdges) {
+      bridge.SetTopScreenPausePageRedrawEdgePresentation(std::nullopt);
+      Require(memory.Write32(0x0050A530U, 0U), "cannot suppress System in the tail");
+    }
+    const auto systemPresentation = bridge.BuildTopScreenPresentation(oot3d::ui::UiSubsystem::GameplayHud);
+    for (const auto &primitive : systemPresentation)
+      Require(primitive.owner_address != 0x005CD1E0U && primitive.owner_address != 0x005E4030U &&
+                  primitive.owner_address != 0x005E4058U,
+              "System retained pause edges or tab hints");
+  }
+  Require(memory.Write32(0x0050A530U, 0U) && memory.Write32(0x0050672CU, 0U),
+          "cannot leave System");
+  bridge.SetTopScreenSystemPagePresentation(false);
+  const auto returnedEdges = bridge.BuildTopScreenPresentation(oot3d::ui::UiSubsystem::GameplayHud);
+  Require(std::count_if(returnedEdges.begin(), returnedEdges.end(), [](const auto &primitive) {
+            return primitive.owner_address == 0x005CD1E0U;
+          }) == 2, "System suppressed subsequent ordinary page edges");
+  bridge.SetTopScreenPauseEdgePresentation(std::nullopt);
   bridge.SetTopScreenPausePageRedrawEdgePresentation(std::nullopt);
   Require(memory.Write32(0x00504FB0U, 0U),
           "cannot deactivate the typed file-select fixture");
@@ -350,6 +384,151 @@ int main() {
   Require(bridge.ApplyTopScreenGuestHook(kTopScreenQuestSubmitModelsHook) &&
               !bridge.TopScreenPauseProjection().QuestDrawModelAdjusted,
           "native counter refresh must rearm its draw transform");
+
+  for (std::uint8_t phase = 0U; phase <= 10U; ++phase) {
+    Require(IsNativeVersionChoicePresented({true, 0x005F0000U, phase, 0U, 1U}) ==
+                (phase >= 3U && phase <= 8U),
+            "version choice phases outside the panels owned the lower screen");
+  }
+  Require(!IsNativeVersionChoicePresented({false, 0x005F0000U, 8U, 0U, 1U}) &&
+              !IsNativeVersionChoicePresented({true, 0U, 8U, 0U, 1U}) &&
+              !IsNativeVersionChoicePresented({true, 0x005F0000U, 8U, 0U, 2U}),
+          "a disabled, destroyed or single-version selector was presented");
+
+  // The title's normal / Master Quest choice runs in game mode 1, as a lane
+  // of the root pause UI rather than a FileSelect state.
+  NativeA32Memory selectorMemory;
+  Require(selectorMemory.MapRegion(
+              {"selector-state", 0x004F0000U, 0x00110000U, true, false, {}},
+              &error),
+          "cannot map version selector fixture");
+  constexpr std::uint32_t kSelectorOwner = 0x005F0000U;
+  constexpr std::uint32_t kSelectorBackdropResource = 0x005F1000U;
+  constexpr std::uint32_t kSelectorBackdropTexture = 0x1495AA00U;
+  Require(selectorMemory.Write32(0x00588E3CU, 1U) &&
+              selectorMemory.Write32(kOmoteUraSelectorLaneEnabled, 1U) &&
+              selectorMemory.Write32(kOmoteUraSelectorOwner, kSelectorOwner) &&
+              selectorMemory.Write8(kSelectorOwner + 0x04U, 1U) &&
+              selectorMemory.Write8(kSelectorOwner + 0x06U, 1U) &&
+              selectorMemory.Write32(kSelectorOwner + 0x498U,
+                                     kSelectorBackdropResource) &&
+              selectorMemory.Write32(kSelectorBackdropResource + 0x4CU,
+                                     kSelectorBackdropTexture),
+          "cannot seed version selector fixture");
+  Oot3dNativeUiLifecycleBridge selectorBridge(selectorMemory);
+  const auto observeSelectorFrame = [&](std::uint32_t hostFrame) {
+    selectorBridge.BeginHostFrame(hostFrame);
+    Require(selectorBridge.ObserveGuestEntry(kGameplayHudDraw).matched,
+            "version selector fixture was not observed");
+  };
+  observeSelectorFrame(1U);
+  Require(!selectorBridge.NativeFrontendPresentationActive() &&
+              !selectorBridge.NativeTouchPresentationActive() &&
+              !selectorBridge.NativeVersionChoiceBackdropGuestAddress() &&
+              selectorBridge.Stats().version_choice_captures == 0U &&
+              selectorBridge.Stats().version_choice_last_selection == -1,
+          "the title prompt displaced the upper title screen");
+  Require(selectorMemory.Write8(kSelectorOwner + 0x04U, 8U) &&
+              selectorMemory.Write8(kSelectorOwner + 0x05U, 1U),
+          "cannot open the version choice fixture");
+  observeSelectorFrame(2U);
+  Require(selectorBridge.NativeFrontendPresentationActive() &&
+              selectorBridge.NativeTouchPresentationActive() &&
+              selectorBridge.Stats().version_choice_captures == 1U &&
+              selectorBridge.Stats().version_choice_last_selection == 1,
+          "the version choice did not own the frontend presentation");
+  Require(selectorBridge.NativeVersionChoiceBackdropGuestAddress() ==
+              kSelectorBackdropTexture,
+          "the version choice background texture was not resolved");
+  Require(selectorMemory.Write8(kSelectorOwner + 0x06U, 2U),
+          "cannot select the single-version variant");
+  observeSelectorFrame(3U);
+  Require(!selectorBridge.NativeFrontendPresentationActive() &&
+              !selectorBridge.NativeVersionChoiceBackdropGuestAddress(),
+          "the single-version prompt was presented as a choice");
+  Require(selectorMemory.Write8(kSelectorOwner + 0x06U, 1U) &&
+              selectorMemory.Write32(kSelectorOwner + 0x498U, 0U),
+          "cannot drop the version choice background resource");
+  observeSelectorFrame(30U);
+  Require(selectorBridge.NativeFrontendPresentationActive() &&
+              !selectorBridge.NativeVersionChoiceBackdropGuestAddress(),
+          "an unbuilt background changed the version choice presentation");
+  Require(selectorMemory.Write32(kSelectorOwner + 0x498U,
+                                 kSelectorBackdropResource),
+          "cannot restore the version choice background resource");
+  Require(selectorMemory.Write8(kSelectorOwner + 0x06U, 1U) &&
+              selectorMemory.Write32(kOmoteUraSelectorLaneEnabled, 0U),
+          "cannot disable the version selector lane");
+  observeSelectorFrame(4U);
+  Require(!selectorBridge.NativeFrontendPresentationActive(),
+          "a disabled selector lane kept the frontend presentation");
+  Require(selectorMemory.Write32(kOmoteUraSelectorLaneEnabled, 1U) &&
+              selectorMemory.Write8(kSelectorOwner + 0x04U, 9U),
+          "cannot close the version choice fixture");
+  observeSelectorFrame(5U);
+  Require(!selectorBridge.NativeFrontendPresentationActive() &&
+              selectorBridge.Stats().version_choice_captures == 2U,
+          "a closed version choice kept the frontend presentation");
+  Require(selectorMemory.Write32(kOmoteUraSelectorOwner, 0U),
+          "cannot destroy the version selector fixture");
+  observeSelectorFrame(6U);
+  Require(!selectorBridge.NativeFrontendPresentationActive(),
+          "a destroyed selector owner kept the frontend presentation");
+
+  // One screen: the game slides the cards in by itself, so the choice stays
+  // withheld (title visible, no touch ownership) until the player reveals it,
+  // and the reveal ends with the choice.
+  selectorBridge.SetVersionChoiceRevealRequired(true);
+  Require(selectorMemory.Write32(kOmoteUraSelectorOwner, kSelectorOwner) &&
+              selectorMemory.Write8(kSelectorOwner + 0x04U, 8U),
+          "cannot reopen the version choice fixture");
+  observeSelectorFrame(7U);
+  Require(selectorBridge.NativeVersionChoiceAwaitingReveal() &&
+              !selectorBridge.NativeFrontendPresentationActive() &&
+              !selectorBridge.NativeTouchPresentationActive() &&
+              !selectorBridge.NativeVersionChoiceBackdropGuestAddress(),
+          "an unrevealed version choice covered the title");
+  selectorBridge.RevealNativeVersionChoice();
+  Require(!selectorBridge.NativeVersionChoiceAwaitingReveal() &&
+              selectorBridge.NativeFrontendPresentationActive() &&
+              selectorBridge.NativeVersionChoiceBackdropGuestAddress() ==
+                  kSelectorBackdropTexture &&
+              selectorBridge.Stats().version_choice_reveals == 1U,
+          "the reveal did not present the version choice");
+  observeSelectorFrame(8U);
+  Require(selectorBridge.NativeFrontendPresentationActive(),
+          "the reveal did not last for the choice");
+  Require(selectorMemory.Write8(kSelectorOwner + 0x04U, 9U),
+          "cannot close the revealed version choice");
+  observeSelectorFrame(9U);
+  Require(selectorMemory.Write8(kSelectorOwner + 0x04U, 8U),
+          "cannot reopen the version choice fixture");
+  observeSelectorFrame(10U);
+  Require(selectorBridge.NativeVersionChoiceAwaitingReveal(),
+          "a closed choice kept its reveal for the next title");
+  // A press on the title prompt counts as the reveal and survives the
+  // prompt's own phases into the panels.
+  Require(selectorMemory.Write8(kSelectorOwner + 0x04U, 9U),
+          "cannot close the version choice fixture");
+  observeSelectorFrame(11U);
+  Require(selectorMemory.Write8(kSelectorOwner + 0x04U, 1U),
+          "cannot open the title prompt fixture");
+  observeSelectorFrame(12U);
+  Require(selectorBridge.NativeVersionChoicePrompting() &&
+              !selectorBridge.NativeVersionChoiceAwaitingReveal() &&
+              !selectorBridge.NativeFrontendPresentationActive(),
+          "the title prompt was not recognised");
+  selectorBridge.RevealNativeVersionChoice();
+  Require(selectorMemory.Write8(kSelectorOwner + 0x04U, 2U),
+          "cannot advance the title prompt fixture");
+  observeSelectorFrame(13U);
+  Require(selectorMemory.Write8(kSelectorOwner + 0x04U, 3U),
+          "cannot slide the panels in");
+  observeSelectorFrame(14U);
+  Require(!selectorBridge.NativeVersionChoiceAwaitingReveal() &&
+              selectorBridge.NativeFrontendPresentationActive() &&
+              selectorBridge.Stats().version_choice_reveals == 2U,
+          "a prompt press did not reveal the entering panels");
 
   std::cout << "oot3d_native_ui_lifecycle_bridge_tests: ok\n";
   return 0;

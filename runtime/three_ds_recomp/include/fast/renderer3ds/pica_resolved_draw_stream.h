@@ -1,19 +1,22 @@
 #pragma once
 
 #include "fast/renderer3ds/pica_composition.h"
+#include "fast/renderer3ds/pica_light_binding.h"
 #include "fast/renderer3ds/pica_scene_payloads.h"
 #include "fast/renderer3ds/pica_scene_semantics.h"
 #include "fast/renderer3ds/pica_vertex_input_layout.h"
+#include "fast/renderer3ds/virtual_shadow_map.h"
 
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <vector>
 
 namespace Fast::Renderer3ds {
 
-inline constexpr uint32_t kPicaResolvedDrawStreamSchemaVersion = 1U;
+inline constexpr uint32_t kPicaResolvedDrawStreamSchemaVersion = 9U;
 
 struct PicaResolvedVertexLayout {
     uint64_t StructuralKey = 0U;
@@ -30,6 +33,12 @@ struct PicaResolvedDrawRecord {
     uint32_t CommandListOffsetWords = 0U;
     PicaCompositionDomain CompositionDomain = PicaCompositionDomain::Unknown;
     PicaCompositionAttribution Composition;
+    std::optional<std::array<float, 16>> LightingWorldToView;
+    std::shared_ptr<const PicaSceneDirectionalLights> SceneDirectionals;
+    std::shared_ptr<const PicaScenePointLights> ScenePoints;
+    std::shared_ptr<const ::Fast::Renderer3ds::RoomShadowShellScene> RoomShadows;
+    std::array<PicaNativeLightSource, 3U> NativeLightSources{};
+    VirtualShadowCaster ShadowCaster;
     PicaSceneResolvedRasterState Raster;
     PicaSceneRenderTargetState RenderTarget;
 
@@ -63,6 +72,8 @@ struct PicaResolvedDrawRecord {
     uint64_t FragmentUniformOffset = 0U;
     uint64_t FragmentUniformSize = 0U;
     uint64_t FragmentUniformContentVersion = 0U;
+    uint64_t SurfaceLightingUniformOffset = 0U;
+    uint64_t SurfaceLightingUniformSize = 0U;
     PicaSceneBufferResource GeometryBuffer;
     uint32_t FirstVertexBinding = 0U;
     uint32_t VertexBindingCount = 0U;
@@ -72,6 +83,9 @@ struct PicaResolvedDrawRecord {
     int32_t BaseVertex = 0;
     std::array<PicaSceneTextureBinding, 3U> Textures{};
     uint8_t BoundTextureMask = 0U;
+    // Native fragment-lighting LUT image (R32Uint), bound only when the draw's
+    // fragment program samples one.
+    PicaSceneTextureBinding LightingLut;
 
     bool PerspectiveProjection = false;
     PicaNativeLightingState NativeLighting;

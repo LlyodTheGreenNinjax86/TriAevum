@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <span>
 #include <vector>
 
 namespace Oot3dNativeGame {
@@ -17,6 +18,13 @@ struct Oot3dPicaVisualFrame {
     std::vector<uint64_t> StrictDrawIdentities;
     std::vector<Oot3dPicaMemoryFillSubmission> MemoryFills;
     std::vector<Oot3dPicaDisplayTransferSubmission> DisplayTransfers;
+    // The leading work a raw-copy dependency flush already executed for the
+    // canonical target when this frame was closed: draws and fills up to this
+    // submission, and this many leading display transfers. The copy itself may
+    // belong to a later frame. Only the canonical continuation of a newly
+    // closed frame reads it, so a restored replay frame does not carry it.
+    std::optional<uint64_t> DependencyExecutedThroughDraw;
+    size_t DependencyExecutedTransfers = 0;
 };
 
 struct Oot3dPicaVisualFrameSample {
@@ -40,6 +48,7 @@ struct Oot3dPicaVisualDrawView {
     std::optional<Oot3dPicaFragmentUniformState> FragmentUniforms;
     std::optional<Oot3dPicaViewportState> Viewport;
     std::optional<std::array<float, 4>> BlendConstantColor;
+    std::optional<Fast::Renderer3ds::PicaNativeLightBinding> LightBinding;
     std::vector<Oot3dPicaVulkanVertexBinding> VertexBindings;
     bool HasVertexBindingOverrides = false;
 
@@ -49,8 +58,8 @@ struct Oot3dPicaVisualDrawView {
 struct Oot3dPicaVisualFrameViewSample {
     Oot3dPicaDisplayTransferSubmission TopTransfer;
     std::vector<Oot3dPicaVisualDrawView> Draws;
-    const std::vector<Oot3dPicaMemoryFillSubmission>* MemoryFills = nullptr;
-    const std::vector<Oot3dPicaDisplayTransferSubmission>* DisplayTransfers = nullptr;
+    std::span<const Oot3dPicaMemoryFillSubmission> MemoryFills;
+    std::span<const Oot3dPicaDisplayTransferSubmission> DisplayTransfers;
     size_t MatchedDraws = 0;
     size_t StrictUniqueMatchedDraws = 0;
     size_t StrictOrdinalMatchedDraws = 0;
@@ -132,7 +141,21 @@ bool AnalyzeAndSampleOot3dPicaVisualFrameView(const Oot3dPicaVisualFrame& previo
 
 bool ViewOot3dPicaVisualFrame(
     const Oot3dPicaVisualFrame& frame,
-    Oot3dPicaVisualFrameViewSample& output);
+    Oot3dPicaVisualFrameViewSample& output,
+    bool skipCompletedDependencies = false);
+
+// Producers a plan can still re-execute. A retained plan (accumulator pending
+// work, previous or latest replay frame) keeps referencing the copy versions it
+// sampled, so the backend must keep those versions alive behind a weak
+// completion token until the plan is dropped. Destroying a version a retained
+// plan still references would make its replay fall back to CPU bytes.
+void CollectOot3dPicaPlanCopyReferences(
+    const Oot3dPicaVulkanDrawPlan& plan,
+    std::vector<Fast::Renderer3ds::PicaTextureCopyReference>& out);
+
+void CollectOot3dPicaFrameCopyReferences(
+    const Oot3dPicaVisualFrame& frame,
+    std::vector<Fast::Renderer3ds::PicaTextureCopyReference>& out);
 
 // Draw matching and transition analysis are immutable for a pair of source
 // frames. Prepare once, then sample at 1/2 for 2x or at 1/3 and 2/3 for 3x
@@ -172,8 +195,36 @@ class Oot3dPicaVisualFrameAccumulator final {
     void Append(Oot3dPicaMemoryFillSubmission fill);
     void Append(Oot3dPicaDisplayTransferSubmission transfer);
     std::optional<Oot3dPicaVisualFrame>
-    Finish(const Oot3dPicaDisplayTransferSubmission& topTransfer, bool allowTransferOnly = false);
+    Finish(const Oot3dPicaDisplayTransferSubmission& topTransfer);
+    // Closes the pending work as one visual frame per completed guest frame,
+    // oldest first. When the host falls behind, several guest refreshes
+    // accumulate: an earlier snapshot of the selected transfer's source into a
+    // known top-screen display framebuffer (displayOutputs) ends one guest
+    // frame. Other transfers of that source (captures into other buffers)
+    // stay inside their frame. Work of the guest's next frame, drawn after the
+    // selected snapshot into its source, stays pending for the next call.
+    // Draws into the source on one of continuationViewports (compared by
+    // corner and half extents) are not next-frame work: a guest frame that
+    // draws there after its snapshot keeps them.
+    std::vector<Oot3dPicaVisualFrame>
+    FinishFrames(const Oot3dPicaDisplayTransferSubmission& topTransfer,
+                 std::span<const uint32_t> displayOutputs,
+                 std::span<const Oot3dPicaViewportState> continuationViewports = {});
     size_t PendingDrawCount() const;
+    // Live plans the accumulator has not published as a frame yet. They still
+    // pin the copy versions their textures reference.
+    [[nodiscard]] std::span<const Oot3dPicaVulkanDrawPlan> PendingDraws()
+        const noexcept {
+        return mPendingDraws;
+    }
+    // A deferred raw TextureCopy owns one guest PPF completion. The obligation
+    // is part of the ordered replay state, so it must survive save and restore
+    // and be discharged by the dependency boundary, never by host-local state.
+    bool HasPendingRawCopyCompletion() const;
+    // Views only the unexecuted native prefix. The owning plans remain available
+    // for the complete visual frame and its subsequent interpolated samples.
+    bool ViewDependencyWork(Oot3dPicaVisualFrameViewSample& output);
+    void CompleteDependencyWork();
     Oot3dPicaVisualFrameAccumulatorState CaptureState() const;
     bool RestoreState(Oot3dPicaVisualFrameAccumulatorState state);
 

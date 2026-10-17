@@ -18,8 +18,8 @@ struct Gpu {
     uint32_t Family{};
     VkPhysicalDeviceMemoryProperties Memory{};
     struct Buffer { VkBuffer Handle{}; VkDeviceMemory Memory{}; void* Mapped{}; };
-    Gpu() {
-        VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO}; app.apiVersion = VK_API_VERSION_1_1;
+    explicit Gpu(const VkPhysicalDeviceFeatures& features = {}, uint32_t apiVersion = VK_API_VERSION_1_1) {
+        VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO}; app.apiVersion = apiVersion;
         VkInstanceCreateInfo info{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO}; info.pApplicationInfo = &app;
         Check(vkCreateInstance(&info, nullptr, &Instance));
         uint32_t count = 0; Check(vkEnumeratePhysicalDevices(Instance, &count, nullptr));
@@ -36,6 +36,7 @@ struct Gpu {
         float priority = 1;
         VkDeviceQueueCreateInfo q{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO}; q.queueFamilyIndex = Family; q.queueCount = 1; q.pQueuePriorities = &priority;
         VkDeviceCreateInfo d{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO}; d.queueCreateInfoCount = 1; d.pQueueCreateInfos = &q;
+        d.pEnabledFeatures = &features;
         Check(vkCreateDevice(Physical, &d, nullptr, &Device)); vkGetDeviceQueue(Device, Family, 0, &Queue);
     }
     uint32_t Type(uint32_t mask, VkMemoryPropertyFlags flags) {

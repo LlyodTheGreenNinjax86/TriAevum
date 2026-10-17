@@ -163,6 +163,7 @@ bool Smaa1xPass::Initialize(VkPhysicalDevice physicalDevice,
             pipeline.shader.bytecode = shader.data();
             pipeline.shader.size =
                 shader.size() * sizeof(uint32_t);
+            pipeline.cache = NriInteropAccess::PipelineCache(interop);
             if (mImpl->Core->CreateComputePipeline(
                     *nriDevice, pipeline, mImpl->Pipelines[i]) !=
                 nri::Result::SUCCESS) {
@@ -255,7 +256,7 @@ bool Smaa1xPass::Configure(
     return false;
 #else
     if (mImpl->Width != 0U &&
-        vkDeviceWaitIdle(mImpl->Device) != VK_SUCCESS) {
+        !mImpl->Interop->CompleteRecordedWork()) {
         return false;
     }
     InvalidateScreenResources();

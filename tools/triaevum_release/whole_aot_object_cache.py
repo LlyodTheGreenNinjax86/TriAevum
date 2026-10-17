@@ -59,10 +59,31 @@ class NativeToolchain:
     target_triple: str = release_platform.WINDOWS.target
     profile: str = release_platform.WINDOWS.profile
     sysroot: Path | None = None
+    # Developer-side LLVM instrumentation PGO. "generate" emits front-end
+    # counters, "generate-ir" emits IR-level counters (required for
+    # context-sensitive PGO); "use" consumes a merged .profdata of either
+    # kind, which clang detects from the profile header. All change code
+    # generation only, so they are part of the object identity.
+    profile_instrumentation: str = "none"
+    profile_data: Path | None = None
 
     @property
     def platform(self) -> release_platform.ReleasePlatform:
         return release_platform.for_target(self.target_triple)
+
+
+PROFILE_INSTRUMENTATION_MODES = ("none", "generate", "generate-ir", "use")
+
+
+def _profile_arguments(toolchain: NativeToolchain) -> tuple[str, ...]:
+    if toolchain.profile_instrumentation == "generate":
+        return ("-fprofile-instr-generate",)
+    if toolchain.profile_instrumentation == "generate-ir":
+        return ("-fprofile-generate",)
+    if toolchain.profile_instrumentation == "use":
+        assert toolchain.profile_data is not None
+        return (f"-fprofile-instr-use={toolchain.profile_data}",)
+    return ()
 
 
 @dataclass(frozen=True)
@@ -122,6 +143,23 @@ def _toolchain_identity(toolchain: NativeToolchain, sysroot: WindowsSysroot | No
     digest.update(b"\0")
     for role, path in (("compiler", compiler), ("archiver", archiver)):
         _hash_record(digest, role, path.stat().st_size, sha256_file(path))
+    mode = toolchain.profile_instrumentation
+    if mode not in PROFILE_INSTRUMENTATION_MODES:
+        raise WholeAotObjectError(f"unsupported profile instrumentation: {mode}")
+    profile_data = None
+    if mode == "use":
+        if toolchain.profile_data is None:
+            raise WholeAotObjectError("profile use requires merged profile data")
+        profile_data = _validate_tool(toolchain.profile_data, "profile data")
+    elif toolchain.profile_data is not None:
+        raise WholeAotObjectError("profile data is only valid in profile use mode")
+    if mode != "none":
+        # Absent for "none" so existing object identities stay unchanged.
+        digest.update(b"\0profile-instrumentation\0")
+        digest.update(mode.encode("ascii"))
+        if profile_data is not None:
+            _hash_record(digest, "profile-data", profile_data.stat().st_size,
+                         sha256_file(profile_data))
     return (
         digest.hexdigest(),
         NativeToolchain(
@@ -130,6 +168,8 @@ def _toolchain_identity(toolchain: NativeToolchain, sysroot: WindowsSysroot | No
             target_triple=toolchain.target_triple,
             profile=toolchain.profile,
             sysroot=toolchain.sysroot,
+            profile_instrumentation=mode,
+            profile_data=profile_data,
         ),
     )
 
@@ -203,9 +243,15 @@ def default_dependency_files(
     repo = repo_root.expanduser().resolve()
     generated = generated_directory.expanduser().resolve()
     nlohmann = nlohmann_include.expanduser().resolve()
+    manifest = load_json_object(generated / "whole_aot_cpp_manifest.json")
+    memory_headers = (
+        (repo / "tools/oot3d/native_game_runtime/oot3d_native_a32_memory_region.h",)
+        if manifest.get("memory_regions") else ()
+    )
     candidates = (
         repo / "tools/oot3d/native_game_runtime/oot3d_native_whole_aot_runtime.h",
         repo / "tools/oot3d/native_game_runtime/oot3d_native_a32_memory.h",
+        *memory_headers,
         repo / "tools/oot3d/native_a32_runtime/oot3d_aot_architectural_state.h",
         repo / "tools/oot3d/native_a32_runtime/oot3d_native_a32_vfp_ops.h",
         *(repo / "tools/oot3d/native_a32_runtime/upstream/recomp").glob("*.h"),
@@ -259,6 +305,7 @@ def _compile_arguments(
             "/w",
             "/Zc:preprocessor",
             "-flto=thin",
+            *_profile_arguments(toolchain),
             "/DNOMINMAX",
             "/DOOT3D_NATIVE_GENERATED_WHOLE_AOT=1",
             *(f"/I{path.resolve()}" for path in include_roots),
@@ -277,6 +324,7 @@ def _compile_arguments(
         "-ffp-model=strict",
         "-w",
         "-flto=thin",
+        *_profile_arguments(toolchain),
         "-DNOMINMAX",
         "-DOOT3D_NATIVE_GENERATED_WHOLE_AOT=1",
         *(f"-I{path.resolve()}" for path in include_roots),

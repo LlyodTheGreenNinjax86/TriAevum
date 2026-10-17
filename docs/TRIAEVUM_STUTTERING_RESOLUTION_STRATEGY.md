@@ -1124,3 +1124,577 @@ expire, so the commands, fixture identity, hashes and measured limits recorded
 here are the handoff, not an assumption that `%TEMP%` remains available.
 
 Do not restart this backlog automatically during unrelated feature work.
+
+## Enhanced profile frame flow (2026-10-01)
+
+Requested optimization phase for the built-in Enhanced preset (DLSS Ultra
+Performance with the transformer model, 4K windowed, VSync on), on the Kokiri
+walk fixture (`ref-kokiri2`), RTX 3060, 6 cores / 12 threads.
+
+Measurement correction. `(host_seconds - largest interval) / frames` overstates
+the frame time: the window contains several preparation stalls, not one. Use the
+`benchmark_window.frame_times` percentiles (`TRIAEVUM_PACING_TRACE=1`) and the GPU
+timeline. `TRIAEVUM_GPU_GAP_TRACE=1` prints, every 60 frames, the GPU's busy
+time per frame (the frame scope's timestamps) and its idle time between
+consecutive frames, which separates GPU-bound, CPU-bound and presentation-bound
+frames. `gpu.frame_ms` alone cannot: it excludes the gaps.
+`TRIAEVUM_GPU_TIMELINE=1` (2026-10-06) attributes the busy time: labelled
+timestamps at every profile scope, top-target render pass, grass draw, shadow
+map and display effect pass, reported as mean ms per label every 300 frames
+(`TRIAEVUM_INTRO_2160P_PERFORMANCE.md`).
+
+| Mode | Frame time | GPU busy / idle per frame |
+| --- | --- | --- |
+| VSync on (user setting) | p50 15.6-16.1 ms, p95 ~25 ms, 13-20/420 over 33.3 ms | ~11 ms / remainder of 16.7 ms |
+| VSync off, windowed | 16.7 ms (compositor cadence) | 10.7 / 6.0 ms |
+| No presentation (`TRIAEVUM_BENCHMARK_NO_PRESENT=1`) | ~11 ms | 10.5 / <1 ms |
+
+Without presentation the walk is GPU-bound: the DLSS CNN model removes 2.5 ms of
+GPU work and 2.45 ms of frame time. A user-mode stack sampler on the render
+thread (no administrator rights needed) attributed ~30% of its time to Grass:
+selection jobs it waits for (~15%), the interaction field's spring integration
+over all 256x256 cells (~7%), shadow refinement and copies. A further 3.6% was the
+CRT `getenv` (lock and scan) called per draw for diagnostics switches.
+
+Retained:
+
+- The interaction field integrates, shifts and stamps only the active columns of
+  each row. Cells evolve independently and a cell at rest (+0 displacement and
+  velocity, no height) stays at rest, so the field is bit-identical: a
+  differential harness against the previous implementation matched 36,000
+  updates (64/256 resolution, per-frame recentring, teleports, context changes,
+  zero steps).
+- Diagnostics switches in per-draw and per-source paths are read once.
+
+Paired no-presentation A/B: renderer CPU frame 8.40 -> 7.35 ms
+(`grass_render` 2.93 -> 2.20 ms); throughput is unchanged because the GPU bounds
+it. Deterministic captures are 12/12 identical to the previous build.
+
+Observed, not retained: for one period during a remote-desktop session, VSync
+presentation fell to p50 30 ms. The render thread waited 24.6 ms for the
+in-flight fence while the GPU idled ~16 ms per frame, because the frame's single
+submission waits for the swapchain image at `ALL_COMMANDS`, holding all of the
+frame's GPU work behind the acquisition. Submitting the work recorded before the
+first swapchain access separately removed that wait (sync validation clean,
+captures identical), but paired A/B after the throttling stopped showed no
+difference (p50 15.6-16.1 ms either way). Following the rejected-submission rule
+above it was removed. Revisit only with a reproducible throttled-presentation
+fixture.
+
+Open, pre-existing in the previous build:
+
+- Enhanced captures vary between runs in late frames (previous build against
+  itself: 10/12, frames 360/390, up to 6.9% of pixels at 330 in another pair).
+- Synchronization validation reports `WRITE_AFTER_WRITE` between a colour clear
+  and a layout transition of one effect image.
+
+Remaining costs: Grass selection (the render thread waits ~2.6 ms for its jobs;
+per-anchor LOD evaluation includes `logf`/`log1pf`), DLSS transformer
+4.7-5.3 ms and Grass 1.9-2.2 ms of GPU work, render command recording ~1 ms.
+
+## Residual shader stutter in the Enhanced profile (2026-10-02)
+
+Goal set by the maintainer: zero shader stutter without losing performance.
+
+Measured sources, the user's own sessions (`play-kokiri/game-20261001*.err.log`,
+warm application and driver caches, renderer and caches on a 5400 rpm HDD):
+
+| Per session | Count | Time |
+| --- | ---: | ---: |
+| NRI pipelines created on the render thread | 185-316 | 2.8-41.0 s |
+| Runtime GLSL->SPIR-V compilations | 41 | 3.9 s |
+| SPIR-V cache reads (HDD, ~16 ms each) | 148 | 2.35 s |
+| Pass shader compilations | 6 | 0.8 s |
+| Collected AOT pack hits | 0 of 193 | - |
+
+The bundled/collected pack is keyed by generated source text, so every
+generator or effect change makes it stale (the J: pack predates the current
+instrumentation). Cold Kokiri walk (420 frames, empty application cache):
+73 SPIR-V (13.8 s), 14 passes (3.0 s), 136 pipelines (26.7 s), all synchronous;
+53 of the 72 programs are instrumented (effect) variants, which Forge never
+prepares. Warm: 136 pipelines still cost 0.46 s in the first frames.
+
+Fixed passes absent from the built-in catalogue (Enhanced, now reported by
+`TRIAEVUM_PASS_ARTIFACT_MISS`): the six iMMERSE MXAO programs (their artifacts
+must stay under `fast/immerse`), `brixelizer_gi_prepare.comp`,
+`oot3d_pica_texture_copy_derive.comp`, the scanout orientation variants,
+`native_surface_lighting.vert` and the shadow caster programs derived from the
+maintained vertex family (directional/point vertex, alpha caster fragment).
+
+Parametric TEV (`--pica-parametric-tev`) makes the native list finite (8
+structural fragment configurations, 6 vertex programs, built in), and reduces the
+cold walk to 28 SPIR-V and 107 pipelines (11 instrumented programs in steady
+play; 17 more are one-shot specialized sources embedded in the visual
+savestate). It is NOT adoptable as is:
+
+- GPU cost: paired no-presentation runs, frame 11.1-11.8 ms specialized versus
+  17.3-17.9 ms parametric (`native_pica_ms` 0.33 -> 2.2 ms). The evaluator is an
+  uber-shader at the Enhanced internal resolution.
+- Exactness: the TEV core is bit-identical to the canonical emitter (4,096 GPU
+  cases, now checked bit for bit in `pica_tev_gpu_tests`), but parametric
+  lighting differs from the specialized emission by 1 ulp in 71 of 512 channels
+  (`pica_lighting_gpu_tests` uses a 1e-5 tolerance). After 8-bit rounding this
+  flips one step on 1-4 pixels in some frames; DLSS/MXAO accumulation spreads it
+  to ~0.5% of pixels. One parametric run also differed from another by 2 pixels.
+
+Plan (keeps specialized programs, so no GPU cost):
+
+A. Preparation journal: record every program/pipeline created during play with
+   its complete description (SPIR-V included) in the renderer cache; at launch,
+   background threads recreate them and hand them to the draw path, so warm
+   content costs no compilation, cache read or pipeline creation on the render
+   thread. Tag with the descriptor contract; age out unused entries.
+B. Regenerate from inputs: record PICA registers/state and the draw-class
+   variant request instead of text, so a renderer update regenerates everything
+   at launch with the current generator and settings.
+C. Forge: seed B from the existing register snapshots (Azahar/Citra) and the
+   TAS corpus, re-expressed as inputs, so never-visited content is prepared too.
+D. For draws still unseen: an exact-enough immediate fallback while the
+   specialized program compiles in the background, limited to those draws.
+
+Also outside shaders: Grass placement (1.4 s at area entry), texture pack and
+cache reads from the HDD.
+
+## Hybrid preparation: background programs and always-available programs (2026-10-02)
+
+Goal set by the maintainer: no missing program and no shader stutter, at a
+trivial cost. Neither tier alone gives both: specialized programs are fast but
+open-ended (some draw always meets a new one); the parametric family is finite
+but costs 3.7 ms of GPU work per Enhanced frame even with effects off (7.3 ->
+10.9 ms, paired no-presentation runs). The hybrid draws each draw with its
+specialized program once that is ready and with its always-available program
+until then, so no draw waits for compilation and the slower program only covers
+transitions.
+
+First part, selected by `TRIAEVUM_SHADER_PREPARATION`:
+
+| Mode | Behaviour |
+| --- | --- |
+| `sync` (default) | Unchanged: a draw creates its own program and pipeline |
+| `complete` | Specialized programs (SPIR-V) and pipelines are prepared by a `PicaPreparationQueue` (three below-normal threads); a draw completes its own unfinished work, so output stays deterministic |
+| `hybrid` | A draw without a ready specialized program draws with its always-available program; only a draw that has neither completes its specialized program |
+| `uber` | Verification: always-available programs wherever they exist |
+
+- The frontend plan carries, beside each specialized fragment program, its
+  parametric pair (the specialized state key determines every input of the
+  parametric program). The backend instruments that pair exactly like the
+  specialized program and accepts it only from built-in SPIR-V (native,
+  temporal and toon families, title vertex family): an always-available program
+  never compiles.
+- Always-available pipelines link startup-prepared graphics pipeline library
+  parts (`NriPicaPipelineFactory::Libraries`, extended dynamic state);
+  specialized pipelines stay monolithic and are created on preparation threads
+  (`NriPicaPipelineBridge::RequestOwnedPipeline/Poll/Complete`). The device
+  negotiates libraries for `hybrid`/`uber`; `TRIAEVUM_NRI_PIPELINE_LIBRARIES=1`
+  still moves every pipeline onto libraries and `0` disables them.
+- `TRIAEVUM_HYBRID_PREPARATION` (end of run) reports specialized, uber and
+  completed draws, completion time, preparation tasks and why a draw had no
+  always-available program; `TRIAEVUM_UBER_DIAGNOSTICS=1` names each one.
+
+Kokiri Enhanced walk, empty application cache (driver caches warm), 420 frames:
+`complete` waited 47 s in 136 draws (maximum 2.0 s), as `sync` did; `hybrid`
+drew 194 draws with always-available programs and still waited 42 s in 96: the
+Enhanced effects (per-pixel lighting, PBR, guides) have no built-in
+always-available programs yet, and one CMB vertex variant (temporal + surface)
+is not built in. Captures (cfg-enhanced-k, 12 frames) are identical across
+`sync`, `complete` and `hybrid`. Startup preparation of the native and temporal
+library parts takes 16-18 s with an empty pipeline cache and 0.1-0.3 s warm; it
+is synchronous and must move to the background before `hybrid` can be default.
+
+Next: express the effect layer as data in one superset program per parametric
+structural configuration (decisions recorded by the same instrumentation code
+that composes specialized programs), so every draw has an always-available
+program; then background part preparation, base exactness (lighting emission
+order), the pass catalogue and shadow caster programs.
+
+### Always-available effect layer, finite pass catalogue (2026-10-02)
+
+Every draw now has an always-available program (U) next to its specialized
+program (S), and U executes S's decisions:
+
+- The instrumentation that composes S records every branch it takes
+  (`PicaEffectDecisions`, including the guide outputs S declares). The superset
+  program of the draw's parametric base implements the same branches; binding 15
+  carries the decisions (4-bit enum fields) with the toon parameters. U uses S's
+  variant for everything except the program: decisions, outputs, applied
+  features and bindings. The pipeline masks the guide attachments S leaves
+  undeclared (they stay untouched, as with S).
+- The superset covers per-pixel lighting, PBR (data-driven coordinate,
+  projection, seams, native lighting and LUTs; the specialized snippets are
+  shared verbatim, cross-hook values hoisted by `HoistPicaGlslDeclarations`),
+  AO texture relief (unit, coordinate and gain as data, shared texts),
+  directional and point shadows, toon, every guide, scene domain, reflection,
+  reactive and rigid motion. 24 built-in programs: lighting x integer
+  texture 0 x temporal inputs x {no surface, surface, surface with fragment
+  primitive IDs}. `build_fragment_artifacts --uber`.
+- Plans restored from a visual savestate carry the parametric base of their
+  structural configuration (`AttachOot3dPicaRestoredUberFragment`).
+- Derivatives after the native alpha test are undefined (the quad may have
+  lost invocations), and two differently structured programs resolved them
+  differently: the native-view normal guide took `dFdx(pica_view)` in the
+  epilogue. Both programs now take the view derivatives at the main prologue
+  (`kViewDerivativesPrologue`), which also makes S defined at alpha-tested edges.
+- Startup preparation runs on the preparation workers: the title vertex family,
+  the canonical bases and the superset programs this device can create. A draw
+  that needs a part being created waits for that part alone; the NRI graphics
+  pipeline library cache creates and links parts outside its lock (per-part
+  in-flight entries).
+- Fixed passes the catalogue lacked are built in (texture copy derive, GI
+  prepare, scanout orientations; MXAO in `fast/immerse` under
+  `THREE_DS_RECOMP_ENABLE_IMMERSE`, `build_immerse_pass_artifacts`). Shadow
+  caster and surface-lighting vertex programs derived from the title vertex
+  family are built with it (`kTitlePassArtifacts`, registered by the title);
+  alpha-tested casters run the parametric base (4 built-in programs,
+  `--casters`) when the draw carries its pair.
+
+Verification (parametric verification mode, U against the instrumented
+parametric program, deterministic configurations): Enhanced without grass
+(DLSS, MXAO, GI, reflections) 12/12; MXAO with renderer normals 12/12; PBR
+material pack scene (828 PBR draws) within the run-to-run noise of that scene
+(isolated single pixels also present between two runs of the same mode).
+AO texture relief is not run-to-run deterministic even between two runs of the
+same mode, so captures cannot qualify it; U runs the same shared text with the
+same decisions. The first run of a probe sequence is a pre-existing outlier:
+compare against a second run.
+
+`hybrid` is the default (`TRIAEVUM_SHADER_PREPARATION=sync` keeps draw-time
+preparation). Kokiri Enhanced walk with grass, 420 frames, no captures
+(`--timing`, pacing trace), specialized base:
+
+| run | p50 ms | p95 ms | p99 ms | >33 ms | compile waits |
+|---|---|---|---|---|---|
+| sync, warm cache | 14.88 | 22.88 | 137.8 | 11 | - |
+| hybrid, warm cache | 15.50 | 21.75 | 83.8 | 7 | 0 (U acquire max 1.0 ms) |
+| sync, empty cache | 14.38 | 28.12 | 12411 | 18 | blocking, max 12.4 s |
+| hybrid, empty cache | 18.38 | 29.62 | 228.1 | 11 | 0 S waits; one U part wait 12.4 s |
+
+Captures (cfg-enhanced-k, 12 frames) are identical between `sync` and warm
+`hybrid`. A 2.5-4.9 s frame occurs in every mode with a warm cache: it is not
+program preparation. `phase_timing.slow_frames` places it after the state
+load: frame 2 in `host_frame_start` (2.2-2.5 s) and frame 5 in `present`
+(2.5 s sync, 4.9 s hybrid), where effect passes create their pipelines and
+resources on first use. Background part compilation lengthens that frame
+despite below-normal priority (the driver serializes part of pipeline
+creation), so the effect passes' pipelines belong in the load-time
+preparation too. Startup preparation (39 parts) takes about 45 s with an
+empty driver/pipeline cache on the spare cores and about 1 s warm; a superset
+part takes 5-12 s to compile cold, so a draw that needs one before it is ready
+waits for it (first launch only, when gameplay starts at once).
+
+Next: acquire U without waiting for an in-flight part (complete S instead when
+it is the shorter path) or prepare on a first-launch screen; journal/Forge seed
+of S programs; lighting emission order (1 ulp) between bases so U and S are
+bit-identical in every frame, not only after the swap.
+
+### Effect pipelines from the persisted cache (2026-10-02)
+
+`TRIAEVUM_SLOW_STEP_MS=<threshold>` prints every timed renderer step slower
+than the threshold (`TRIAEVUM_SLOW_STEP scope=... step=... ms=...`): frame
+start/end, PICA draws, display transfers and each effect pass of the display
+graph, directional and point shadows, interactive grass (placements, surface
+lighting), and the host loop's frame start and present. Disabled, a step costs
+one load.
+
+It attributes the post-load slow frames (Kokiri Enhanced, warm caches):
+
+| frame | step | before | after |
+|---|---|---|---|
+| 5 | directional shadow casters, first use | 0.91 s | < 0.1 s |
+| 5 | point shadow casters, first use | 0.67 s | < 0.1 s |
+| 5 | interactive grass: scene placements | 1.03-1.07 s | unchanged |
+| 2 | upscaler: DLSS feature creation | 1.40-1.51 s | unchanged |
+
+The caster, effect and grass pipelines were created without a pipeline cache,
+so every launch compiled them again on first use. Every pipeline of the device
+now uses the persisted caches: NRI passes and casters the NRI cache (owned by
+the PICA pipeline bridge and lent to the interop context,
+`NriInteropAccess::PipelineCache`), raw Vulkan passes (grass, its compactor
+and shadow grid, surface lighting, raw copy encode) the backend's
+`VkPipelineCache`. Frame 5 drops from 2.75 s to 1.17 s.
+
+The remaining two are one-time initializations, not programs:
+
+- DLSS creates its NGX feature on the first dispatch (and again when the
+  resolution or quality changes). The creation records and submits on the
+  graphics queue, so it cannot move to a worker while frames submit.
+- `GrassStaticPlacementCache::Resolve` waits for the whole scene's grass
+  placements (built in parallel on the placement workers) so grass never
+  appears partially; on entering a scene that wait is about 1 s here.
+  Starting a scene's placements when its geometry registers, before its first
+  rendered frame, would hide it behind the scene transition.
+
+GPL shader parts log their creation time
+(`TRIAEVUM_NRI_GPL_SHADER_PART_CREATED part=N ms=...`): warm, the 41 startup
+parts take 80-470 ms each while 16 threads contend, 0.9 s wall time, all before
+the state loads.
+
+These runs shared the GPU with a streaming client (about 24 % utilization at
+idle), so their absolute frame times are not comparable with the table above;
+the attribution is CPU wall time on the render thread.
+
+### First launch: startup preparation order and threads (2026-10-02)
+
+With empty caches a draw that needs an always-available part before it is
+ready waits for that part alone. On a 6-core/12-thread machine the startup
+preparation ran 11 threads next to the specialized-program workers and the
+game: oversubscribed driver compilation made each superset part take 19-31 s
+of wall time (about 3-5 s alone) for no added throughput, and the parts started
+after the canonical bases. `VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT` on the
+fragment parts changed nothing (402 s vs 398 s summed part time): the driver
+ignores it for pipeline libraries.
+
+Startup preparation now runs about one thread per physical core minus one
+(`hardware_concurrency / 2 - 1`, clamped to 1-8) and creates the vertex parts,
+then the superset programs, then the canonical bases. Kokiri Enhanced, empty
+caches, interleaved rounds (wait of the first draw that needs a part):
+
+| startup preparation | round 1 | round 2 | round 3 |
+|---|---|---|---|
+| 11 threads, canonical bases first (before) | 11.95 s | 21.9 s | 13.4 s |
+| 5 threads, canonical bases first | 7.1 s | 7.1 s | 7.5 s |
+| 5 threads, superset programs first (now) | 5.4 s | 5.8 s | 5.4 s |
+
+The cold run's longest frame drops from 13.5-22 s to 6.0-6.4 s. Preparation as
+a whole ends later (about 60 s instead of 50 s), in the background. A first
+launch that reaches gameplay before its superset parts exist still waits for
+the part it needs; only a preparation step before gameplay removes that wait.
+
+### One lighting text for specialized and always-available programs (2026-10-02)
+
+The specialized program emitted its fragment lighting unrolled per light; the
+always-available program runs `PicaLightingProgramBody`, reading the decoded
+program from the draw's uniforms. Both evaluated the same operations in the
+same order, but the compiler contracted and expanded them differently: 71 of
+512 channels of `pica_lighting_gpu_tests` differed by 1 ulp (its 1e-5
+tolerance hid them).
+
+The specialized program now runs the same text with its program as a constant
+(`pica_lighting_constant_program`, built by the same `BuildPicaLightingProgram`
+as the uniform payload); the compiler folds every branch. Lighting operations
+are `precise` (no contraction), and `dot`, `normalize`, `length` and `cross`
+are spelled out (`PicaLightingArithmeticFunctions`): the driver expands those
+builtins differently once inputs fold to constants (with `cross` alone left as a
+builtin, 4 of 512 channels still differed). The GPU test now requires bit
+identity: 0 of 512. Every built-in fragment family is regenerated.
+
+Specialized programs on every draw (`sync`) against always-available programs
+on every draw (`uber`), Kokiri, 12 captures:
+
+| configuration | sync vs uber | reference noise |
+|---|---|---|
+| effects, AA and AO off (`cfg-enh-static`) | 8/12 identical, others 1-5 px | - |
+| Enhanced without grass, AA off | 2-5/12 identical, 4-75 px, max 9 | sync vs sync 12/12; uber vs uber 9/12, 51 px |
+| Enhanced without grass, TAA | 1/12, 0.002 % | - |
+| Enhanced without grass, DLSS | 0.85 % (before: about 1.2 %), max 17-33 | sync vs sync 12/12 |
+
+Without an upscaler the remaining difference is the always-available mode's
+own run-to-run variation (uber vs uber is not bit-stable, sync vs sync is; open).
+DLSS accumulates it in its history across the frame; differences under 1 % are
+accepted when an upscaler is involved. GPU cost, interleaved warm rounds
+(Kokiri Enhanced with grass, GPU shared with a streaming client): mean GPU busy
+11.00 ms per frame before, 11.18 ms after, within the 0.6-0.8 ms spread of each
+build's rounds.
+
+Real use after these changes (Kokiri Enhanced with grass, DLSS, 12 captures):
+`sync` against `sync` and `hybrid` against `hybrid` are identical (12/12);
+`sync` against `hybrid` differs in 1.16-1.2 % of pixels (max 41-58), warm or
+cold. Hybrid draws its first frames after a load with always-available
+programs (about 580 draws warm) until the specialized ones are linked, and the
+upscaler carries those frames' residual in its history. Accepted threshold for
+upscaled output: under 2 %. The earlier statement that warm `hybrid` captures
+equal `sync` captures held for that build and is superseded by this one.
+
+### Initial preparation (2026-10-02)
+
+The game starts behind a preparation screen (`NativePreparationScreen`, drawn
+on the ImGui foreground over everything else; captures read framebuffer 0
+before it and are unaffected):
+
+1. The guest waits, its clock stopped and its frames not counted, until the
+   renderer's startup preparation is ready
+   (`PicaProgramPreparationBackend::PreparationStatus`): every startup program
+   part, and the DLSS features of the last run. A DLSS feature depends only on
+   its output size, quality, input encoding and preset; the backend records the
+   keys of its live features in the renderer cache (`dlss_feature.txt`) and
+   creates them on the first active frame when the settings and swapchain
+   still match (`NriInteropContext::PrepareDlss`, the same creation the
+   dispatch runs; the dispatch reuses the feature of its key; see
+   [Scene changes](#scene-changes-one-temporal-upscaler-instance-per-stream-2026-10-02)).
+2. The first guest frames render under the screen until ten in a row take
+   less than 100 ms (at most 30 s): what is left of the first-use costs, such
+   as the first scene's grass placements, a DLSS feature for new parameters or
+   cold caster pipelines on a first launch, is paid there.
+
+The benchmark window starts after the preparation; `runtime.json` reports it
+(`initial_preparation`: startup and wait seconds, first frames and their
+seconds) and `TRIAEVUM_INITIAL_PREPARATION` prints it. Kokiri Enhanced with
+grass:
+
+| run | guest waited | first frames under the screen | longest measured frame |
+|---|---|---|---|
+| empty caches (first launch) | 46.1 s (programs) | 17 frames, 6.1 s (DLSS 1.65 s, casters 2.1 s, grass 1.4 s) | 105 ms (was 11.4 s) |
+| warm caches | 0 s (DLSS created in the first frame begin, 1.6 s) | 17 frames, 2.0 s (grass 1.1 s) | 40 ms (was 2.7 s) |
+
+Captures are unchanged: `sync` against `sync` 12/12. Scenes entered later
+still build their grass placements on their first grass frame (about 1 s for
+Kokiri), as before.
+
+### Startup programs prepared by Forge (2026-10-02)
+
+The first launch no longer waits for the startup program parts: Forge's device
+preparation creates them during installation, into the renderer cache the game
+then loads (`--startup-programs`, see
+[NRI pipeline preparation](TRIAEVUM_NRI_PIPELINE_PREPARATION.md#startup-programs-2026-10-02)).
+The renderer and the helper derive the parts from one owner
+(`renderer3ds/pica_startup_programs.h`: the title vertex family, the superset
+programs, the canonical bases, the same preparation interface and sample
+count), and negotiate graphics pipeline libraries with one function
+(`PicaPipelineLibrariesSupported`, `kPicaPipelineLibraryExtensions`): one
+differing parameter would be a silent cache miss.
+
+Kokiri Enhanced with grass, RTX 3060, i5-12400F (6 cores), same session:
+
+| first launch | game accepted | startup preparation | guest waited | parts |
+|---|---|---|---|---|
+| empty renderer cache | 0 bytes | 33.5-34.9 s | 24.8-25.9 s | cold (about 5.6 s per superset part) |
+| after Forge's preparation | 13,654,247 bytes | 0.72-1.16 s | 0 s | at most 0.30 s per fragment part |
+
+Forge pays the cost instead: 39/39 parts in 45.5 s on six threads on a new
+driver, 0.7-0.8 s when the driver's own disk cache still holds the helper's
+parts; with the 500 observed recipes the whole job is 539/539 in 9.1 s here.
+A driver update or another GPU invalidates the cache: the game then prepares
+the parts again behind its preparation screen, as before. The first frames
+(DLSS feature of a first launch, cold effect pipelines, the first scene's
+grass placements) still run under the screen (17 frames, 6.5-8.9 s).
+
+Validating this exposed a determinism fault of the preparation screen: the
+temporal jitter phase followed the renderer's frame counter, which also
+advanced on the frames that show the screen while the guest waits, so the
+images depended on how long the preparation took (cold against Forge-prepared:
+0/12 captures identical, 13-30% of pixels on every edge). The phase now counts
+the frames that drew the PICA scene (`mTemporalJitterSequence`): cold against
+Forge-prepared 12/12 identical, with the same process and memory fingerprints.
+
+### Scene changes: one temporal upscaler instance per stream (2026-10-02)
+
+Entering a house froze the game for seconds. Reproduction: the user's save in
+front of Link's house in Kokiri Forest (their Enhanced configuration: 4K
+output, DLSS Ultra Performance with the Transformer model, grass, PBR), stick
+forward for 210 frames: Link enters, and since the house camera faces the
+door, walks back out; `qualify/scene-change` in the work directory
+(`enter.json`, `run_equiv_trio.sh`).
+
+Every scene change switched the upscaler between two output extents a few
+frames apart: the presentation upscales to the display's extent (2160x3840
+in storage orientation), while the transition composes the scene at a native
+boundary (the game copies its scene into a texture) at its scene target's
+extent (4320x3840). One DLSS feature served both, so each switch destroyed it
+and created the other one (`TRIAEVUM_DLSS_FEATURE_CREATED`): eight creations
+in that walk, 3.4-3.8 s each on this machine's shared GPU (1.4 s measured on
+an idle one), the longest frame 3.84 s. The creation itself is not the cost:
+with one feature alive the second takes 0.06-0.1 s; destroying the only
+feature made NGX load its model again for the next one.
+
+Each provider now keeps one instance per output contract (`UpscalerInstances`
+in `nri_interop_context.cpp`, for DLSS and FSR): at most three with the
+current quality and preset, instances of other settings retired, the least
+recently used extent making room. A dispatch that resumes an instance after
+another instance's dispatch restarts its history, as the recreated single
+instance did, so the images are unchanged. The renderer cache records every
+live DLSS feature (`dlss_feature.txt`, `triaevum-dlss-features-v2`; the
+single-feature v1 record still loads) and the initial preparation creates
+them all, so a scene change creates none.
+
+| walk (two scene changes) | DLSS creations during play | longest frame | frames over 33 ms |
+|---|---|---|---|
+| before | 8 (3.4-3.8 s each) | 3839 ms | 297/882 |
+| after, record of the previous build | 1 (0.09 s) | 130 ms | 24/884 |
+| after, both features prepared at startup | 0 | 110 ms | GPU-contention dependent |
+
+The 110 ms frame is the guest's own scene load (a 5 MB RomFS read and its
+decompression) during the black fade. FSR had the same switch, cheaper:
+100-175 ms on each of seven switches; now only the first use of each extent
+(instance creation 12-17 ms). Captures across both transitions (frames 40-325
+every 15, including the frames after each switch): new against the previous
+build 20/20 identical for DLSS and FSR; the one capture that differed (frame
+40, before any switch) differs the same way between two runs of either build.
+
+Reproducing it also exposed a savestate fault: a state saved while an
+upscaler renders at a reduced internal scale could not be loaded at startup
+(`--load-state`: "native PICA color snapshot is incompatible"), because the
+restore ran before the first frame applied the settings' internal scale.
+`RestorePicaColorTargets` now applies the scale that frame would select; a
+state saved at another scale says so, with both scales.
+
+### Valid startup links and the seam binding (2026-10-05)
+
+The Windows release qualification ran the Vulkan validation layer over the
+release profiles (Kokiri walk under Enhanced, point and directional shadows,
+toon outline, the plain path, and the title intro with animated lights). Every
+run reported the same errors, all from this preparation work:
+
+- `VUID-VkGraphicsPipelineCreateInfo-layout-07990`: the startup items of the
+  vertex programs linked `canonical.front()`, a base with combined image
+  samplers, against the separate-sampler layout of the startup state.
+- `VUID-RuntimeSpirv-OpEntryPoint-08743`: every superset program was linked
+  with the first vertex program of the title family, which writes locations
+  0-6, while 20 of the 24 superset programs read the temporal clip positions
+  (7, 8) or the surface normal and tint (9, 10) that only the matching vertex
+  variants write.
+- `VUID-vkCmdDrawIndexed-None-08114`: always-available surface programs on a
+  device with fragment primitive IDs declare the PBR seam buffer (binding 26)
+  and read it only when the draw's decisions select seam softening, but a draw
+  without seam data left binding 26 unwritten.
+
+The links were invalid only during preparation: draws link the parts with
+their own vertex programs. `PicaStartupProgramParts` now pairs every fragment
+program with the first vertex program of the family that writes every location
+it reads (`PicaStageInterfaceLinks`, from the SPIR-V Location decorations) and
+gives each vertex program the first separate-sampler base it feeds; a fragment
+program no vertex program feeds gets no item. The parts are the same, so the
+driver and Forge caches stay valid. A draw without seam data binds a 16-byte
+view of its frame's uniform buffer at binding 26 (one view per frame). Images
+are unchanged; with the fixes the validation layer reports no error in any of
+the five runs (`renderer_spirv_pack_tests` checks every startup link of the
+embedded families). The remaining warnings are unused vertex attributes,
+fragment outputs masked by the guide attachments and unread vertex outputs.
+
+### Stale built-in packs disable the always-available programs (2026-10-11)
+
+Hyrule Field from day through dusk into night stalled 4.6-4.9 s per new
+program with an empty pipeline cache (Kokiri savestate, warp by day, clock
+just before dusk, 2,400 frames). `TRIAEVUM_HYBRID_PREPARATION` reported
+`completed_draws=103` and `uber_unavailable=0/0/103/0/0/0`: every draw of the
+profile's instrumented variants found no superset program (reason 2,
+`FragmentNotBuiltIn`) and completed its specialized program on the render
+thread.
+
+The superset programs embed the surface-lighting text. The rim light, the
+outdoor-brightness anchor and the night grass reference (2026-10-10/11)
+changed that text without regenerating `pica_uber_fragment.spvpack`, so the
+composed source of every superset no longer matched a built-in artifact.
+`build_fragment_artifacts --uber --check` reported it ("uber effect source
+changed"); the same commits left seven `builtin_pass.spvpack` entries stale
+(the grass passes, `native_surface_lighting.frag`), which `build_pass_artifacts
+--check` reported and the runtime compiled on first use
+(`TRIAEVUM_PASS_ARTIFACT_MISS`).
+
+Any change to text a built-in family composes (surface lighting,
+instrumentation snippets, pass shaders) must regenerate the families and pass
+`check_fragment_families` and `build_pass_artifacts --check` (both are ctest
+entries of `tools/renderer/tev_program`). The host test suites do not see it.
+
+Regenerated both packs. Same path, empty cache: `completed_draws=0`,
+`uber_unavailable=0/0/0/0/0/0`, about 51,000 draws on the superset programs
+while specialized ones prepare in the background. Worst frame of the ramp
+4,905 -> 136 ms, night 4,680 -> 174 ms. The first entry into the field still
+costs about 2 s with nothing cached (first grass placement, composition
+pipelines); a kept or Forge-prepared cache removes it.
+
+The shader corpus is not the cause: regenerating it with the current
+importers produced a byte-identical pack (`expanded-union.o3ps`, SHA-256
+`55b95430...`). It covers the Authentic variants of the captured
+configurations; 42 of the 64 dusk shaders it missed are captured
+configurations in the profile's instrumented variants, and the pipeline
+manifests carry only canonical, attachment-free recipes, so device preparation
+cannot reach the instrumented pipelines of an F1 profile.

@@ -722,6 +722,68 @@ Evidence:
 - `I:\oot3dre_work\native_game\renderer_application_host_split_20260724.json`
 - `I:\oot3dre_work\native_game\renderer_application_host_split_20260724.bmp`
 
+## Visual frames when the host falls behind (2026-09-30)
+
+The GSP scans out the frame the guest last swapped in while the guest may
+already have drawn its next frame into the other display buffer. The visual
+frame accumulator used to close all pending work at the selected top
+transfer, so a slow host frame (for example with Brixelizer GI, ~20 ms)
+produced visual frames holding two guest frames (250 draws instead of 125).
+The composition schedule then saw two world runs on the scene target
+(`NonContiguousWorldTarget`), withheld every stage anchor and classified the
+display as `Unknown`: that frame and its interpolated samples were presented
+without any scene effect (GI, AO, outlines, shadows schedule). On the Kokiri
+reference with GI and Interpolated2x this hit 215 of 899 presented frames, the
+flicker reported under interpolation.
+
+`Oot3dPicaVisualFrameAccumulator::FinishFrames` now closes one visual frame
+per guest frame:
+
+- work after the selected snapshot, from the first later draw into its source
+  target, stays pending for the next visual frame (the selected frame's later
+  draws into other targets, such as the bottom screen, stay with it);
+- an earlier snapshot of the same source into a known top-screen display
+  framebuffer (outputs of previously selected transfers) ends a superseded
+  guest frame, which the host executes for the canonical target and keeps as
+  interpolation history without presenting it. Captures of the source into
+  other buffers stay inside their frame.
+
+Result on the same walk: 1 effect-less frame (the first after loading), host
+CPU 23.7 -> 19.4 ms, 239 -> 197 draws per host frame. The Field and Sheik
+interpolation qualifications (effects off, fixed timestep) remain equivalent
+to their baselines (contracts, framebuffers, interpolation counters), and the
+Kokiri walk with GI off is pixel-identical to the pre-GI build. Runtime JSON
+reports `superseded_visual_frames`.
+
+Correction (2026-10-05). The split ignored raw-copy dependency work. A raw
+`TextureCopy` that signals the guest is executed immediately with every pending
+draw, fill and transfer before it (`ViewDependencyWork`), including the
+not-yet-closed frame's work when the guest copies in its next frame. The view
+of a closed frame skipped that executed prefix only when the completed copy was
+inside the frame, but the split moves the copy to the next frame with the rest
+of that frame's work. The selected frame then executed its draws a second time,
+and the presentation scheduler stopped the run ("PICA draw would execute more
+than once in one presentation"). With Original30 (native 30, no interpolation)
+the host always closes the previous guest frame while the next one is pending,
+so the Sheik revelation stopped at its first copy (run frame 2473) on every
+output size. `FinishFrames` now gives every frame it closes the boundary of the
+executed prefix (`DependencyExecutedThroughDraw`, `DependencyExecutedTransfers`),
+taken from the last completed copy among all pending work, and the canonical
+continuation skips exactly that. `oot3d_native_pica_vulkan_bridge_tests` covers
+the case: the flush, the split, both frames' canonical continuations and no
+duplicate draw.
+
+Second correction (2026-10-05). The TopScreen frontend draws its relocated
+lower menu onto the upper target after the upper snapshot, within the same
+guest frame. The split took it for the next frame's work, so File Select, Name
+Entry and the version choice were drawn over by the next frame's scene and
+never shown. `FinishFrames` accepts continuation viewports: a later draw into
+the source on one of them continues the frame (also for a superseded frame, up
+to the following frame's first other draw into the source). The window passes
+the relocated menu canvases only while that relocation is active, so every
+other frame splits as before (`oot3d_native_pica_vulkan_plan_tests`;
+`TRIAEVUM_TOPSCREEN_FRONTEND_SKY.md`).
+
 ## Commit discipline
 
 Each significant step uses two commits when both repositories change:

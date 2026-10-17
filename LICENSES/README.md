@@ -12,8 +12,13 @@ their imported source.
 | nihstro subset | BSD-3-Clause | `tools/oot3d/third_party/azahar_pica/NIHSTRO_LICENSE.txt` |
 | libultraship | MIT | Upstream submodule `runtime/three_ds_recomp/LICENSE` |
 | NVIDIA NRI | MIT | `LICENSES/NRI-MIT.txt` and pinned upstream source |
+| TriAevum DLSS module (separately licensed) | MIT for its integration code; NVIDIA's NGX SDK library linked into it under NVIDIA's terms | `runtime/three_ds_recomp/src/fast/dlss/LICENSE.md` |
+| NVIDIA DLSS SDK (NGX library, `nvngx_dlss` runtime) | NVIDIA RTX SDKs licence | `LICENSES/NVIDIA-DLSS-SDK-LICENSE.txt`, copied by the packager from the SDK |
+| AMD FidelityFX SDK FSR runtime (`amd_fidelityfx_vk.dll`) | MIT | `LICENSES/FidelityFX-SDK-MIT.txt` |
+| Godot Engine contact shadows port | MIT | `LICENSES/Godot-MIT.txt` and the ported file headers |
 | SDL2 2.32.10 (statically linked) | zlib | `LICENSES/SDL2-zlib.txt` |
 | SDL_GameControllerDB mappings | zlib | `LICENSES/SDL-GameControllerDB-zlib.txt` |
+| Zstandard 1.5.6 (statically linked) | BSD-3-Clause (upstream is dual BSD/GPL-2.0; used under BSD) | `LICENSES/zstd-BSD-3-Clause.txt` |
 | Microsoft Visual C++ runtime for shaderc | Microsoft runtime redistribution terms | `LICENSES/Microsoft-Visual-Cpp-Runtime.md` |
 | NXVK probe | GPL-2.0-or-later | `ports/switch_vulkan_probe/COPYING` |
 | shaderc shared runtime | Apache-2.0 | `LICENSES/shaderc-Apache-2.0.txt` |

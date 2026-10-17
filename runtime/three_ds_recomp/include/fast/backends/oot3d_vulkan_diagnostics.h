@@ -1,5 +1,7 @@
 #pragma once
 
+#include "fast/renderer3ds/pica_temporal_identity.h"
+
 #include "fast/oot3d/display_effect_plan.h"
 #include "fast/oot3d/display_effect_resources.h"
 #include "fast/oot3d/effect_geometry_provider_plan.h"
@@ -22,6 +24,7 @@ struct PicaSceneFrameStats;
 }
 namespace Renderer3ds {
 struct PicaCompositionScheduleStats;
+struct VirtualShadowPageStatistics;
 }
 
 struct Oot3dVulkanDiagnosticsConfig {
@@ -40,9 +43,12 @@ struct Oot3dVulkanGpuTimings {
     std::optional<double> NativePicaMilliseconds;
     std::optional<double> ToonRasterMilliseconds;
     std::optional<double> GrassMilliseconds;
-    std::optional<double> CacaoMilliseconds;
+    std::optional<double> GrassCompactionMilliseconds, GrassBladesMilliseconds, GrassShadowsMilliseconds,
+        GrassLightingMilliseconds;
+    std::optional<double> AmbientOcclusionMilliseconds;
     std::optional<double> DepthPreparationMilliseconds;
     std::optional<double> ReflectionMilliseconds;
+    std::optional<double> GlobalIlluminationMilliseconds;
     std::optional<double> MotionVectorsMilliseconds;
     std::optional<double> SceneCompositeMilliseconds;
     std::optional<double> AntiAliasingMilliseconds;
@@ -229,14 +235,14 @@ struct Oot3dVulkanFrameDiagnostics {
     uint32_t DisplayEffectGraphDeclaredReadCount = 0;
     uint32_t DisplayEffectGraphResolvedReadCount = 0;
     uint32_t DisplayEffectGraphMissingReadCount = 0;
-    uint32_t DisplayEffectGraphMissingReadMask = 0;
+    uint64_t DisplayEffectGraphMissingReadMask = 0;
     uint32_t DisplayEffectGraphBindingFallbackCount = 0;
     uint32_t DisplayEffectPhysicalPlanInvocationCount = 0;
     uint32_t DisplayEffectPhysicalPlanCompleteCount = 0;
     uint32_t DisplayEffectPhysicalDeclaredResourceCount = 0;
     uint32_t DisplayEffectPhysicalResolvedResourceCount = 0;
     uint32_t DisplayEffectPhysicalMissingResourceCount = 0;
-    uint32_t DisplayEffectPhysicalMissingResourceMask = 0;
+    uint64_t DisplayEffectPhysicalMissingResourceMask = 0;
     uint32_t DisplayEffectPhysicalSemanticResourceCount = 0;
     uint32_t DisplayEffectPhysicalExternalImageResourceCount = 0;
     uint32_t DisplayEffectPhysicalNativeAttachmentResourceCount = 0;
@@ -374,6 +380,28 @@ struct Oot3dVulkanFrameDiagnostics {
     float NriDirectionalShadowLightDirectionX = 0.0F;
     float NriDirectionalShadowLightDirectionY = 0.0F;
     float NriDirectionalShadowLightDirectionZ = 0.0F;
+    uint32_t NriVirtualShadowRequestedPageCount = 0;
+    uint32_t NriVirtualShadowResidentPageCount = 0;
+    uint32_t NriVirtualShadowReusedPageCount = 0;
+    uint32_t NriVirtualShadowUpdatedPageCount = 0;
+    uint32_t NriVirtualShadowStaticUpdatedPageCount = 0;
+    uint32_t NriVirtualShadowStaticReusedPageCount = 0;
+    uint32_t NriVirtualShadowEmptyPageCount = 0;
+    uint32_t NriVirtualShadowEvictedPageCount = 0;
+    uint32_t NriVirtualShadowUnmappedPageCount = 0;
+    uint64_t NriVirtualShadowAtlasBytes = 0;
+    // Shadow keyframes (a light that moves in every frame).
+    uint32_t NriVirtualShadowPendingPageCount = 0;
+    uint32_t NriVirtualShadowKeyframeDisplayedLayoutCount = 0;
+    uint32_t NriVirtualShadowKeyframeConstructionPageCount = 0;
+    uint32_t NriVirtualShadowKeyframeConstructionBudget = 0;
+    uint32_t NriVirtualShadowKeyframeCutCount = 0;
+    uint32_t NriVirtualShadowKeyframeRotationCount = 0;
+    float NriVirtualShadowKeyframeWeight = 0.0F;
+    float NriVirtualShadowKeyframeLagDegrees = 0.0F;
+    float NriVirtualShadowKeyframeDirectionX = 0.0F;
+    float NriVirtualShadowKeyframeDirectionY = 0.0F;
+    float NriVirtualShadowKeyframeDirectionZ = 0.0F;
     uint32_t NriDirectionalShadowReceiverEligibleDrawCount = 0;
     uint32_t NriDirectionalShadowReceiverLightingAvailableDrawCount = 0;
     uint32_t NriDirectionalShadowReceiverLightingEnabledDrawCount = 0;
@@ -388,6 +416,25 @@ struct Oot3dVulkanFrameDiagnostics {
     uint32_t NriDirectionalShadowScheduleRejectedCount = 0;
     uint32_t NriDirectionalShadowScheduleDuplicateCount = 0;
     uint32_t NriDirectionalShadowScheduleSurfaceEndCount = 0;
+    // Casters prepared from the published sequence before it executed.
+    uint32_t NriDirectionalShadowPreparedDrawCount = 0;
+    uint32_t NriDirectionalShadowPreparedCasterCount = 0;
+    uint32_t NriDirectionalShadowPreparedTransientCount = 0;
+    uint32_t NriDirectionalShadowPreparedReuseCount = 0;
+    uint32_t NriDirectionalShadowPreparedMapCount = 0;
+    uint32_t NriDirectionalShadowPreparedMapBeforeOpaqueCount = 0;
+    uint32_t NriDirectionalShadowPreparedAlphaCasterCount = 0;
+    uint32_t NriDirectionalShadowPreparedAlphaRejectedCount = 0;
+    uint32_t NriDirectionalShadowAlphaCasterDrawCount = 0;
+    uint32_t NriPointShadowMapAttemptCount = 0;
+    uint32_t NriPointShadowMapCount = 0;
+    uint32_t NriPointShadowCandidateLightCount = 0;
+    uint32_t NriPointShadowLightCount = 0;
+    uint32_t NriPointShadowRenderedLightCount = 0;
+    uint32_t NriPointShadowCasterDrawCount = 0;
+    uint32_t NriPointShadowAlphaCasterDrawCount = 0;
+    uint32_t NriPointShadowReceiverDrawCount = 0;
+    uint32_t NriPointShadowReceiverBoundDrawCount = 0;
     uint32_t DisplayTransferCount = 0;
     uint32_t ScanoutCount = 0;
     uint32_t OverlayCount = 0;
@@ -395,13 +442,13 @@ struct Oot3dVulkanFrameDiagnostics {
     uint32_t ToonDrawCount = 0;
     uint32_t OutlineOcclusionDrawCount = 0;
     uint32_t PicaMaterialToonDrawCount = 0;
-    uint32_t CacaoPassCount = 0;
-    bool CacaoOutputNriOwned = false;
-    uint32_t CacaoNormalGuidePassCount = 0;
-    uint32_t CacaoAmbientGuideDrawCount = 0;
-    uint32_t CacaoAmbientRgbGuideDrawCount = 0;
-    uint32_t CacaoAmbientFallbackGuideDrawCount = 0;
-    uint32_t CacaoAmbientCompositeCount = 0;
+    uint32_t AmbientOcclusionPassCount = 0;
+    bool AmbientOcclusionOutputNriOwned = false;
+    uint32_t AmbientOcclusionNormalGuidePassCount = 0;
+    uint32_t AmbientOcclusionAmbientGuideDrawCount = 0;
+    uint32_t AmbientOcclusionAmbientRgbGuideDrawCount = 0;
+    uint32_t AmbientOcclusionAmbientFallbackGuideDrawCount = 0;
+    uint32_t AmbientOcclusionAmbientCompositeCount = 0;
     uint32_t HiZPassCount = 0;
     uint32_t HiZMipCount = 0;
     uint32_t HiZDepthConvention = 0;
@@ -492,6 +539,34 @@ struct Oot3dVulkanFrameDiagnostics {
     uint32_t FsrOutputHeight = 0;
     uint32_t FsrHistoryResetCount = 0;
     bool FsrNriDispatched = false;
+    // Temporal-upscaler guides resampled from the scene target's extent to the
+    // colour input's (the extent they were read at).
+    uint32_t UpscalerGuideResampleCount = 0;
+    // MXAO executions that accumulated over frames, and those that reprojected
+    // a valid history.
+    uint32_t MxaoTemporalPassCount = 0;
+    uint32_t MxaoTemporalHistoryValidCount = 0;
+    // Boundaries before native UI that resolved TAA/SMAA, and those that could
+    // not because another surface owned them this frame.
+    uint32_t BeforeUiAntiAliasingCount = 0;
+    uint32_t BeforeUiAntiAliasingUnavailableCount = 0;
+    // Scenes before native UI kept by a boundary for an upscaler, their
+    // transfers beside a display, and the UI laid over an upscaled scene.
+    uint32_t SceneBeforeUiSnapshotCount = 0;
+    uint32_t SceneBeforeUiTransferCount = 0;
+    uint32_t NativeUiOverlayCount = 0;
+    // UI-attributed draws whose viewport covers a colour target this frame's
+    // scene drew into, and those of them composed as screen-space frame
+    // content rather than placed on the native UI canvas. Of those, opaque
+    // pictures of their own (movie frames), shown fitted, the black bar
+    // rectangles painted around them, and overlays with their own alpha.
+    uint32_t WholeTargetUiDrawCount = 0;
+    uint32_t ScreenContentDrawCount = 0;
+    uint32_t OwnPictureDrawCount = 0;
+    uint32_t PictureBarRectCount = 0;
+    uint32_t PictureOverlayDrawCount = 0;
+    uint32_t UpscalerGuideWidth = 0;
+    uint32_t UpscalerGuideHeight = 0;
     uint32_t DlssUpscalePassCount = 0;
     uint32_t DlssInputWidth = 0;
     uint32_t DlssInputHeight = 0;
@@ -538,7 +613,19 @@ struct Oot3dVulkanFrameDiagnostics {
     uint32_t RigidMotionDrawCount = 0;
     uint32_t ExactMotionDrawCount = 0;
     uint32_t DeformedMotionDrawCount = 0;
+    // All draws in an ambiguous native instance group (including its first).
+    uint32_t RepeatedIdentityMotionDrawCount = 0;
+    // PicaMotionProvenance order: invalid, camera, rigid, exact candidate.
+    std::array<uint32_t, 4> MotionProvenanceDrawCounts{};
+    std::array<uint32_t, static_cast<size_t>(Renderer3ds::PicaTemporalMatchReason::Count)> TemporalMatchReasonDrawCounts{};
     uint32_t GrassMotionBladeCount = 0;
+    // Normal guide sources: draws that write it and those that read the
+    // authored vertex normal; AO texture relief candidates and appliers.
+    uint32_t NormalGuideDrawCount = 0;
+    uint32_t TypedNormalGuideDrawCount = 0;
+    uint32_t AoReliefCandidateDrawCount = 0;
+    uint32_t AoReliefTextureDrawCount = 0;
+    uint32_t AoReliefAppliedDrawCount = 0;
     uint64_t FirstSubmissionId = 0;
     uint64_t LastSubmissionId = 0;
     uint64_t LastRenderTargetNamespace = 0;
@@ -650,7 +737,12 @@ class Oot3dVulkanDiagnostics {
                                       bool attachmentsCleared,
                                       uint32_t barrierCount);
     void RecordNriDirectionalShadow(uint32_t casterCount,
-                                    bool nativeLight);
+                                    bool nativeLight,
+                                    uint32_t alphaCasterCount = 0U);
+    void RecordNriPointShadowMap(bool executed, uint32_t candidateLights, uint32_t lights,
+                                 uint32_t renderedLights, uint32_t casterDraws,
+                                 uint32_t alphaCasterDraws);
+    void RecordNriPointShadowReceiver(bool bound);
     void RecordNriDirectionalShadowAttempt(uint32_t queuedCasters,
                                            uint32_t queuedNativeLights,
                                            uint32_t executionStage);
@@ -658,6 +750,13 @@ class Oot3dVulkanDiagnostics {
         uint32_t candidateCount, uint32_t clusterCount,
         float geometryWeight, float directionX, float directionY,
         float directionZ);
+    void RecordNriVirtualShadowPages(const Renderer3ds::VirtualShadowPageStatistics& pages,
+                                    uint32_t updated, uint64_t atlasBytes);
+    // displayedDirection: the direction the displayed shadows correspond to.
+    void RecordNriVirtualShadowKeyframes(uint32_t displayedLayouts, float newerWeight,
+                                        uint32_t constructionPages, uint32_t constructionBudget,
+                                        bool cut, bool rotated, const std::array<float, 3>& displayedDirection,
+                                        float lagDegrees);
     void RecordNriDirectionalShadowReceiver(bool eligible,
                                             bool lightingAvailable,
                                             bool lightingEnabled,
@@ -670,6 +769,17 @@ class Oot3dVulkanDiagnostics {
     void RecordNriDirectionalShadowSchedule(bool authorized,
                                             bool duplicate,
                                             bool surfaceEnd);
+    // One draw handed over before its sequence executed: whether it became a
+    // prepared caster, and whether its geometry used the transient arena.
+    void RecordNriDirectionalShadowPreparation(bool caster, bool transient);
+    // An alpha-tested draw handed over for the map: whether its native alpha
+    // test could be prepared (textures, LUT and fragment uniforms resolved).
+    void RecordNriDirectionalShadowPreparedAlpha(bool prepared);
+    // An ordered submission reused the bounds of its prepared caster.
+    void RecordNriDirectionalShadowPreparedReuse();
+    // An authorized map update from the prepared casters, at the opaque
+    // boundary or at the late fallback anchor.
+    void RecordNriDirectionalShadowPreparedMap(bool beforeOpaque);
     void RecordDisplayTransfer(bool present, uint32_t spatialAaMode = 0U,
                                uint32_t msaaSamples = 1U);
     void RecordSmaa1x(bool outputsNriOwned,
@@ -686,10 +796,10 @@ class Oot3dVulkanDiagnostics {
     void RecordMemoryFill();
     void RecordToonDraw(bool picaMaterialPath);
     void RecordOutlineOcclusionDraw();
-    void RecordCacaoPass(bool outputNriOwned = false,
-                         bool picaNormalGuide = false);
-    void RecordCacaoAmbientGuideDraw(bool exactRgb);
-    void RecordCacaoAmbientComposite();
+    void RecordAmbientOcclusionPass(bool outputNriOwned = false,
+                                   bool picaNormalGuide = false);
+    void RecordAmbientOcclusionAmbientGuideDraw(bool exactRgb);
+    void RecordAmbientOcclusionAmbientComposite();
     void RecordHiZPass(uint32_t mipCount, uint32_t depthConvention = 0U,
                        bool outputNriOwned = false,
                        bool computeNriOwned = false,
@@ -746,6 +856,15 @@ class Oot3dVulkanDiagnostics {
     void RecordFsrUpscale(bool executed, bool historyReset,
                           uint32_t inputWidth, uint32_t inputHeight,
                           uint32_t outputWidth, uint32_t outputHeight);
+    void RecordUpscalerGuides(bool resampled, uint32_t guideWidth,
+                              uint32_t guideHeight);
+    void RecordMxaoTemporal(bool temporal, bool historyValid);
+    void RecordBeforeUiAntiAliasing(bool applied, bool unavailable);
+    void RecordSceneBeforeUi(bool snapshot, bool transferred);
+    void RecordNativeUiOverlay();
+    void RecordWholeTargetUiDraw(bool screenContent);
+    void RecordOwnPictureDraw(uint32_t barRects);
+    void RecordPictureOverlayDraw();
     void RecordDlssUpscale(bool executed, bool historyReset,
                            uint32_t inputWidth, uint32_t inputHeight,
                            uint32_t outputWidth, uint32_t outputHeight);
@@ -768,8 +887,11 @@ class Oot3dVulkanDiagnostics {
     void SetPresentationState(
         Oot3dVulkanPresentationStateDiagnostics state);
     void RecordTemporalDraw(bool rigidMotionValid, bool exactMotionValid,
-                            bool deformedMotionValid);
+                            bool deformedMotionValid, bool repeatedIdentity = false);
+    void RecordTemporalCorrespondence(uint32_t reason, uint32_t provenance);
     void RecordGrassMotion(uint32_t bladeCount);
+    void RecordNormalGuideDraw(bool typedNormal, bool relief);
+    void RecordAoReliefDraw(bool reliefTexture);
     void EndFrame();
     void SetGpuTimings(uint64_t frameIndex,
                        const Oot3dVulkanGpuTimings& timings);

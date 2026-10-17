@@ -4,6 +4,7 @@
 #include "oot3d_native_pica_frontend.h"
 #include "oot3d_native_pica_program_descriptor.h"
 #include "oot3d_native_pica_shader_gen.h"
+#include "oot3d_native_pica_affine_layout.h"
 
 #include <array>
 #include <bit>
@@ -209,7 +210,66 @@ int main(int argc, char** argv) {
         for (size_t entry = 0; entry < count; ++entry) {
             Oot3dNativeGame::Oot3dPicaDecodedDrawState state{};
             state.ShaderInterface.VertexMainOffset = word(word(8 + entry*4) + 8);
+            const auto layout = Oot3dNativeGame::DescribeOot3dAffineUniforms(packet,state);
+            const bool cmb = packet.VertexShader.ProgramWordCount == 310 &&
+                             packet.VertexShader.SwizzleWordCount == 54;
+            Require((layout == Oot3dNativeGame::kOot3dCmbAffineLayout) == cmb,
+                    "original shader layout identity mismatch");
+            const auto entryOffset = state.ShaderInterface.VertexMainOffset;
+            state.ShaderInterface.VertexMainOffset = 1;
+            Require(!Oot3dNativeGame::DescribeOot3dAffineUniforms(packet,state).Palette.Valid(),
+                    "unproven entrypoint acquired a palette");
+            state.ShaderInterface.VertexMainOffset = entryOffset;
+            packet.VertexShader.Program[0] ^= 1;
+            Require(!Oot3dNativeGame::DescribeOot3dAffineUniforms(packet,state).Palette.Valid(),
+                    "changed code acquired a palette");
+            packet.VertexShader.Program[0] ^= 1;
+            packet.VertexShader.Swizzles[0] ^= 1;
+            Require(!Oot3dNativeGame::DescribeOot3dAffineUniforms(packet,state).Palette.Valid(),
+                    "changed operand descriptor acquired a palette");
+            packet.VertexShader.Swizzles[0] ^= 1;
             state.ShaderInterface.OutputMask = 0x7f;
+            const std::array<uint32_t,7> canonicalOutputMap{
+                0x03020100U,0x0b0a0908U,0x1f100d0cU,0x1f1f0f0eU,
+                0x1f1f1716U,0x07060504U,0x1f141312U};
+            for (size_t i=0;i<canonicalOutputMap.size();++i) packet.Registers[0x50+i]=canonicalOutputMap[i];
+            const Oot3dNativeGame::Oot3dCmbTextureCoordinates expectedCoordinates{cmb,cmb,cmb};
+            Require(Oot3dNativeGame::DescribeOot3dCmbTextureCoordinates(packet,state)==expectedCoordinates,
+                    "original CMB texture coordinate outputs were not proven");
+            {
+                Oot3dNativeGame::Oot3dPicaGeneratedVertexShader shader;
+                std::string error;
+                Require(Oot3dNativeGame::GenerateOot3dPicaVertexShader(packet,state,shader,&error),error);
+                Require(shader.TemporalProgram->CmbTextureCoordinates==expectedCoordinates,
+                        "generated program lost the source-proven texture coordinates");
+            }
+            const Oot3dNativeGame::Oot3dCmbTextureCoordinates unknownCoordinates{};
+            packet.VertexShader.Program[0] ^= 1;
+            Require(Oot3dNativeGame::DescribeOot3dCmbTextureCoordinates(packet,state)==unknownCoordinates,
+                    "changed code acquired periodic texture semantics");
+            packet.VertexShader.Program[0] ^= 1;
+            packet.VertexShader.Swizzles[0] ^= 1;
+            Require(Oot3dNativeGame::DescribeOot3dCmbTextureCoordinates(packet,state)==unknownCoordinates,
+                    "changed operands acquired periodic texture semantics");
+            packet.VertexShader.Swizzles[0] ^= 1;
+            state.ShaderInterface.VertexMainOffset=1;
+            Require(Oot3dNativeGame::DescribeOot3dCmbTextureCoordinates(packet,state)==unknownCoordinates,
+                    "unproven entry acquired periodic texture semantics");
+            state.ShaderInterface.VertexMainOffset=entryOffset;
+            state.ShaderInterface.GeometryShaderEnabled=true;
+            Require(Oot3dNativeGame::DescribeOot3dCmbTextureCoordinates(packet,state)==unknownCoordinates,
+                    "geometry program acquired CMB texture semantics");
+            state.ShaderInterface.GeometryShaderEnabled=false;
+            // An output-map permutation is part of shader identity, not a
+            // license to assume c10/c11 still feed final texture coordinate 0.
+            packet.Registers[0x52]=0x1f100c0dU; // swap U/V
+            auto mapped=Oot3dNativeGame::DescribeOot3dCmbTextureCoordinates(packet,state);
+            Require(!mapped[0] && mapped[1]==cmb && mapped[2]==cmb,
+                    "swapped output components acquired canonical texture semantics");
+            packet.Registers[0x52]=0x1f100908U; // color instead of UV
+            mapped=Oot3dNativeGame::DescribeOot3dCmbTextureCoordinates(packet,state);
+            Require(!mapped[0], "color output acquired periodic texture semantics");
+            packet.Registers[0x52]=canonicalOutputMap[2];
             for (uint32_t variant = 0; variant < 8; ++variant) {
                 for (uint32_t row = 0; row < 7; ++row) {
                     const uint32_t s = (row * 4 + variant) % 24;
@@ -222,6 +282,12 @@ int main(int argc, char** argv) {
                 std::string error;
                 Require(Oot3dNativeGame::GenerateOot3dPicaVertexShader(packet, state, reference, &error), error);
                 Require(Oot3dNativeGame::GenerateOot3dPicaVertexShader(packet, state, translated, &error, true), error);
+                Require(reference.TemporalProgram->AffineLayout == layout &&
+                        translated.TemporalProgram->AffineLayout == layout &&
+                        reference.TemporalProgram->CmbTextureCoordinates ==
+                            Oot3dNativeGame::DescribeOot3dCmbTextureCoordinates(packet,state) &&
+                        translated.TemporalProgram->CmbTextureCoordinates == reference.TemporalProgram->CmbTextureCoordinates,
+                        "shader generation dropped the proven affine layout");
                 Require(reference.Source == translated.Source && reference.StateKey == translated.StateKey &&
                         reference.TemporalProgram->PreviousRegisterState == translated.TemporalProgram->PreviousRegisterState &&
                         reference.TemporalProgram->PreviousMainBody == translated.TemporalProgram->PreviousMainBody &&
@@ -356,9 +422,10 @@ int main(int argc, char** argv) {
         1U, 0x000F022EU, 1U, 0x000F022EU, 1U, 0x000F022EU};
     compositionSubmit.Parameters[1] = static_cast<uint32_t>(
         compositionCommandList.size() * sizeof(uint32_t));
-    constexpr std::array<Oot3dNativeGame::
-                             Oot3dPicaCommandListCompositionSpan,
-                         2>
+    // const, not constexpr: the span carries a light binding, not a literal type.
+    const std::array<Oot3dNativeGame::
+                         Oot3dPicaCommandListCompositionSpan,
+                     2>
         compositionSpans{{
             {0x14002800U,
              0x14002808U,
@@ -970,6 +1037,24 @@ int main(int argc, char** argv) {
                 changedProcTexIdentity.FragmentProgramId !=
                     procTexIdentity.FragmentProgramId,
             "procedural texture LUT data was omitted from shader identity");
+    {
+        // Depth left to fixed function is another specialized program: two
+        // draws differing only in their depth mapping are two pipelines.
+        auto rasterState = fragmentState;
+        rasterState.OutputMerger.FragmentOperationMode = 0;
+        rasterState.Viewport.ZBuffering = true;
+        rasterState.Viewport.DepthRange = -1.0F;
+        rasterState.Viewport.NearPlane = 0.0F;
+        auto explicitState = rasterState;
+        explicitState.Viewport.DepthRange = -0.5F;
+        Require(Oot3dNativeGame::Oot3dPicaFragmentDepthIsRasterDepth(rasterState) &&
+                    !Oot3dNativeGame::Oot3dPicaFragmentDepthIsRasterDepth(explicitState) &&
+                    Oot3dNativeGame::BuildOot3dPicaCanonicalDrawIdentity(procTexPacket, rasterState)
+                            .FragmentProgramId !=
+                        Oot3dNativeGame::BuildOot3dPicaCanonicalDrawIdentity(procTexPacket, explicitState)
+                            .FragmentProgramId,
+                "fixed-function depth was omitted from the fragment program identity");
+    }
 
     Oot3dNativeGame::Oot3dGspCommandPacket irqSubmit{};
     irqSubmit.Control = 1;

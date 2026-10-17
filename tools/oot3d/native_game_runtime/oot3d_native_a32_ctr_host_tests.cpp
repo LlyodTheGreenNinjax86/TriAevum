@@ -8,7 +8,9 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
+#include <sstream>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -205,7 +207,230 @@ void TestBoundedSvcEventHistory() {
 
 } // namespace
 
+void TestGuestAccessWatch() {
+    // Diagnostic watch: watched pages lose their fast entry so typed accesses
+    // take the checked path. Values must be identical, only visibility changes.
+    NativeA32Memory memory;
+    std::string error;
+    Require(memory.MapRegion(
+                {"watch", 0x1C000000, 0x8000, true, false, {}}, &error),
+            error);
+    constexpr uint32_t watchedAddress = 0x1C001000;
+    constexpr uint32_t outsideAddress = 0x1C006000;
+    const std::array<uint8_t, 4> initial{0x78, 0x56, 0x34, 0x12};
+    const std::array<uint8_t, 4> replacement{0xEF, 0xBE, 0xAD, 0xDE};
+    Require(memory.WriteBytes(watchedAddress, initial), "seed watched bytes");
+    Require(memory.WriteBytes(outsideAddress, initial), "seed outside bytes");
+
+    uint32_t value = 0;
+    Require(memory.ReadFast<uint32_t>(watchedAddress, &value) &&
+                value == 0x12345678U,
+            "fast read before watching");
+    Require(memory.WatchCounters().TypedReads == 0U,
+            "unwatched memory must not be counted");
+
+    const std::array<std::pair<uint32_t, uint32_t>, 1> ranges{
+        {{watchedAddress, watchedAddress + 0x100U}}};
+    memory.SetRangeWatch(ranges);
+    Require(memory.RangeWatchActive() && memory.WatchedRangeCount() == 1U,
+            "watch must be active after SetRangeWatch");
+
+    value = 0;
+    Require(memory.ReadFast<uint32_t>(watchedAddress, &value) &&
+                value == 0x12345678U,
+            "watched typed read must return the same bytes");
+    Require(memory.WatchCounters().TypedReads == 1U &&
+                memory.WatchCounters().FirstReadAddress == watchedAddress &&
+                memory.WatchCounters().FirstReadSize == 4U,
+            "watched typed read must be counted once with its identity");
+
+    Require(memory.ReadFast<uint32_t>(outsideAddress, &value) &&
+                value == 0x12345678U,
+            "read outside the watch still works");
+    Require(memory.WatchCounters().TypedReads == 1U,
+            "read outside the watch must not be counted");
+
+    Require(memory.WriteFast<uint32_t>(watchedAddress, 0xDEADBEEFU),
+            "watched typed write");
+    Require(memory.WatchCounters().TypedWrites == 1U,
+            "watched typed write must be counted");
+    Require(memory.ReadFast<uint32_t>(watchedAddress, &value) &&
+                value == 0xDEADBEEFU,
+            "watched typed write must land");
+
+    std::array<uint8_t, 4> bytes{};
+    Require(memory.ReadBytes(watchedAddress, bytes) &&
+                bytes == replacement,
+            "watched byte read must return the bytes just written");
+    Require(memory.WatchCounters().ByteReads == 1U,
+            "watched byte read must be counted");
+    Require(memory.GetReadPointer(watchedAddress, 4U) != nullptr &&
+                memory.WatchCounters().PointerReads == 1U,
+            "handing out a live pointer must be recorded");
+
+    memory.SetRangeWatchSuppressed(true);
+    Require(memory.WriteBytes(watchedAddress, initial), "suppressed byte write");
+    Require(memory.WatchCounters().ByteWrites == 0U,
+            "suppressed byte write must not be counted");
+    memory.SetRangeWatchSuppressed(false);
+    Require(memory.WriteBytes(watchedAddress, replacement),
+            "counted byte write");
+    Require(memory.WatchCounters().ByteWrites == 1U,
+            "byte write must be counted when not suppressed");
+
+    memory.ClearRangeWatch();
+    Require(!memory.RangeWatchActive() && memory.WatchedRangeCount() == 0U,
+            "watch must be cleared");
+    const auto counters = memory.WatchCounters();
+    Require(memory.ReadFast<uint32_t>(watchedAddress, &value) &&
+                value == 0xDEADBEEFU,
+            "typed read after clearing the watch");
+    Require(memory.WatchCounters().TypedReads == counters.TypedReads,
+            "cleared watch must stop counting");
+}
+
+void TestGpuMemoryWriteOwnership() {
+    NativeA32Memory memory;
+    std::string error;
+    Require(memory.MapRegion({"copy", 0x1000, 0x3000, true, false, {}}, &error), error);
+    std::vector<std::pair<uint32_t, size_t>> writes;
+    memory.SetWriteObserver([&](uint32_t address, size_t size) {
+        writes.emplace_back(address, size);
+    });
+    Require(memory.ObserveWrites(0x2000, 0x100), "observe GPU copy destination");
+    Require(memory.WriteFast<uint32_t>(0x2000, 0U), "same-value typed write");
+    Require(writes == std::vector<std::pair<uint32_t, size_t>>{{0x2000, 4}},
+            "same-value typed writes must revoke exact GPU byte ownership");
+    Require(memory.WriteFast<uint32_t>(0x3000, 1U) &&
+                memory.WriteFast<uint16_t>(0x21FF, 1U), "unrelated writes");
+    Require(writes.size() == 1, "writes outside GPU-owned range must not revoke it");
+    Require(memory.WriteFast<uint32_t>(0x1FFE, 0U), "cross-page partial write");
+    Require(writes.back() == std::pair<uint32_t, size_t>{0x1FFE, 4},
+            "partial overlap must preserve its actual address and length");
+    const std::array<uint8_t, 2> zero{};
+    Require(memory.WriteBytes(0x2004, zero) &&
+                memory.WriteHostBytes(0x2006, zero) &&
+                memory.Fill(0x2008, 2, 0), "bulk writes");
+    Require(writes.size() == 5 && writes[2].first == 0x2004 &&
+                writes[3].first == 0x2006 && writes[4].first == 0x2008,
+            "host and bulk writes must revoke ownership even without byte changes");
+    {
+        NativeA32Memory::RangeWatchSuppression materialization(memory);
+        Require(memory.WriteBytes(0x2000, zero), "GPU materialization");
+    }
+    Require(writes.size() == 5, "GPU materialization must retain GPU ownership");
+    uint64_t value = 0, token = 0;
+    uint32_t fault = 0, previous = 0;
+    Require(memory.LoadExclusive(0x2000, 4, &value, &token, &fault) &&
+                memory.StoreExclusive(0x2000, 4, value, token, &fault) ==
+                    oot3d::recomp::a32::ExclusiveStoreResult::Success &&
+                memory.AtomicSwap(0x2000, 4, 0, &previous, &fault),
+            "atomic writes");
+    Require(writes.size() == 7, "atomic same-value stores must revoke ownership");
+    Require(memory.GetWritePointer(0x2010, 4) != nullptr &&
+                writes.back() == std::pair<uint32_t, size_t>{0x2010, 4} &&
+                !memory.ObserveWrites(0x2010, 4),
+            "escaped mutable pointers must prevent future GPU ownership");
+    const auto saved = memory.CaptureState();
+    Require(memory.RestoreState(saved, &error), error);
+    Require(memory.ObserveWrites(0x2010, 4) &&
+                memory.WriteFast<uint32_t>(0x2010, 0U),
+            "restored memory must retain the observer but not old allocation pointers");
+    Require(writes.size() == 9 && writes.back().first == 0x2010,
+            "restored page traps must observe writes");
+    memory.SetWriteObserver({});
+    Require(memory.WriteFast<uint32_t>(0x2010, 0U) && writes.size() == 9,
+            "removing observer must detach callbacks");
+}
+
+void TestDeferredDeviceMemory() {
+    NativeA32Memory memory;
+    std::string error;
+    Require(memory.MapRegion({"device", 0x1000, 0x4000, true, false, {}}, &error), error);
+    size_t materialized = 0;
+    const auto publish = [&](uint32_t address, size_t size, uint8_t value) {
+        const std::array ranges{std::pair<uint32_t, size_t>{address, size}};
+        return memory.DeferWrites(ranges,
+            [&, value](uint32_t, std::span<uint8_t> bytes) {
+                materialized += bytes.size();
+                std::fill(bytes.begin(), bytes.end(), value);
+                return true;
+            });
+    };
+    Require(publish(0x1FF0, 64, 0x31), "publish cross-page device write");
+    Require(materialized == 0, "device completion must not fetch unobserved bytes");
+    uint32_t word = 0;
+    Require(memory.ReadFast<uint32_t>(0x1FFE, &word) && word == 0x31313131 &&
+                materialized == 4, "unaligned cross-page read must fetch only its bytes");
+    Require(memory.WriteFast<uint16_t>(0x2004, 0) &&
+                memory.Fill(0x2008, 4, 0x72), "CPU partial overwrites");
+    Require(publish(0x2010, 32, 0x54), "new producer partially supersedes old producer");
+    std::array<uint8_t, 64> actual{};
+    Require(memory.ReadBytes(0x1FF0, actual), "materialize surviving versions");
+    std::array<uint8_t, 64> expected;
+    expected.fill(0x31);
+    expected[20] = expected[21] = 0;
+    std::fill(expected.begin() + 24, expected.begin() + 28, 0x72);
+    std::fill(expected.begin() + 32, expected.end(), 0x54);
+    Require(actual == expected && materialized == 58,
+            "CPU writes and newer device writes must replace only their exact bytes");
+    Require(publish(0x2000, 8, 0x83), "publish for atomics");
+    uint64_t value = 0, token = 0;
+    uint32_t fault = 0, previous = 0;
+    Require(memory.LoadExclusive(0x2000, 4, &value, &token, &fault) &&
+                value == 0x83838383, "exclusive load observes device result");
+    Require(publish(0x2000, 4, 0x94) &&
+                memory.StoreExclusive(0x2000, 4, 1, token, &fault) ==
+                    oot3d::recomp::a32::ExclusiveStoreResult::ReservationLost,
+            "device publication invalidates the exclusive reservation");
+    Require(memory.AtomicSwap(0x2000, 4, 0x12345678, &previous, &fault) &&
+                previous == 0x94949494 &&
+                memory.ReadFast<uint32_t>(0x2000, &word) && word == 0x12345678,
+            "atomic swap must read the producer then preserve its replacement");
+    Require(publish(0x3000, 16, 0xA5), "publish pointer-backed device result");
+    const auto* pointer = memory.GetReadPointer(0x3000, 16);
+    Require(pointer && pointer[15] == 0xA5 && !publish(0x3000, 16, 0xB6),
+            "escaped read pointer must be coherent and prevent later deferral");
+    Require(publish(0x4000, 16, 0xC7), "publish for snapshot");
+    const auto snapshot = memory.CaptureState();
+    NativeA32Memory restored;
+    Require(restored.RestoreState(snapshot, &error), error);
+    Require(restored.ReadFast<uint32_t>(0x4000, &word) && word == 0xC7C7C7C7,
+            "savestate contains device bytes, not host callbacks or stale RAM");
+    Require(publish(0x4010, 8, 0xD8), "publish for memory clone");
+    const NativeA32Memory cloned(memory);
+    Require(cloned.ReadFast<uint32_t>(0x4010, &word) && word == 0xD8D8D8D8,
+            "copied memory owns a materialized independent image");
+    Require(memory.RestoreState(snapshot, &error) && publish(0x3000, 16, 0xE9),
+            "replacing memory releases pointers to the old allocation");
+    Require(memory.GetWritePointer(0x3000, 16)[0] == 0xE9 &&
+                !publish(0x3000, 16, 0xFA),
+            "escaped writable pointers also materialize and exclude deferral");
+}
+
+void TestDeferredDeviceFailureAndOverwrite() {
+    NativeA32Memory memory;
+    std::string error;
+    Require(memory.MapRegion({"device", 0x1000, 0x1000, true, false, {}}, &error), error);
+    const std::array ranges{std::pair<uint32_t, size_t>{0x1100, 4}};
+    Require(memory.DeferWrites(ranges, [](uint32_t, std::span<uint8_t>) { return false; }),
+            "publish a producer that will fail on materialization");
+    uint32_t value = 0xFFFFFFFF;
+    Require(!memory.ReadFast<uint32_t>(0x1100, &value) && value == 0xFFFFFFFF,
+            "failed producer must fault instead of exposing stale bytes");
+    bool rejected = false;
+    try { (void)memory.CaptureState(); } catch (const std::exception&) { rejected = true; }
+    Require(rejected, "state capture must reject unresolved device output");
+    Require(memory.WriteFast<uint32_t>(0x1100, 0x10203040) &&
+                memory.ReadFast<uint32_t>(0x1100, &value) && value == 0x10203040,
+            "a complete overwrite discards obsolete work without reading it");
+}
+
 int main() {
+    TestDeferredDeviceMemory();
+    TestDeferredDeviceFailureAndOverwrite();
+    TestGpuMemoryWriteOwnership();
+    TestGuestAccessWatch();
     TestBoundedSvcEventHistory();
     const std::filesystem::path romFsPath =
         std::filesystem::temp_directory_path() /
@@ -676,13 +901,14 @@ int main() {
             "cannot write the over-EOF File:Read request");
     state.r[0] = romFsFile;
     Require(host.HandleSvc(0x32, state, memory, context).Action ==
-                NativeA32HostAction::Wait,
-            "over-EOF RomFS read changed its error behavior");
+                NativeA32HostAction::Resume,
+            "over-EOF RomFS read did not return a short read");
     std::array<uint8_t, invalidReadSentinel.size()> invalidReadBytes{};
     Require(memory.ReadBytes(readAddress, invalidReadBytes) &&
-                invalidReadBytes == invalidReadSentinel &&
-                host.RuntimeProfile().RomFsReadCalls == 3U,
-            "rejected over-EOF read touched memory or the backing stream");
+                invalidReadBytes[0] == romFsBytes.back() && invalidReadBytes[1] == invalidReadSentinel[1] &&
+                memory.Read32(0x1FF82088, &response) && response == 1U &&
+                host.RuntimeProfile().RomFsReadCalls == 4U,
+            "short read changed bytes past EOF");
 
     Require(memory.Write32(0x1FF82080, 0x08080000),
             "cannot write File:Close request");
@@ -726,6 +952,33 @@ int main() {
                 NativeA32HostAction::Resume &&
                 state.r[0] == 0 && state.r[1] == 0,
             "WaitSynchronizationN did not acquire the available APT lock");
+    {
+        // Event names are built without streams; they must keep the text
+        // the stream formatting produced.
+        std::ostringstream expected;
+        expected << "WaitSynchronizationN:any:0x" << std::hex << std::setw(8)
+                 << std::setfill('0') << lockHandle << "=";
+        const std::string& name = host.SvcEvents().back().Name;
+        Require(name.rfind(expected.str(), 0) == 0 &&
+                    name.size() > expected.str().size(),
+                "WaitSynchronizationN event name changed format");
+        const std::array<uint32_t, 4> saved{
+            state.r[0], state.r[1], state.r[2], state.r[3]};
+        state.r[0] = 0xFFFFFFF0U;  // no such arbiter: report a host fault
+        state.r[1] = 0x0000ABCDU;
+        state.r[2] = 3U;
+        state.r[3] = static_cast<uint32_t>(-5);
+        Require(host.HandleSvc(0x22, state, memory, context).Action ==
+                    NativeA32HostAction::Fault,
+                "ArbitrateAddress on an invalid handle did not fault");
+        std::ostringstream arbitrate;
+        arbitrate << "ArbitrateAddress:address=0x" << std::hex << std::setw(8)
+                  << std::setfill('0') << 0x0000ABCDU << ":type=" << std::dec
+                  << 3U << ":value=" << -5;
+        Require(host.SvcEvents().back().Name == arbitrate.str(),
+                "ArbitrateAddress event name changed format");
+        std::copy(saved.begin(), saved.end(), state.r.begin());
+    }
 
     Require(memory.Write32(0x1FF82080, 0x00020080) &&
                 memory.Write32(0x1FF82084, 0x300) &&

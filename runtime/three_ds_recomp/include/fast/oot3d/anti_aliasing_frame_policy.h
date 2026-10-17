@@ -16,6 +16,16 @@ struct AntiAliasingFrameCapabilities {
 struct AntiAliasingFramePolicy {
     bool TemporalJitter = false;
     bool TemporalMotion = false;
+    // Presentation stages read the display's world surface: TAA, SMAA, the
+    // upscalers and forced motion vectors (FXAA and MSAA do not).
+    bool PresentationWorldSurface = false;
+    // Same-extent anti-aliasing (TAA, SMAA) is a scene stage: a target's
+    // boundary before native UI resolves it, so the UI draws over the result.
+    bool SceneAntiAliasing = false;
+    // An upscaler changes the extent and runs at presentation: a target's
+    // boundary before native UI keeps the scene it completed, so the upscaler
+    // reconstructs that scene and the UI is laid over its output.
+    bool PresentationUpscaler = false;
     uint32_t TemporalJitterPhases = 8U;
     uint32_t SpatialAaMode = 0U;
     uint8_t MsaaSamples = 1U;
@@ -34,6 +44,14 @@ ResolveAntiAliasingFramePolicy(
         settings.AntiAliasing == AntiAliasingMode::Taa ||
         temporalUpscaler || forceTaa;
     policy.TemporalMotion = policy.TemporalJitter || forceMotion;
+    policy.PresentationWorldSurface = policy.TemporalMotion ||
+        settings.AntiAliasing == AntiAliasingMode::Smaa1x ||
+        settings.AntiAliasing == AntiAliasingMode::Upscaler;
+    policy.SceneAntiAliasing =
+        settings.AntiAliasing == AntiAliasingMode::Taa || forceTaa ||
+        settings.AntiAliasing == AntiAliasingMode::Smaa1x;
+    policy.PresentationUpscaler =
+        settings.AntiAliasing == AntiAliasingMode::Upscaler;
     policy.TemporalJitterPhases = temporalUpscaler
         ? ResolveUpscalerContract(
               settings.Upscaler, settings.UpscalerMode, 1U, 1U)

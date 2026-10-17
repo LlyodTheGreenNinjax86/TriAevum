@@ -29,10 +29,10 @@ float DecodeAmbientOcclusionResponse(
 }
 
 float ResolveAmbientOcclusionVisibility(
-    float cacaoVisibility,
+    float aoVisibility,
     float normalGuideAlpha) noexcept {
     const float visibility =
-        FiniteSaturate(cacaoVisibility, 1.0F);
+        FiniteSaturate(aoVisibility, 1.0F);
     const float response =
         DecodeAmbientOcclusionResponse(
             normalGuideAlpha);
@@ -41,11 +41,11 @@ float ResolveAmbientOcclusionVisibility(
 
 std::array<float, 3>
 ResolveAmbientOcclusionVisibilityRgb(
-    float cacaoVisibility,
+    float aoVisibility,
     float normalGuideAlpha,
     const std::array<float, 4>& ambientGuide) noexcept {
     const float visibility =
-        FiniteSaturate(cacaoVisibility, 1.0F);
+        FiniteSaturate(aoVisibility, 1.0F);
     const float fallback =
         DecodeAmbientOcclusionResponse(normalGuideAlpha);
     const bool exact =
@@ -62,9 +62,9 @@ ResolveAmbientOcclusionVisibilityRgb(
 }
 
 float ResolveSceneAmbientOcclusionVisibility(
-    float cacaoVisibility, float sceneCoverage) noexcept {
+    float aoVisibility, float sceneCoverage) noexcept {
     const float visibility =
-        FiniteSaturate(cacaoVisibility, 1.0F);
+        FiniteSaturate(aoVisibility, 1.0F);
     const float coverage =
         FiniteSaturate(sceneCoverage, 0.0F);
     return std::lerp(1.0F, visibility, coverage);
@@ -80,16 +80,16 @@ float oot3d_ambient_occlusion_response(
 }
 
 float oot3d_ambient_occlusion_visibility(
-    float cacao_visibility_value,
+    float ao_visibility_value,
     float normal_guide_alpha) {
     float response = oot3d_ambient_occlusion_response(
         normal_guide_alpha);
-    return mix(1.0, clamp(cacao_visibility_value, 0.0, 1.0),
+    return mix(1.0, clamp(ao_visibility_value, 0.0, 1.0),
                response);
 }
 
 vec3 oot3d_ambient_occlusion_visibility_rgb(
-    float cacao_visibility_value,
+    float ao_visibility_value,
     float normal_guide_alpha,
     vec4 ambient_guide) {
     float fallback = oot3d_ambient_occlusion_response(
@@ -98,16 +98,35 @@ vec3 oot3d_ambient_occlusion_visibility_rgb(
         ? clamp(ambient_guide.rgb, vec3(0.0), vec3(1.0))
         : vec3(fallback);
     return mix(vec3(1.0),
-               vec3(clamp(cacao_visibility_value, 0.0, 1.0)),
+               vec3(clamp(ao_visibility_value, 0.0, 1.0)),
                response);
 }
 
 float oot3d_scene_ambient_occlusion_visibility(
-    float cacao_visibility_value,
+    float ao_visibility_value,
     float scene_coverage) {
     return mix(1.0,
-               clamp(cacao_visibility_value, 0.0, 1.0),
+               clamp(ao_visibility_value, 0.0, 1.0),
                clamp(scene_coverage, 0.0, 1.0));
+}
+)glsl";
+}
+
+std::string_view
+AmbientOcclusionDebugShaderLibrary() noexcept {
+    return R"glsl(
+float mxao_debug_pack_normal(vec3 n) {
+    uvec3 q=uvec3(round(clamp(n*0.5+0.5,0.0,1.0)*vec3(255.0,255.0,127.0)));
+    return uintBitsToFloat(0x3F800000u|(q.x<<15u)|(q.y<<7u)|q.z);
+}
+// Views 3-5 (normals in use, renderer, depth) and 11-12 (face normals, face
+// vs depth normals) are packed colours.
+vec3 oot3d_ambient_occlusion_debug_color(uint view, float value) {
+    if((view>=3u && view<=5u) || view==11u || view==12u) {
+        uint bits=floatBitsToUint(value);
+        return vec3(float((bits>>15u)&255u)/255.0,float((bits>>7u)&255u)/255.0,float(bits&127u)/127.0);
+    }
+    return vec3(clamp(value,0.0,1.0));
 }
 )glsl";
 }

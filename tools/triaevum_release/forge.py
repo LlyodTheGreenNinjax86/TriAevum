@@ -841,6 +841,7 @@ def build_private_whole_aot(
     jobs: int = 8,
     sysroot: Path | None = None,
     target_triple: str = WINDOWS.target,
+    profile_data: Path | None = None,
 ) -> dict[str, Any]:
     """Build the direct generated-C++ plugin consumed by the mature runtime."""
     platform = for_target(target_triple)
@@ -882,6 +883,7 @@ def build_private_whole_aot(
                 sysroot=sysroot,
                 target_triple=platform.target,
                 profile=platform.profile,
+                profile_data=profile_data,
             ),
             shard_count=shard_count,
             jobs=jobs,
@@ -898,6 +900,7 @@ def build_private_whole_aot(
             "plugin_sha256",
             "cache_key",
             "translator_identity_sha256",
+            "profile_data_sha256",
             "functions",
             "shards",
             "objects_compiled",
@@ -916,6 +919,8 @@ def publish_private_runtime(
     launch_profile: Path,
     data_root: Path,
     topscreen_texture_pack: Path | None = None,
+    water_texture_catalog: Path | None = None,
+    scene_light_catalog: Path | None = None,
     package_root: Path | None = None,
     pica_shader_pack: Path | None = None,
     renderer_cache_directory: Path | None = None,
@@ -996,6 +1001,14 @@ def publish_private_runtime(
         if not topscreen_texture_pack.is_file():
             raise ForgeError("TopScreen texture pack is missing before activation")
         profile["arguments"].extend(("--topscreen-texture-overrides", str(topscreen_texture_pack.resolve())))
+    if water_texture_catalog is not None:
+        if not water_texture_catalog.is_file():
+            raise ForgeError("Water texture catalog is missing before activation")
+        profile["arguments"].extend(("--water-texture-catalog", str(water_texture_catalog.resolve())))
+    if scene_light_catalog is not None:
+        if not scene_light_catalog.is_file():
+            raise ForgeError("Scene light catalog is missing before activation")
+        profile["arguments"].extend(("--scene-light-catalog", str(scene_light_catalog.resolve())))
     context = InstallationContext(installation)
     if pica_shader_pack is not None:
         if not pica_shader_pack.is_file():
@@ -1005,12 +1018,13 @@ def publish_private_runtime(
         profile["arguments"].extend(("--renderer-cache-directory", str(renderer_cache_directory.resolve())))
     path_options = {"--title-plugin", "--a32-process-manifest", "--resource-root",
                     "--config", "--topscreen-config", "--save-data", "--output",
-                    "--topscreen-texture-overrides", "--pica-aot-shader-pack", "--renderer-cache-directory"}
+                    "--topscreen-texture-overrides", "--water-texture-catalog", "--scene-light-catalog",
+                    "--pica-aot-shader-pack", "--renderer-cache-directory"}
     scopes = {}
     for index, argument in enumerate(profile["arguments"][:-1]):
         if argument in path_options:
             target = Path(profile["arguments"][index + 1])
-            profile["arguments"][index + 1] = context.profile_argument(target, profile_path)
+            profile["arguments"][index + 1] = context.profile_argument(target, profile_path, runtime_dir=package)
             scopes[argument] = context.scope(target, profile_path.parent)
     profile["path_scopes"] = scopes
     if not destination.is_file() or sha256_file(destination) != plugin_hash:
@@ -1046,6 +1060,16 @@ def publish_private_runtime(
         prepared.state["runtime"]["topscreen_textures"] = {
             "path": context.reference(topscreen_texture_pack, prepared.directory),
             "sha256": sha256_file(topscreen_texture_pack),
+        }
+    if water_texture_catalog is not None:
+        prepared.state["runtime"]["water_textures"] = {
+            "path": context.reference(water_texture_catalog, prepared.directory),
+            "sha256": sha256_file(water_texture_catalog),
+        }
+    if scene_light_catalog is not None:
+        prepared.state["runtime"]["scene_lights"] = {
+            "path": context.reference(scene_light_catalog, prepared.directory),
+            "sha256": sha256_file(scene_light_catalog),
         }
     if pica_shader_pack is not None:
         prepared.state["runtime"]["pica_shader_pack"] = {
@@ -1215,6 +1239,7 @@ def build_private_title(
     shard_count: int = 256,
     jobs: int = 8,
     sysroot: Path | None = None,
+    profile_data: Path | None = None,
 ) -> dict[str, Any]:
     prepared = load_prepared_content(
         prepared_directory, required_inputs=("code", "exheader")
@@ -1237,6 +1262,7 @@ def build_private_title(
         target_triple=target_triple,
         shard_count=shard_count,
         jobs=jobs,
+        profile_data=profile_data,
     )
     with activation_transaction(runtime_plugin.resolve().parent, [
         runtime_plugin, launch_profile, active_title_state,
@@ -1409,6 +1435,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     title_parser.add_argument("--sysroot", type=Path,
                               help="Use a verified private Windows sysroot instead of host discovery")
     title_parser.add_argument(
+        "--profile-data", type=Path,
+        help="Developer PGO: merged LLVM profile applied to the title module")
+    title_parser.add_argument(
         "--target-triple", default=host_platform().target
     )
     title_parser.add_argument(
@@ -1575,6 +1604,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 shard_count=args.shards,
                 jobs=args.jobs,
                 sysroot=args.sysroot,
+                profile_data=args.profile_data,
             )
         else:
             recipe = load_recipe(args.recipes, args.recipe)

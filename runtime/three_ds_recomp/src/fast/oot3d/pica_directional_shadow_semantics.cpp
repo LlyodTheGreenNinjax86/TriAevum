@@ -52,6 +52,26 @@ struct LightCluster {
 PicaDirectionalShadowLightSelection
 ResolvePicaDirectionalShadowLightSelection(
     std::span<const PicaSceneDrawRecord* const> draws) noexcept {
+    // Native environment ownership is scene-wide, not weighted by how many
+    // actors happened to select a source. Never average opposing directions.
+    for (const auto* draw : draws) {
+        if (!draw || !draw->SceneDirectionals) continue;
+        const auto& snapshot = *draw->SceneDirectionals;
+        if (snapshot.Count > snapshot.Lights.size()) return {};
+        PicaDirectionalShadowLightSelection result;
+        for (uint32_t i = 0; i < snapshot.Count; ++i)
+            if (Renderer3ds::PicaSceneDirectionalDirection(snapshot.Lights[i])) ++result.CandidateCount;
+        // The scene's main light, as the environment key light resolves it.
+        if (const auto* main = Renderer3ds::FindPicaSceneMainDirectional(snapshot)) {
+            result.WorldDirectionTowardSource = *Renderer3ds::PicaSceneDirectionalDirection(*main);
+            result.ReferenceDraw = draw;
+            result.ReferenceLightIndex = static_cast<uint8_t>(main - snapshot.Lights.data());
+            result.GeometryLightWeight = Renderer3ds::PicaSceneDirectionalEnergy(*main);
+            result.ShadowStrength = Renderer3ds::PicaSceneMainShadowStrength(snapshot, *main);
+        }
+        result.ClusterCount = result.CandidateCount;
+        return result;
+    }
     std::vector<LightCluster> clusters;
     uint32_t candidateCount = 0U;
     for (const PicaSceneDrawRecord* draw : draws) {
@@ -60,6 +80,9 @@ ResolvePicaDirectionalShadowLightSelection(
             !draw->NativeTransform.CurrentViewToWorldAvailable) {
             continue;
         }
+        auto viewToWorld = draw->NativeTransform.CurrentViewToWorld;
+        if (draw->LightingWorldToView &&
+            !InvertDirectionalShadowMatrix(*draw->LightingWorldToView, viewToWorld)) continue;
         const float geometryWeight = static_cast<float>(
             std::max(draw->VertexOrIndexCount, 1U));
         for (uint8_t lightIndex = 0U;
@@ -74,7 +97,7 @@ ResolvePicaDirectionalShadowLightSelection(
             DirectionalShadowVector worldDirection =
                 TransformPicaLightDirectionToWorld(
                     light.DirectionViewTowardSource,
-                    draw->NativeTransform.CurrentViewToWorld);
+                    viewToWorld);
             if (!Normalize(worldDirection)) {
                 continue;
             }
@@ -201,6 +224,22 @@ ResolvePicaDirectionalShadowReceiverLight(
         Luminance(result.ShadowedDirectFraction) > kMinimumLightEnergy
             ? PicaDirectionalShadowReceiverClass::DirectMatched
             : PicaDirectionalShadowReceiverClass::AmbientOnly;
+    return result;
+}
+
+uint16_t ResolvePicaSurfaceDirectionalShadowMask(
+    std::span<const PicaSurfaceShadowLight> lights,
+    const DirectionalShadowMatrix& viewToWorld,
+    const DirectionalShadowVector& worldDirectionTowardSource) noexcept {
+    auto target = worldDirectionTowardSource;
+    if (!Normalize(target)) return 0U;
+    uint16_t result = 0U;
+    for (const auto& light : lights) {
+        if (!light.Enabled || light.Point || light.ShaderSlot >= 12U) continue;
+        auto world = TransformPicaLightDirectionToWorld(light.DirectionViewTowardSource, viewToWorld);
+        if (Normalize(world) && Dot(world, target) >= kDirectionClusterCosine)
+            result |= static_cast<uint16_t>(1U << light.ShaderSlot);
+    }
     return result;
 }
 

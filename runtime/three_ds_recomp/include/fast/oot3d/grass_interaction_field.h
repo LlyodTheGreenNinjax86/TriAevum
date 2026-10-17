@@ -4,9 +4,11 @@
 #include "fast/oot3d/graphics_settings.h"
 
 #include <array>
+#include <algorithm>
 #include <cstdint>
 #include <optional>
 #include <span>
+#include <utility>
 #include <vector>
 
 namespace Fast::Oot3d {
@@ -38,12 +40,24 @@ class GrassInteractionField final {
     [[nodiscard]] bool Initialized() const noexcept {
         return mInitialized;
     }
+    [[nodiscard]] bool AtRest() const {
+        return std::all_of(mActiveColumns.begin(), mActiveColumns.end(),
+                           [](const auto& range) { return range[0] >= range[1]; });
+    }
     void Reset();
 
   private:
+    struct CellValue {
+        std::array<float, 2> Displacement;
+        std::array<float, 2> Velocity;
+        float Height;
+    };
     void ShiftTo(const std::array<float, 2>& center);
     void ClearValues();
+    void ClearActiveColumns();
     void Stamp(const InteractiveGrassSettings& settings, const GrassInteractor& actor);
+    // Zero (+0) displacement and velocity and no interaction height.
+    [[nodiscard]] bool AtRest(size_t index) const noexcept;
     [[nodiscard]] std::array<float, 2> SampleImpl(
         float worldX, float worldZ, const float* worldY,
         float verticalTolerance) const;
@@ -56,9 +70,10 @@ class GrassInteractionField final {
     std::vector<std::array<float, 2>> mDisplacement;
     std::vector<std::array<float, 2>> mVelocity;
     std::vector<float> mInteractionHeight;
-    std::vector<std::array<float, 2>> mScratchDisplacement;
-    std::vector<std::array<float, 2>> mScratchVelocity;
-    std::vector<float> mScratchHeight;
+    // Cells evolve independently and a cell at rest stays at rest, so only
+    // the columns [first, end) of each row may differ from rest.
+    std::vector<std::array<uint32_t, 2>> mActiveColumns;
+    std::vector<std::pair<size_t, CellValue>> mShiftScratch;
 };
 
 } // namespace Fast::Oot3d

@@ -124,6 +124,7 @@ bool TemporalAaPass::Initialize(VkPhysicalDevice physical, VkDevice device,
         pipelineDesc.shader.stage = nri::StageBits::COMPUTE_SHADER;
         pipelineDesc.shader.bytecode = shader.data();
         pipelineDesc.shader.size = shader.size() * sizeof(uint32_t);
+        pipelineDesc.cache = NriInteropAccess::PipelineCache(interop);
         if (mImpl->Core->CreateComputePipeline(
                 *nriDevice, pipelineDesc, mImpl->Pipeline) !=
             nri::Result::SUCCESS)
@@ -155,7 +156,7 @@ bool TemporalAaPass::Configure(uint32_t width, uint32_t height) {
 #ifndef ENABLE_OOT3D_NRI
     return false;
 #else
-    if (mImpl->Width != 0U && vkDeviceWaitIdle(mImpl->Device) != VK_SUCCESS)
+    if (mImpl->Width != 0U && !mImpl->Interop->CompleteRecordedWork())
         return false;
     InvalidateScreenResources();
     try {
@@ -202,14 +203,15 @@ bool TemporalAaPass::Configure(uint32_t width, uint32_t height) {
 bool TemporalAaPass::Execute(
     VkCommandBuffer command, uint32_t frameSlot, uint64_t renderedFrameId,
     VkImage currentColor, VkFormat currentColorFormat,
-    VkImage motionSurface, VkFormat motionFormat, bool historyValid,
+    VkImage motionSurface, VkFormat motionFormat,
+    uint32_t motionWidth, uint32_t motionHeight, bool historyValid,
     float historyWeight, float clampExpansion, float sharpness,
     SceneColorEncoding inputEncoding,
     const EffectPassBarrierPlan& barrierPlan) {
     const auto* outputBarrier = barrierPlan.Find(
         EffectResource::TemporalColor);
     if (currentColor == VK_NULL_HANDLE || motionSurface == VK_NULL_HANDLE ||
-        mImpl->Width == 0U ||
+        mImpl->Width == 0U || motionWidth == 0U || motionHeight == 0U ||
         !IsKnownSceneColorEncoding(inputEncoding) ||
         !barrierPlan.Valid() ||
         outputBarrier == nullptr || !outputBarrier->Managed())
@@ -217,6 +219,7 @@ bool TemporalAaPass::Execute(
 #ifndef ENABLE_OOT3D_NRI
     (void)command; (void)frameSlot; (void)renderedFrameId;
     (void)currentColorFormat; (void)motionFormat; (void)historyValid;
+    (void)motionWidth; (void)motionHeight;
     (void)historyWeight; (void)clampExpansion; (void)sharpness;
     (void)inputEncoding;
     (void)barrierPlan;
@@ -230,7 +233,7 @@ bool TemporalAaPass::Execute(
             VK_IMAGE_USAGE_SAMPLED_BIT, mImpl->Width, mImpl->Height) ||
         !mImpl->Interop->WrapTexture(
             motionSurface, motionFormat, VK_IMAGE_TYPE_2D,
-            VK_IMAGE_USAGE_SAMPLED_BIT, mImpl->Width, mImpl->Height))
+            VK_IMAGE_USAGE_SAMPLED_BIT, motionWidth, motionHeight))
         return false;
 
     const uint32_t write = static_cast<uint32_t>(renderedFrameId & 1U);
@@ -394,6 +397,12 @@ bool TemporalAaPass::ComputeOwnedByNri() const {
 }
 bool TemporalAaPass::BarriersOwnedByNri() const {
     return mImpl->NriBarriersUsed;
+}
+uint32_t TemporalAaPass::Width() const {
+    return mImpl->Width;
+}
+uint32_t TemporalAaPass::Height() const {
+    return mImpl->Height;
 }
 SceneColorEncoding TemporalAaPass::OutputEncoding() const {
     return mImpl->OutputEncoding;

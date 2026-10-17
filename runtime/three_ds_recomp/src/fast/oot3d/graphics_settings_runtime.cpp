@@ -6,8 +6,10 @@
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <string_view>
+#include <vector>
 
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
@@ -56,9 +58,9 @@ bool HasGraphicsEnvironmentOverride() {
         "OOT3D_GRAPHICS_FOV_MULTIPLIER",
         "OOT3D_GRAPHICS_GRASS_AUTO",
         "OOT3D_GRAPHICS_GRASS_HASH",
-        "OOT3D_GRAPHICS_CACAO",
-        "OOT3D_GRAPHICS_CACAO_QUALITY",
-        "OOT3D_GRAPHICS_CACAO_STRESS",
+        "OOT3D_GRAPHICS_AO",
+        "OOT3D_GRAPHICS_AO_QUALITY",
+        "OOT3D_GRAPHICS_AO_STRESS",
         "OOT3D_GRAPHICS_HIZ",
         "OOT3D_GRAPHICS_SSSR",
         "OOT3D_GRAPHICS_REFLECTION_TEXTURE_HASH",
@@ -78,8 +80,8 @@ bool HasGraphicsEnvironmentOverride() {
         "OOT3D_GRAPHICS_TEST_BORDERLESS_AFTER_FRAMES",
         "OOT3D_GRAPHICS_TEST_PRESENTATION_ROLLBACK_AFTER_FRAMES",
         "OOT3D_GRAPHICS_TEST_FAIL_PRESENTATION_APPLY",
-        "OOT3D_GRAPHICS_TEST_CACAO_AFTER_FRAMES",
-        "OOT3D_GRAPHICS_TEST_CACAO_OFF_AFTER_FRAMES",
+        "OOT3D_GRAPHICS_TEST_AO_AFTER_FRAMES",
+        "OOT3D_GRAPHICS_TEST_AO_OFF_AFTER_FRAMES",
         "OOT3D_GRAPHICS_TEST_RENDER_SCALE_AFTER_FRAMES",
         "OOT3D_GRAPHICS_TEST_UPSCALER_QUALITY_AFTER_FRAMES",
     };
@@ -123,6 +125,11 @@ GraphicsSettingsRuntime::GraphicsSettingsRuntime() {
                     initial = loaded.Value;
                     selectedInitial = true;
                     rewriteLoadedSettings = loaded.NeedsRewrite;
+                }
+                if (const auto presets = root.find("GraphicsPresets"); presets != root.end()) {
+                    std::vector<std::string> issues;
+                    mUserPresets = GraphicsPresetLibrary::Deserialize(*presets, &issues);
+                    for (const auto& issue : issues) SPDLOG_WARN("OOT3D graphics presets: {}", issue);
                 }
             }
         } catch (const std::exception& exception) {
@@ -268,15 +275,15 @@ GraphicsSettingsRuntime::GraphicsSettingsRuntime() {
             dumpDirectory;
         customized = true;
     }
-    if (const char* cacao = std::getenv("OOT3D_GRAPHICS_CACAO");
-        cacao != nullptr && std::string_view(cacao) == "1") {
-        initial.Effects.AmbientOcclusion = AmbientOcclusionMode::Cacao;
+    if (const char* ao = std::getenv("OOT3D_GRAPHICS_AO");
+        ao != nullptr && std::string_view(ao) == "1") {
+        initial.Effects.AmbientOcclusion = AmbientOcclusionMode::Gtao;
         customized = true;
     }
-    if (const char* cacaoQuality =
-            std::getenv("OOT3D_GRAPHICS_CACAO_QUALITY");
-        cacaoQuality != nullptr) {
-        const std::string_view quality(cacaoQuality);
+    if (const char* aoQuality =
+            std::getenv("OOT3D_GRAPHICS_AO_QUALITY");
+        aoQuality != nullptr) {
+        const std::string_view quality(aoQuality);
         if (quality == "0" || quality == "1") {
             initial.Effects.AoQuality =
                 quality == "1" ? 1U : 0U;
@@ -284,19 +291,18 @@ GraphicsSettingsRuntime::GraphicsSettingsRuntime() {
         }
     }
     if (const char* stress =
-            std::getenv("OOT3D_GRAPHICS_CACAO_STRESS");
+            std::getenv("OOT3D_GRAPHICS_AO_STRESS");
         stress != nullptr && std::string_view(stress) == "1") {
         initial.Effects.AmbientOcclusion =
-            AmbientOcclusionMode::Cacao;
+            AmbientOcclusionMode::Gtao;
         initial.Effects.AoQuality = 1U;
         initial.Effects.AoRadius = 12.0F;
         initial.Effects.AoStrength = 4.0F;
         initial.Effects.AoShadowPower = 4.0F;
         initial.Effects.AoShadowClamp = 0.72F;
-        initial.Effects.AoHorizonAngleThreshold = 0.20F;
+        initial.Effects.AoDetailRadius = 3.0F;
         initial.Effects.AoFadeOutFrom = 0.0F;
         initial.Effects.AoFadeOutTo = 5000.0F;
-        initial.Effects.AoBlurPassCount = 0U;
         initial.Effects.AoSharpness = 0.25F;
         initial.Effects.AoDetailStrength = 2.0F;
         customized = true;
@@ -347,6 +353,16 @@ GraphicsSettingsRuntime::GraphicsSettingsRuntime() {
             customized = true;
         }
     }
+    // Developer inspection of MXAO (MxaoDebugView 1-12); never saved.
+    if (const char* debug = std::getenv("OOT3D_GRAPHICS_MXAO_DEBUG")) {
+        char* end = nullptr;
+        const long parsed = std::strtol(debug, &end, 10);
+        if (end != debug && *end == '\0' && parsed >= 0 &&
+            parsed <= static_cast<long>(MxaoDebugView::FaceDisagreement)) {
+            initial.Effects.MxaoDebug = static_cast<MxaoDebugView>(parsed);
+            customized = true;
+        }
+    }
     if (const char* toon = std::getenv("OOT3D_GRAPHICS_TOON");
         toon != nullptr && std::string_view(toon) == "1") {
         initial.Effects.Toon = ToonMode::PostProcessPreview;
@@ -393,6 +409,27 @@ GraphicsSettingsRuntime::GraphicsSettingsRuntime() {
         initial.Preset = GraphicsPreset::Custom;
         selectedInitial = true;
     }
+    // The host found that the previous launch with these settings ended in
+    // its first minute (TRIAEVUM_SAFE_PRESENTATION carries why): the stored
+    // presentation (resolutions, window mode, anti-aliasing and upscaler) may
+    // be what ends it, so it restarts from the defaults and is stored so,
+    // instead of failing at every launch. Everything else is kept.
+    if (const char* safe = std::getenv("TRIAEVUM_SAFE_PRESENTATION");
+        selectedInitial && safe != nullptr && *safe != '\0') {
+        const GraphicsSettings defaults{};
+        initial.Window = defaults.Window;
+        initial.OutputWidth = defaults.OutputWidth;
+        initial.OutputHeight = defaults.OutputHeight;
+        initial.InternalResolutionScale = defaults.InternalResolutionScale;
+        initial.AntiAliasing = defaults.AntiAliasing;
+        initial.MsaaSamples = defaults.MsaaSamples;
+        initial.Upscaler = defaults.Upscaler;
+        initial.UpscalerMode = defaults.UpscalerMode;
+        rewriteLoadedSettings = true;
+        SPDLOG_WARN("OOT3D graphics: {}; display, resolution, anti-aliasing and upscaler settings were reset "
+                    "to their defaults", safe);
+        std::fprintf(stderr, "TRIAEVUM_SAFE_PRESENTATION reason=\"%s\"\n", safe);
+    }
     if (selectedInitial) {
         mService = GraphicsSettingsService(std::move(initial));
     }
@@ -417,7 +454,47 @@ VersionedGraphicsSettings GraphicsSettingsRuntime::SnapshotForRendering() const 
     std::scoped_lock lock(mMutex);
     VersionedGraphicsSettings result{mService.Current(), mRevision};
     mNativePresentation.Apply(result.Value);
+    if (!UsesFullSceneLighting(result.Value.Effects.SurfaceLighting)) {
+        result.Value.Effects.DirectionalShadows.Mode = DirectionalShadowMode::Off;
+        result.Value.Effects.PointShadows.Mode = PointShadowMode::Off;
+        result.Value.Effects.GlobalIllumination.Mode = GlobalIlluminationMode::Off;
+    }
+    // A GI mode this build or device does not offer (the experimental modes
+    // outside builds that opt in) renders Off, whatever the loaded
+    // configuration asks for; F1 shows the capability's reason.
+    auto& globalIllumination = result.Value.Effects.GlobalIllumination;
+    if ((globalIllumination.Mode == GlobalIlluminationMode::BrixelizerGi &&
+         !mCapabilities.Has(GraphicsCapability::BrixelizerGlobalIllumination)) ||
+        (globalIllumination.Mode == GlobalIlluminationMode::ScreenSpace &&
+         !mCapabilities.Has(GraphicsCapability::ScreenSpaceGlobalIllumination)))
+        globalIllumination.Mode = GlobalIlluminationMode::Off;
+    // Likewise an AO provider that is not available (MXAO without the
+    // separately installed iMMERSE module, CACAO without its SDK) renders Off;
+    // the preference stays saved for when it is.
+    auto& ambientOcclusion = result.Value.Effects.AmbientOcclusion;
+    if ((ambientOcclusion == AmbientOcclusionMode::Mxao && !mCapabilities.Has(GraphicsCapability::ImmerseMxao)) ||
+        (ambientOcclusion == AmbientOcclusionMode::Cacao && !mCapabilities.Has(GraphicsCapability::FidelityFxCacao)))
+        ambientOcclusion = AmbientOcclusionMode::Off;
+    // Inactive directional/ambient edits must not invalidate histories.
+    // Point-light groups remain independently controllable in per-pixel modes.
+    if (!mNativePresentation.Active() && result.Value.Preset != GraphicsPreset::Authentic &&
+        UsesFullSceneLighting(result.Value.Effects.SurfaceLighting)) {
+        if (mSceneEnvironment.Enabled) result.Environment = mSceneEnvironment;
+        else {
+            result.Environment.ScopeIdentity = mSceneEnvironment.ScopeIdentity;
+            result.Environment.PointLights = mSceneEnvironment.PointLights;
+            // Caster policy is independent of the authored light override.
+            result.Environment.CasterFaces = mSceneEnvironment.CasterFaces;
+        }
+    }
+    // Inactive rim edits neither change renderer state nor invalidate histories.
+    if (!result.Environment.Rim.Enabled) result.Environment.Rim = {};
     return result;
+}
+void GraphicsSettingsRuntime::PublishSceneEnvironment(
+    const Renderer3ds::PicaEnvironmentLighting& environment) {
+    std::scoped_lock lock(mMutex);
+    mSceneEnvironment = environment;
 }
 bool GraphicsSettingsRuntime::NativePresentationOverrideActive() const {
     std::scoped_lock lock(mMutex);
@@ -445,9 +522,23 @@ GraphicsSettingsRuntime::PresentationStatus() const {
 }
 GraphicsSettingsValidation GraphicsSettingsRuntime::Apply(GraphicsSettings candidate, bool persist) {
     std::scoped_lock lock(mMutex);
+    return ApplyLocked(std::move(candidate), mCapabilities, persist);
+}
+GraphicsSettingsValidation GraphicsSettingsRuntime::RestorePreferences(GraphicsSettings stored,
+                                                                       bool persist) {
+    std::scoped_lock lock(mMutex);
+    // Structural validation only: every capability counts as present.
+    GraphicsCapabilities unrestricted;
+    for (uint32_t index = 0; index <= static_cast<uint32_t>(kLastGraphicsCapability); ++index) {
+        unrestricted.Set(static_cast<GraphicsCapability>(index), true);
+    }
+    return ApplyLocked(std::move(stored), unrestricted, persist);
+}
+GraphicsSettingsValidation GraphicsSettingsRuntime::ApplyLocked(
+    GraphicsSettings candidate, const GraphicsCapabilities& capabilities, bool persist) {
     const auto previous =
         GetPresentationSettings(mService.Current());
-    auto result = mService.Stage(std::move(candidate), mCapabilities);
+    auto result = mService.Stage(std::move(candidate), capabilities);
     if (mService.ApplyPending()) {
         ++mRevision;
         const auto current =
@@ -479,6 +570,14 @@ void GraphicsSettingsRuntime::PublishSceneExtent(uint32_t width, uint32_t height
     std::scoped_lock lock(mMutex);
     mDisplayMetrics.SceneWidth = width;
     mDisplayMetrics.SceneHeight = height;
+}
+GlobalIlluminationProviderStatus GraphicsSettingsRuntime::GlobalIlluminationStatus() const {
+    std::scoped_lock lock(mMutex);
+    return mGlobalIlluminationStatus;
+}
+void GraphicsSettingsRuntime::PublishGlobalIlluminationStatus(GlobalIlluminationProviderStatus status) {
+    std::scoped_lock lock(mMutex);
+    mGlobalIlluminationStatus = std::move(status);
 }
 GraphicsSettingsSaveState GraphicsSettingsRuntime::SaveState() const {
     std::scoped_lock lock(mMutex);
@@ -616,5 +715,82 @@ bool GraphicsSettingsRuntime::PersistCurrentLocked() {
                      exception.what());
         return false;
     }
+}
+std::vector<std::string> GraphicsSettingsRuntime::UserPresetNames() const {
+    std::scoped_lock lock(mMutex);
+    std::vector<std::string> names;
+    for (const auto& preset : mUserPresets.Presets()) names.push_back(preset.Name);
+    return names;
+}
+bool GraphicsSettingsRuntime::HasUserPreset(std::string_view name) const {
+    std::scoped_lock lock(mMutex);
+    return mUserPresets.Find(name) != nullptr;
+}
+std::string GraphicsSettingsRuntime::ActiveUserPreset() const {
+    std::scoped_lock lock(mMutex);
+    if (mActiveUserPresetRevision != mRevision || mActiveUserPresetGeneration != mUserPresetGeneration) {
+        const auto* match = mUserPresets.Match(mService.Current());
+        mActiveUserPreset = match != nullptr ? match->Name : std::string{};
+        mActiveUserPresetRevision = mRevision;
+        mActiveUserPresetGeneration = mUserPresetGeneration;
+    }
+    return mActiveUserPreset;
+}
+std::string GraphicsSettingsRuntime::UserPresetsReadOnlyReason() const {
+    std::scoped_lock lock(mMutex);
+    return mUserPresets.ReadOnlyReason();
+}
+GraphicsPresetChange GraphicsSettingsRuntime::SaveUserPreset(std::string_view name) {
+    std::scoped_lock lock(mMutex);
+    if (!mUserPresets.ReadOnlyReason().empty()) return {false, mUserPresets.ReadOnlyReason()};
+    if (const auto error = GraphicsPresetLibrary::ValidateName(name); error != GraphicsPresetNameError::None)
+        return {false, GraphicsPresetLibrary::DescribeNameError(error)};
+    auto previous = mUserPresets;
+    const bool replaced = mUserPresets.Find(name) != nullptr;
+    mUserPresets.Save(name, mService.Current());
+    ++mUserPresetGeneration;
+    const auto stored = GraphicsPresetLibrary::NormalizeName(name);
+    return PersistUserPresetsLocked(std::move(previous),
+                                    (replaced ? "Replaced preset \"" : "Saved preset \"") + stored + "\"");
+}
+GraphicsPresetChange GraphicsSettingsRuntime::LoadUserPreset(std::string_view name) {
+    std::scoped_lock lock(mMutex);
+    const auto* preset = mUserPresets.Find(name);
+    if (preset == nullptr) return {false, "No user preset is named \"" + std::string(name) + "\""};
+    auto candidate = GraphicsSettingsService::KeepHostOwnedSettings(preset->Settings, mService.Current());
+    candidate.Preset = GraphicsPreset::Custom;
+    const auto loadedName = preset->Name;
+    const auto validation = ApplyLocked(std::move(candidate), mCapabilities, true);
+    GraphicsPresetChange change{validation.Accepted(),
+                                (validation.Accepted() ? "Loaded preset \"" : "Rejected preset \"") + loadedName + "\""};
+    for (const auto& issue : validation.Issues) change.Message += "\n" + issue.Field + ": " + issue.Message;
+    return change;
+}
+GraphicsPresetChange GraphicsSettingsRuntime::DeleteUserPreset(std::string_view name) {
+    std::scoped_lock lock(mMutex);
+    if (!mUserPresets.ReadOnlyReason().empty()) return {false, mUserPresets.ReadOnlyReason()};
+    const auto* preset = mUserPresets.Find(name);
+    if (preset == nullptr) return {false, "No user preset is named \"" + std::string(name) + "\""};
+    const auto deletedName = preset->Name;
+    auto previous = mUserPresets;
+    mUserPresets.Remove(name);
+    ++mUserPresetGeneration;
+    return PersistUserPresetsLocked(std::move(previous), "Deleted preset \"" + deletedName + "\"");
+}
+GraphicsPresetChange GraphicsSettingsRuntime::PersistUserPresetsLocked(
+    GraphicsPresetLibrary previous, std::string done) {
+    if (mPersistenceSuppressed || mPersistence == nullptr)
+        return {true, done + " for this session only (settings are not being saved)."};
+    std::string failure;
+    try {
+        if (mPersistence->StoreGraphicsPresets(mUserPresets.Serialize())) return {true, done + "."};
+        failure = "the configuration file could not be written";
+    } catch (const std::exception& exception) {
+        failure = exception.what();
+    }
+    SPDLOG_ERROR("Unable to persist OOT3D graphics presets: {}", failure);
+    mUserPresets = std::move(previous);
+    ++mUserPresetGeneration;
+    return {false, "Not saved: " + failure + ". The presets are unchanged."};
 }
 } // namespace Fast::Oot3d

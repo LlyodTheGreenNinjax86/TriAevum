@@ -56,17 +56,6 @@ add_subdirectory("legacy_compat")
 
 add_subdirectory("ship")
 
-#=================== OOT3D Native ===================
-
-file(GLOB Source_Files__Oot3d CONFIGURE_DEPENDS RELATIVE
-    ${CMAKE_CURRENT_SOURCE_DIR} "oot3d/*.cpp")
-foreach(OOT3D_NATIVE_ASSET_SOURCE IN LISTS
-        OOT3D_NATIVE_ASSET_RUNTIME_SOURCE_NAMES)
-    list(REMOVE_ITEM Source_Files__Oot3d
-        "oot3d/${OOT3D_NATIVE_ASSET_SOURCE}")
-endforeach()
-source_group("oot3d" FILES ${Source_Files__Oot3d})
-target_sources(three_ds_recomp_runtime PRIVATE ${Source_Files__Oot3d})
 
 if (CMAKE_SYSTEM_NAME STREQUAL "Darwin" OR CMAKE_SYSTEM_NAME STREQUAL "iOS")
     set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/ship/utils/AppleFolderManager.mm PROPERTIES COMPILE_FLAGS -fno-objc-arc)
@@ -81,6 +70,8 @@ endif()
 target_include_directories(three_ds_recomp_runtime
     PRIVATE ${CMAKE_CURRENT_BINARY_DIR}
     PUBLIC ${CMAKE_CURRENT_SOURCE_DIR} ${INCLUDE_DIR} ${ADDITIONAL_LIB_INCLUDES}
+    # The interface of the separately licensed iMMERSE module (MIT).
+    ${CMAKE_CURRENT_SOURCE_DIR}/../module_interface
 )
 
 #=================== Linking ===================
@@ -119,9 +110,6 @@ target_link_libraries(three_ds_recomp_runtime PRIVATE ZLIB::ZLIB)
 
 find_package(nlohmann_json REQUIRED)
 target_link_libraries(three_ds_recomp_runtime PUBLIC nlohmann_json::nlohmann_json)
-target_link_libraries(oot3d_native_asset_runtime PUBLIC
-    nlohmann_json::nlohmann_json)
-target_link_libraries(three_ds_recomp_runtime PRIVATE oot3d_native_asset_runtime)
 
 find_package(tinyxml2 REQUIRED)
 target_link_libraries(three_ds_recomp_runtime PUBLIC tinyxml2::tinyxml2)
@@ -177,25 +165,62 @@ target_link_libraries(three_ds_recomp_runtime PUBLIC prism monocypher)
 
 if(THREE_DS_RECOMP_ENABLE_VULKAN)
     target_sources(three_ds_recomp_runtime PRIVATE fast/renderer/shaderc_compiler.cpp)
+    # Screen-space diffuse GI: the title-neutral module and runtime pass
+    # (docs/TRIAEVUM_SCREEN_SPACE_GI.md) behind the OOT3D provider
+    # (fast/oot3d/screen_space_gi_provider.cpp).
+    target_sources(three_ds_recomp_runtime PRIVATE
+        fast/renderer/diffuse_gi_reference.cpp
+        fast/renderer/diffuse_gi_gather.cpp
+        fast/renderer/diffuse_gi_gather_shader.cpp
+        fast/renderer/diffuse_gi_hierarchy.cpp
+        fast/renderer/diffuse_gi_guiding.cpp
+        fast/renderer/diffuse_gi_noise.cpp
+        fast/renderer/diffuse_gi_m4_shader.cpp
+        fast/renderer/diffuse_gi_temporal.cpp
+        fast/renderer/diffuse_gi_temporal_shader.cpp
+        fast/renderer/diffuse_gi_pass_shader.cpp
+        fast/renderer/diffuse_gi_pass_plan.cpp
+        fast/renderer/diffuse_gi_pass.cpp)
+    # Precompiled SPIR-V families, embedded from their packs.
+    include(${CMAKE_CURRENT_SOURCE_DIR}/../cmake/spirv_pack.cmake)
+    foreach(_pack renderer/builtin_pass renderer3ds/pica_native_fragment oot3d/pica_temporal_fragment
+                  oot3d/pica_toon_fragment oot3d/pica_uber_fragment oot3d/pica_caster_fragment)
+        triaevum_add_spirv_pack(three_ds_recomp_runtime fast/${_pack}_binaries.cpp fast/${_pack}.spvpack)
+    endforeach()
     target_link_libraries(three_ds_recomp_runtime PRIVATE ${CMAKE_DL_LIBS})
     target_link_libraries(three_ds_recomp_runtime PUBLIC Vulkan::Vulkan PRIVATE three_ds_recomp_shaderc)
     if(THREE_DS_RECOMP_ENABLE_NRI)
         target_link_libraries(three_ds_recomp_runtime PRIVATE NRI)
-        if(THREE_DS_RECOMP_NGX_INCLUDE_DIR)
-            target_include_directories(three_ds_recomp_runtime PRIVATE
-                "${THREE_DS_RECOMP_NGX_INCLUDE_DIR}")
-            target_compile_definitions(three_ds_recomp_runtime PRIVATE
-                ENABLE_OOT3D_NGX
-                OOT3D_NGX_RUNTIME_VERSION="${THREE_DS_RECOMP_NGX_VERSION}")
-        endif()
-    endif()
-    if(THREE_DS_RECOMP_ENABLE_CACAO)
-        target_link_libraries(three_ds_recomp_runtime PRIVATE oot3d_cacao)
     endif()
     if(THREE_DS_RECOMP_ENABLE_SSSR)
         target_link_libraries(three_ds_recomp_runtime PRIVATE
             oot3d_ffx_sssr
             oot3d_ffx_sssr_backend_vk)
+    endif()
+    if(THREE_DS_RECOMP_ENABLE_BRIXELIZER_GI)
+        target_link_libraries(three_ds_recomp_runtime PRIVATE
+            oot3d_ffx_brixelizergi)
+        target_compile_definitions(three_ds_recomp_runtime PRIVATE
+            ENABLE_OOT3D_BRIXELIZER_GI)
+    endif()
+    if(THREE_DS_RECOMP_OFFER_EXPERIMENTAL_GI)
+        target_compile_definitions(three_ds_recomp_runtime PRIVATE
+            TRIAEVUM_OFFER_EXPERIMENTAL_GI)
+    endif()
+    if(TARGET oot3d_cacao)
+        target_link_libraries(three_ds_recomp_runtime PRIVATE oot3d_cacao)
+        target_compile_definitions(three_ds_recomp_runtime PRIVATE ENABLE_OOT3D_CACAO)
+    endif()
+    # The iMMERSE module is under its own licence (fast/immerse/LICENSE.md):
+    # a separate shared library the runtime loads when it is installed.
+    if(THREE_DS_RECOMP_ENABLE_IMMERSE)
+        include(${CMAKE_CURRENT_SOURCE_DIR}/fast/immerse/immerse.cmake)
+    endif()
+    # The DLSS module links NVIDIA's NGX SDK under NVIDIA's licence
+    # (fast/dlss/LICENSE.md): a separate shared library the runtime loads when
+    # it is installed. The runtime links nothing of NGX.
+    if(THREE_DS_RECOMP_ENABLE_DLSS_MODULE)
+        include(${CMAKE_CURRENT_SOURCE_DIR}/fast/dlss/dlss.cmake)
     endif()
     if(THREE_DS_RECOMP_ENABLE_D3D12_NGX_PROVIDER)
         target_link_libraries(three_ds_recomp_runtime PRIVATE d3d12 dxgi)
@@ -219,7 +244,6 @@ target_compile_definitions(three_ds_recomp_runtime PRIVATE
     $<$<BOOL:${THREE_DS_RECOMP_ENABLE_NRI}>:ENABLE_OOT3D_NRI>
     $<$<BOOL:${THREE_DS_RECOMP_ENABLE_VULKAN}>:ENABLE_RENDERER3DS_VULKAN>
     $<$<BOOL:${THREE_DS_RECOMP_ENABLE_NRI}>:ENABLE_RENDERER3DS_NRI>
-    $<$<BOOL:${THREE_DS_RECOMP_ENABLE_CACAO}>:ENABLE_OOT3D_CACAO>
     $<$<BOOL:${THREE_DS_RECOMP_ENABLE_D3D12_NGX_PROVIDER}>:ENABLE_OOT3D_D3D12_NGX_PROVIDER>
 )
 

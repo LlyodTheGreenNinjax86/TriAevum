@@ -1,10 +1,15 @@
 #include "fast/oot3d/nri_interop_context.h"
 #include "fast/oot3d/nri_stage_scope.h"
+#include "fast/oot3d/nri_upscaler_instances.h"
 
 #ifdef ENABLE_OOT3D_VULKAN
+#include "fast/renderer3ds/vulkan_image_contract.h"
 
 #include <algorithm>
+#include <array>
+#include <chrono>
 #include <cstdio>
+#include <tuple>
 #include <unordered_map>
 #include <vector>
 
@@ -18,6 +23,18 @@
 #include <Extensions/NRIUpscaler.h>
 #include <Extensions/NRIWrapperVK.h>
 #include "nri_interop_internal.h"
+#include "fast/oot3d/dlss_module_loader.h"
+#include "fast/renderer3ds/pica_vulkan_device_profile.h"
+#if defined(_WIN32)
+// Only the loader is needed here; GDI's ERROR macro would hide nri::Message::ERROR.
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef NOGDI
+#define NOGDI
+#endif
+#include <windows.h>
+#endif
 #endif
 
 namespace Fast::Oot3d {
@@ -25,30 +42,28 @@ namespace Fast::Oot3d {
 struct NriInteropContext::Impl {
     std::string Reason = "NRI support was not compiled into this build";
     RendererValidationTelemetry* ValidationTelemetry = nullptr;
+    VkDevice VulkanDevice = VK_NULL_HANDLE;
+    std::function<bool()> RecordedWorkBoundary;
 #ifdef ENABLE_OOT3D_NRI
     nri::Device* Device = nullptr;
     nri::CoreInterface Core{};
     nri::WrapperVKInterface Wrapper{};
     nri::UpscalerInterface UpscalerInterface{};
     nri::Upscaler* Nis = nullptr;
-    nri::Upscaler* Fsr = nullptr;
-    nri::Upscaler* Dlss = nullptr;
     uint32_t NisWidth = 0;
     uint32_t NisHeight = 0;
     UpscalerQuality NisQuality = UpscalerQuality::Quality;
     bool NisInputSrgb = true;
     std::string NisReason = "NRI NIS support is unavailable";
-    uint32_t FsrWidth = 0;
-    uint32_t FsrHeight = 0;
-    UpscalerQuality FsrQuality = UpscalerQuality::Quality;
-    bool FsrInputSrgb = true;
+    UpscalerInstances<nri::Upscaler*> Fsr;
     std::string FsrReason = "NRI FSR support is unavailable";
-    uint32_t DlssWidth = 0;
-    uint32_t DlssHeight = 0;
-    UpscalerQuality DlssQuality = UpscalerQuality::Quality;
-    bool DlssInputSrgb = true;
-    std::string DlssReason = "NRI DLSS support is unavailable";
+    // DLSS is the DLSS module's (triaevum/dlss_module.h), on this device.
+    const TriaevumDlssModule* DlssModule = nullptr;
+    TriaevumDlssDevice* DlssDevice = nullptr;
+    UpscalerInstances<TriaevumDlssFeature*> Dlss;
+    std::string DlssReason = "the DLSS module is unavailable";
     bool DynamicRendering = false;
+    nri::PipelineCache* LentPipelineCache = nullptr;
     std::unordered_map<uint32_t, nri::CommandBuffer*> CommandBuffers;
     struct WrappedTexture {
         nri::Texture* Texture = nullptr;
@@ -59,8 +74,10 @@ struct NriInteropContext::Impl {
         nri::Descriptor* DepthAttachment = nullptr;
         std::vector<nri::Descriptor*> ExtraViews;
         bool Owned = false;
+        uint64_t Generation = 0;
     };
     std::unordered_map<VkImage, WrappedTexture> Textures;
+    uint64_t NextTextureGeneration = 1U;
     std::unordered_map<VkBuffer, nri::Buffer*> Buffers;
 
     nri::Descriptor* GetUpscalerView(VkImage image, bool storage) {
@@ -80,6 +97,63 @@ struct NriInteropContext::Impl {
             nri::Result::SUCCESS)
             descriptor = nullptr;
         return descriptor;
+    }
+
+    auto FsrDestroyer() {
+        return [this](nri::Upscaler* upscaler) {
+            if (UpscalerInterface.DestroyUpscaler != nullptr)
+                UpscalerInterface.DestroyUpscaler(upscaler);
+        };
+    }
+    auto DlssDestroyer() {
+        return [this](TriaevumDlssFeature* feature) {
+            if (DlssModule != nullptr) DlssModule->DestroyFeature(feature);
+        };
+    }
+
+    // NRI loads FidelityFX's Vulkan runtime only when it creates FSR, by
+    // name from the default search path: FSR is offered only when that load
+    // can succeed, so choosing it never fails mid-frame.
+    static std::string FidelityFxRuntimeReason() {
+#if defined(_WIN32)
+        // Quietly: an older Vulkan loader lacks commands the runtime imports,
+        // and that load failure must withdraw FSR, not show a system dialog.
+        DWORD previousMode = 0;
+        SetThreadErrorMode(SEM_FAILCRITICALERRORS | SEM_NOOPENFILEERRORBOX, &previousMode);
+        HMODULE library = LoadLibraryA("amd_fidelityfx_vk.dll");
+        const DWORD error = library == nullptr ? GetLastError() : 0U;
+        SetThreadErrorMode(previousMode, nullptr);
+        if (library == nullptr)
+            return error == ERROR_PROC_NOT_FOUND
+                ? "FSR's FidelityFX runtime needs a newer Vulkan loader (update the graphics driver)"
+                : "FSR needs amd_fidelityfx_vk.dll beside TriAevum";
+        FreeLibrary(library);
+        return {};
+#else
+        return "FSR's FidelityFX runtime is available on Windows only";
+#endif
+    }
+
+    // DLSS through the DLSS module on this device: offered on NVIDIA GPUs
+    // when the module is installed and NGX confirms DLSS Super Resolution.
+    void InitializeDlss(VkInstance instance, VkPhysicalDevice physicalDevice, VkDevice device) {
+        DlssModule = Oot3d::DlssModule();
+        if (DlssModule == nullptr) {
+            DlssReason = DlssModuleUnavailableReason();
+            return;
+        }
+        VkPhysicalDeviceProperties properties{};
+        vkGetPhysicalDeviceProperties(physicalDevice, &properties);
+        constexpr uint32_t kNvidiaVendor = 0x10DEU;
+        if (properties.vendorID != kNvidiaVendor) {
+            DlssReason = "DLSS needs an NVIDIA GPU";
+            return;
+        }
+        const TriaevumDlssDeviceDesc desc{instance, physicalDevice, device,
+                                          vkGetInstanceProcAddr, vkGetDeviceProcAddr};
+        std::array<char, 256> reason{};
+        DlssDevice = DlssModule->CreateDevice(&desc, reason.data(), reason.size());
+        DlssReason = DlssDevice != nullptr ? std::string{} : std::string(reason.data());
     }
 
     nri::UpscalerResource GetUpscalerResource(
@@ -413,6 +487,15 @@ void NriInteropAccess::DestroyPipelineWrapper(
         context.mImpl->Core.DestroyPipeline(pipeline);
 }
 
+nri::PipelineCache* NriInteropAccess::PipelineCache(NriInteropContext& context) {
+    return context.mImpl->LentPipelineCache;
+}
+
+void NriInteropAccess::LendPipelineCache(NriInteropContext& context,
+                                         nri::PipelineCache* cache) {
+    context.mImpl->LentPipelineCache = cache;
+}
+
 bool NriInteropAccess::CmdSetPipeline(
     NriInteropContext& context, uint32_t frameIndex,
     nri::Pipeline* pipeline) {
@@ -465,6 +548,7 @@ bool NriInteropContext::Initialize(VkInstance instance, VkPhysicalDevice physica
     }
     desc.vkInstance = instance;
     desc.vkPhysicalDevice = physicalDevice;
+    mImpl->VulkanDevice = device;
     desc.vkDevice = device;
     desc.queueFamilies = &queueFamily;
     desc.queueFamilyNum = 1;
@@ -477,9 +561,9 @@ bool NriInteropContext::Initialize(VkInstance instance, VkPhysicalDevice physica
             VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME);
     desc.vkExtensions.deviceExtensions = deviceExtensions.data();
     if (graphicsPipelineLibrariesEnabled) {
-        deviceExtensions.push_back(VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME);
-        deviceExtensions.push_back(VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME);
-        deviceExtensions.push_back(VK_EXT_EXTENDED_DYNAMIC_STATE_EXTENSION_NAME);
+        deviceExtensions.insert(deviceExtensions.end(),
+                                Renderer3ds::kPicaPipelineLibraryExtensions.begin(),
+                                Renderer3ds::kPicaPipelineLibraryExtensions.end());
         desc.vkExtensions.deviceExtensions = deviceExtensions.data();
     }
     desc.vkExtensions.deviceExtensionNum =
@@ -523,16 +607,13 @@ bool NriInteropContext::Initialize(VkInstance instance, VkPhysicalDevice physica
         if (mImpl->UpscalerInterface.IsUpscalerSupported(
                 *mImpl->Device, nri::UpscalerType::FSR) &&
             fsrDeviceFeaturesEnabled)
-            mImpl->FsrReason.clear();
-        if (mImpl->UpscalerInterface.IsUpscalerSupported(
-                *mImpl->Device, nri::UpscalerType::DLSR))
-            mImpl->DlssReason.clear();
+            mImpl->FsrReason = Impl::FidelityFxRuntimeReason();
     } else {
         mImpl->UpscalerInterface = {};
         mImpl->NisReason = "NRI was built without a Vulkan NIS provider";
         mImpl->FsrReason = "NRI was built without a Vulkan FSR provider";
-        mImpl->DlssReason = "NRI was built without a Vulkan DLSS provider";
     }
+    mImpl->InitializeDlss(instance, physicalDevice, device);
     mImpl->Reason.clear();
     return true;
 #else
@@ -554,14 +635,12 @@ void NriInteropContext::Shutdown() {
             mImpl->UpscalerInterface.DestroyUpscaler(mImpl->Nis);
         }
         mImpl->Nis = nullptr;
-        if (mImpl->Fsr != nullptr &&
-            mImpl->UpscalerInterface.DestroyUpscaler != nullptr)
-            mImpl->UpscalerInterface.DestroyUpscaler(mImpl->Fsr);
-        mImpl->Fsr = nullptr;
-        if (mImpl->Dlss != nullptr &&
-            mImpl->UpscalerInterface.DestroyUpscaler != nullptr)
-            mImpl->UpscalerInterface.DestroyUpscaler(mImpl->Dlss);
-        mImpl->Dlss = nullptr;
+        mImpl->Fsr.Clear(mImpl->FsrDestroyer());
+        mImpl->Dlss.Clear(mImpl->DlssDestroyer());
+        if (mImpl->DlssDevice != nullptr)
+            mImpl->DlssModule->DestroyDevice(mImpl->DlssDevice);
+        mImpl->DlssDevice = nullptr;
+        mImpl->DlssReason = "the DLSS module is unavailable";
         for (auto& [_, texture] : mImpl->Textures) {
             for (nri::Descriptor* view : texture.ExtraViews)
                 mImpl->Core.DestroyDescriptor(view);
@@ -582,6 +661,7 @@ void NriInteropContext::Shutdown() {
         mImpl->Textures.clear();
         mImpl->Buffers.clear();
         mImpl->CommandBuffers.clear();
+        mImpl->LentPipelineCache = nullptr;
         nriDestroyDevice(mImpl->Device);
         mImpl->Device = nullptr;
         mImpl->Core = {};
@@ -590,12 +670,6 @@ void NriInteropContext::Shutdown() {
         mImpl->NisWidth = 0;
         mImpl->NisHeight = 0;
         mImpl->NisInputSrgb = true;
-        mImpl->FsrWidth = 0;
-        mImpl->FsrHeight = 0;
-        mImpl->FsrInputSrgb = true;
-        mImpl->DlssWidth = 0;
-        mImpl->DlssHeight = 0;
-        mImpl->DlssInputSrgb = true;
     }
 #endif
 }
@@ -649,6 +723,7 @@ bool NriInteropContext::WrapTexture(VkImage image, VkFormat format, VkImageType 
     Impl::WrappedTexture record;
     record.Texture = wrapped;
     record.Format = nriFormat;
+    record.Generation = mImpl->NextTextureGeneration++;
     mImpl->Textures.emplace(image, record);
     return true;
 #else
@@ -668,6 +743,9 @@ bool NriInteropContext::WrapBuffer(
     nri::BufferVKDesc desc{};
     desc.vkBuffer = reinterpret_cast<uint64_t>(buffer);
     desc.size = size;
+    // Four-byte structure support permits typed, raw and explicit-stride
+    // structured views of imported arenas without changing their Vulkan usage.
+    desc.structureStride = 4;
     desc.mappedMemory = mappedMemory;
     nri::Buffer* wrapped = nullptr;
     if (mImpl->Wrapper.CreateBufferVK(
@@ -711,6 +789,15 @@ bool NriInteropContext::CreateOwnedTexture2D(
         (desc.Width != desc.Height || desc.Layers != 6U ||
          desc.Samples != VK_SAMPLE_COUNT_1_BIT))
         return false;
+    const auto physical = reinterpret_cast<VkPhysicalDevice>(
+        mImpl->Wrapper.GetPhysicalDeviceVK(*mImpl->Device));
+    if (!Renderer3ds::VulkanImage2DSupported(physical, desc.Format, desc.Usage,
+            desc.Width, desc.Height, desc.MipLevels, desc.Layers, desc.Samples, desc.CubeSampledView)) {
+        std::fprintf(stderr, "TRIAEVUM_VULKAN_IMAGE_UNSUPPORTED format=%u usage=%u width=%u height=%u mips=%u layers=%u samples=%u\n",
+            unsigned(desc.Format), unsigned(desc.Usage), desc.Width, desc.Height,
+            desc.MipLevels, desc.Layers, unsigned(desc.Samples));
+        return false;
+    }
     const nri::Format nriFormat =
         nri::nriConvertVKFormatToNRI(desc.Format);
     if (nriFormat == nri::Format::UNKNOWN) return false;
@@ -854,6 +941,7 @@ bool NriInteropContext::CreateOwnedTexture2D(
         output = {};
         return false;
     }
+    record.Generation = mImpl->NextTextureGeneration++;
     mImpl->Textures.emplace(output.Image, record);
     return true;
 #else
@@ -869,6 +957,16 @@ bool NriInteropContext::OwnsTexture(VkImage image) const {
 #else
     (void)image;
     return false;
+#endif
+}
+
+uint64_t NriInteropContext::TextureGeneration(VkImage image) const {
+#ifdef ENABLE_OOT3D_NRI
+    const auto found = mImpl->Textures.find(image);
+    return found != mImpl->Textures.end() ? found->second.Generation : 0U;
+#else
+    (void)image;
+    return 0U;
 #endif
 }
 
@@ -1050,8 +1148,7 @@ bool NriInteropContext::DispatchFsr(
         !IsKnownSceneColorEncoding(desc.InputEncoding))
         return false;
     const bool inputSrgb = SceneColorIsSrgb(desc.InputEncoding);
-    const auto command = mImpl->CommandBuffers.find(desc.FrameIndex);
-    if (command == mImpl->CommandBuffers.end()) return false;
+    if (!mImpl->CommandBuffers.contains(desc.FrameIndex)) return false;
     const auto wrapSampled = [&](VkImage image, VkFormat format,
                                  uint32_t width, uint32_t height) {
         return WrapTexture(image, format, VK_IMAGE_TYPE_2D,
@@ -1070,13 +1167,13 @@ bool NriInteropContext::DispatchFsr(
                      desc.OutputWidth, desc.OutputHeight))
         return false;
 
-    if (mImpl->Fsr == nullptr || mImpl->FsrWidth != desc.OutputWidth ||
-        mImpl->FsrHeight != desc.OutputHeight ||
-        mImpl->FsrQuality != desc.Quality ||
-        mImpl->FsrInputSrgb != inputSrgb) {
-        if (mImpl->Fsr != nullptr)
-            mImpl->UpscalerInterface.DestroyUpscaler(mImpl->Fsr);
-        mImpl->Fsr = nullptr;
+    const NriDlssFeatureKey key{desc.OutputWidth, desc.OutputHeight,
+                                desc.Quality, inputSrgb, 0U};
+    nri::Upscaler* fsr = mImpl->Fsr.Find(key);
+    if (fsr == nullptr) {
+        const auto started = std::chrono::steady_clock::now();
+        if (!mImpl->Fsr.MakeRoom(key, [this] { return CompleteRecordedWork(); }, mImpl->FsrDestroyer()))
+            return false;
         nri::UpscalerDesc upscaler{};
         upscaler.upscaleResolution = {
             static_cast<nri::Dim_t>(desc.OutputWidth),
@@ -1087,19 +1184,21 @@ bool NriInteropContext::DispatchFsr(
             (inputSrgb ? nri::UpscalerBits::SRGB
                        : nri::UpscalerBits::HDR) |
             nri::UpscalerBits::USE_REACTIVE |
-            nri::UpscalerBits::DEPTH_LINEAR |
-            nri::UpscalerBits::MV_JITTERED;
+            nri::UpscalerBits::DEPTH_LINEAR; // motion without jitter (upscaler_guides.h)
         if (mImpl->UpscalerInterface.CreateUpscaler(
-                *mImpl->Device, upscaler, mImpl->Fsr) !=
+                *mImpl->Device, upscaler, fsr) !=
             nri::Result::SUCCESS) {
             mImpl->FsrReason =
                 "NRI failed to create FSR (amd_fidelityfx_vk.dll missing or incompatible)";
             return false;
         }
-        mImpl->FsrWidth = desc.OutputWidth;
-        mImpl->FsrHeight = desc.OutputHeight;
-        mImpl->FsrQuality = desc.Quality;
-        mImpl->FsrInputSrgb = inputSrgb;
+        mImpl->Fsr.Add(key, fsr);
+        std::fprintf(stderr,
+            "TRIAEVUM_FSR_INSTANCE_CREATED output=%ux%u quality=%u srgb=%d live=%zu ms=%.1f\n",
+            key.OutputWidth, key.OutputHeight, static_cast<unsigned>(key.Quality),
+            key.InputSrgb ? 1 : 0, mImpl->Fsr.Size(),
+            std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - started).count());
     }
 
     nri::DispatchUpscaleDesc dispatch{};
@@ -1134,11 +1233,14 @@ bool NriInteropContext::DispatchFsr(
     dispatch.mvScale = {
         static_cast<float>(desc.InputWidth),
         static_cast<float>(desc.InputHeight)};
-    dispatch.flags = desc.ResetHistory
+    const bool resumed = mImpl->Fsr.Resumes(fsr);
+    dispatch.flags = desc.ResetHistory || resumed
         ? nri::DispatchUpscaleBits::RESET_HISTORY
         : nri::DispatchUpscaleBits::NONE;
+    const auto command = mImpl->CommandBuffers.find(desc.FrameIndex);
+    if (command == mImpl->CommandBuffers.end()) return false;
     mImpl->UpscalerInterface.CmdDispatchUpscale(
-        *command->second, *mImpl->Fsr, dispatch);
+        *command->second, *fsr, dispatch);
     return true;
 #else
     (void)desc;
@@ -1148,8 +1250,7 @@ bool NriInteropContext::DispatchFsr(
 
 bool NriInteropContext::DlssAvailable() const {
 #ifdef ENABLE_OOT3D_NRI
-    return Available() && mImpl->UpscalerInterface.CreateUpscaler != nullptr &&
-           mImpl->DlssReason.empty();
+    return Available() && mImpl->DlssDevice != nullptr && mImpl->DlssReason.empty();
 #else
     return false;
 #endif
@@ -1163,6 +1264,82 @@ const std::string& NriInteropContext::DlssUnavailableReason() const {
 #endif
 }
 
+bool NriInteropContext::EnsureDlssFeature(uint32_t frameIndex,
+                                          const NriDlssFeatureKey& key) {
+#ifdef ENABLE_OOT3D_NRI
+    if (mImpl->Dlss.Find(key) != nullptr) return true;
+    if (!mImpl->CommandBuffers.contains(frameIndex)) return false;
+    if (mImpl->DlssDevice == nullptr) return false;
+    const auto started = std::chrono::steady_clock::now();
+    if (!mImpl->Dlss.MakeRoom(key, [this] { return CompleteRecordedWork(); }, mImpl->DlssDestroyer()))
+        return false;
+    // Completing a prefix replaces the NRI command wrapper and invalidates
+    // iterators into CommandBuffers. Acquire it only after retirement.
+    const auto command = mImpl->CommandBuffers.find(frameIndex);
+    if (command == mImpl->CommandBuffers.end()) return false;
+    // The mode in NRI's UpscalerMode order (TriaevumDlssMode); motion without
+    // jitter at render resolution (upscaler_guides.h).
+    const TriaevumDlssFeatureDesc feature{
+        key.OutputWidth, key.OutputHeight,
+        static_cast<uint32_t>(ToNriUpscalerMode(key.Quality)), key.Preset,
+        key.InputSrgb ? 0U : static_cast<uint32_t>(TRIAEVUM_DLSS_FLAG_HDR)};
+    // NGX records feature-creation commands into the already-open frame
+    // command buffer, avoiding an out-of-band queue submission.
+    const auto commandBuffer = static_cast<VkCommandBuffer>(
+        mImpl->Core.GetCommandBufferNativeObject(command->second));
+    std::array<char, 256> reason{};
+    TriaevumDlssFeature* created = mImpl->DlssModule->CreateFeature(
+        mImpl->DlssDevice, commandBuffer, &feature, reason.data(), reason.size());
+    if (created == nullptr) {
+        // DLSS is withdrawn for the session: the next frame plans without it.
+        mImpl->DlssReason = reason.data();
+        return false;
+    }
+    mImpl->Dlss.Add(key, created);
+    std::fprintf(stderr,
+        "TRIAEVUM_DLSS_FEATURE_CREATED output=%ux%u quality=%u srgb=%d preset=%u "
+        "live=%zu ms=%.1f\n",
+        key.OutputWidth, key.OutputHeight, static_cast<unsigned>(key.Quality),
+        key.InputSrgb ? 1 : 0, static_cast<unsigned>(key.Preset), mImpl->Dlss.Size(),
+        std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - started).count());
+    return true;
+#else
+    (void)frameIndex;
+    (void)key;
+    return false;
+#endif
+}
+
+bool NriInteropContext::PrepareDlss(uint32_t frameIndex,
+                                    const NriDlssFeatureKey& key) {
+#ifdef ENABLE_OOT3D_NRI
+    if (!DlssAvailable() || key.OutputWidth == 0U || key.OutputHeight == 0U)
+        return false;
+    return EnsureDlssFeature(frameIndex, key);
+#else
+    (void)frameIndex;
+    (void)key;
+    return false;
+#endif
+}
+
+std::vector<NriDlssFeatureKey> NriInteropContext::DlssFeatures() const {
+#ifdef ENABLE_OOT3D_NRI
+    return mImpl->Dlss.Keys();
+#else
+    return {};
+#endif
+}
+
+uint64_t NriInteropContext::DlssFeatureGeneration() const {
+#ifdef ENABLE_OOT3D_NRI
+    return mImpl->Dlss.Generation();
+#else
+    return 0U;
+#endif
+}
+
 bool NriInteropContext::DispatchDlss(
     const NriTemporalUpscaleDispatchDesc& desc) {
 #ifdef ENABLE_OOT3D_NRI
@@ -1171,8 +1348,7 @@ bool NriInteropContext::DispatchDlss(
         !IsKnownSceneColorEncoding(desc.InputEncoding))
         return false;
     const bool inputSrgb = SceneColorIsSrgb(desc.InputEncoding);
-    const auto command = mImpl->CommandBuffers.find(desc.FrameIndex);
-    if (command == mImpl->CommandBuffers.end()) return false;
+    if (!mImpl->CommandBuffers.contains(desc.FrameIndex)) return false;
     const auto wrapSampled = [&](VkImage image, VkFormat format,
                                  uint32_t width, uint32_t height) {
         return WrapTexture(image, format, VK_IMAGE_TYPE_2D,
@@ -1191,70 +1367,53 @@ bool NriInteropContext::DispatchDlss(
                      desc.OutputWidth, desc.OutputHeight))
         return false;
 
-    if (mImpl->Dlss == nullptr || mImpl->DlssWidth != desc.OutputWidth ||
-        mImpl->DlssHeight != desc.OutputHeight ||
-        mImpl->DlssQuality != desc.Quality ||
-        mImpl->DlssInputSrgb != inputSrgb) {
-        if (mImpl->Dlss != nullptr)
-            mImpl->UpscalerInterface.DestroyUpscaler(mImpl->Dlss);
-        mImpl->Dlss = nullptr;
-        nri::UpscalerDesc upscaler{};
-        upscaler.upscaleResolution = {
-            static_cast<nri::Dim_t>(desc.OutputWidth),
-            static_cast<nri::Dim_t>(desc.OutputHeight)};
-        upscaler.type = nri::UpscalerType::DLSR;
-        upscaler.mode = ToNriUpscalerMode(desc.Quality);
-        upscaler.flags =
-            (inputSrgb ? nri::UpscalerBits::SRGB
-                       : nri::UpscalerBits::HDR) |
-            nri::UpscalerBits::USE_REACTIVE |
-            nri::UpscalerBits::MV_JITTERED;
-        // NGX records feature-creation commands into the already-open frame
-        // command buffer, avoiding an out-of-band queue submission.
-        upscaler.commandBuffer = command->second;
-        if (mImpl->UpscalerInterface.CreateUpscaler(
-                *mImpl->Device, upscaler, mImpl->Dlss) !=
-            nri::Result::SUCCESS) {
-            mImpl->DlssReason =
-                "NRI failed to create DLSS (NGX runtime or GPU support unavailable)";
-            return false;
-        }
-        mImpl->DlssWidth = desc.OutputWidth;
-        mImpl->DlssHeight = desc.OutputHeight;
-        mImpl->DlssQuality = desc.Quality;
-        mImpl->DlssInputSrgb = inputSrgb;
-    }
-
-    nri::DispatchUpscaleDesc dispatch{};
-    dispatch.output =
-        mImpl->GetUpscalerResource(desc.OutputImage, true);
-    dispatch.input =
-        mImpl->GetUpscalerResource(desc.InputImage);
-    dispatch.guides.upscaler.depth =
-        mImpl->GetUpscalerResource(desc.DepthImage);
-    dispatch.guides.upscaler.mv =
-        mImpl->GetUpscalerResource(desc.MotionImage);
-    dispatch.guides.upscaler.reactive =
-        mImpl->GetUpscalerResource(desc.ReactiveImage);
-    if (dispatch.output.descriptor == nullptr ||
-        dispatch.input.descriptor == nullptr ||
-        dispatch.guides.upscaler.depth.descriptor == nullptr ||
-        dispatch.guides.upscaler.mv.descriptor == nullptr ||
-        dispatch.guides.upscaler.reactive.descriptor == nullptr)
+    const NriDlssFeatureKey key{desc.OutputWidth, desc.OutputHeight, desc.Quality,
+                                inputSrgb, desc.DlssPreset};
+    if (!EnsureDlssFeature(desc.FrameIndex, key))
         return false;
-    dispatch.currentResolution = {
-        static_cast<nri::Dim_t>(desc.InputWidth),
-        static_cast<nri::Dim_t>(desc.InputHeight)};
-    dispatch.cameraJitter = {desc.JitterPixels[0], desc.JitterPixels[1]};
-    dispatch.mvScale = {
-        static_cast<float>(desc.InputWidth),
-        static_cast<float>(desc.InputHeight)};
-    dispatch.flags = desc.ResetHistory
-        ? nri::DispatchUpscaleBits::RESET_HISTORY
-        : nri::DispatchUpscaleBits::NONE;
-    mImpl->UpscalerInterface.CmdDispatchUpscale(
-        *command->second, *mImpl->Dlss, dispatch);
-    return true;
+    TriaevumDlssFeature* const feature = mImpl->Dlss.Find(key);
+
+    // The views NRI made of the host's images, as NRI's own NGX path used.
+    const auto image = [&](VkImage source, VkFormat format, uint32_t width,
+                           uint32_t height, bool storage) {
+        nri::Descriptor* view = mImpl->GetUpscalerView(source, storage);
+        return TriaevumDlssImage{
+            source,
+            view != nullptr ? reinterpret_cast<VkImageView>(
+                                  mImpl->Core.GetDescriptorNativeObject(view))
+                            : VK_NULL_HANDLE,
+            format, width, height};
+    };
+    TriaevumDlssEvaluateDesc evaluate{};
+    evaluate.Output = image(desc.OutputImage, desc.OutputFormat,
+                            desc.OutputWidth, desc.OutputHeight, true);
+    evaluate.Color = image(desc.InputImage, desc.InputFormat,
+                           desc.InputWidth, desc.InputHeight, false);
+    evaluate.Depth = image(desc.DepthImage, desc.DepthFormat,
+                           desc.InputWidth, desc.InputHeight, false);
+    evaluate.Motion = image(desc.MotionImage, desc.MotionFormat,
+                            desc.InputWidth, desc.InputHeight, false);
+    evaluate.Reactive = image(desc.ReactiveImage, desc.ReactiveFormat,
+                              desc.InputWidth, desc.InputHeight, false);
+    if (evaluate.Output.View == VK_NULL_HANDLE ||
+        evaluate.Color.View == VK_NULL_HANDLE ||
+        evaluate.Depth.View == VK_NULL_HANDLE ||
+        evaluate.Motion.View == VK_NULL_HANDLE ||
+        evaluate.Reactive.View == VK_NULL_HANDLE)
+        return false;
+    evaluate.RenderWidth = desc.InputWidth;
+    evaluate.RenderHeight = desc.InputHeight;
+    evaluate.JitterX = desc.JitterPixels[0];
+    evaluate.JitterY = desc.JitterPixels[1];
+    evaluate.MotionScaleX = static_cast<float>(desc.InputWidth);
+    evaluate.MotionScaleY = static_cast<float>(desc.InputHeight);
+    const bool resumed = mImpl->Dlss.Resumes(feature);
+    evaluate.ResetHistory = desc.ResetHistory || resumed ? 1U : 0U;
+    const auto command = mImpl->CommandBuffers.find(desc.FrameIndex);
+    if (command == mImpl->CommandBuffers.end()) return false;
+    const auto commandBuffer = static_cast<VkCommandBuffer>(
+        mImpl->Core.GetCommandBufferNativeObject(command->second));
+    return mImpl->DlssModule->Evaluate(feature, commandBuffer, &evaluate) != 0;
 #else
     (void)desc;
     return false;
@@ -1270,6 +1429,16 @@ bool NriInteropContext::Available() const {
 }
 
 const std::string& NriInteropContext::UnavailableReason() const { return mImpl->Reason; }
+
+void NriInteropContext::SetRecordedWorkBoundary(std::function<bool()> boundary) {
+    mImpl->RecordedWorkBoundary = std::move(boundary);
+}
+
+bool NriInteropContext::CompleteRecordedWork() {
+    if (mImpl->RecordedWorkBoundary) return mImpl->RecordedWorkBoundary();
+    return mImpl->VulkanDevice == VK_NULL_HANDLE ||
+           vkDeviceWaitIdle(mImpl->VulkanDevice) == VK_SUCCESS;
+}
 
 } // namespace Fast::Oot3d
 

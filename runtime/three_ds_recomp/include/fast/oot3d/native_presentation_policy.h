@@ -13,7 +13,7 @@ inline constexpr bool BuildRequiresNativePresentation() {
 }
 
 // The mobile baseline uses the exact F2 mask, not the Authentic preset. Keep
-// configured values intact and leave native lighting, pacing and composition alone.
+// configured values intact and preserve pacing and native composition.
 class NativePresentationPolicy {
   public:
     explicit constexpr NativePresentationPolicy(bool required = BuildRequiresNativePresentation())
@@ -33,6 +33,10 @@ class NativePresentationPolicy {
         effective.Effects.ToonStyle.OutlineEnabled = false;
         effective.Effects.AmbientOcclusion = AmbientOcclusionMode::Off;
         effective.Effects.Reflections = ReflectionMode::Off;
+        effective.Effects.DirectionalShadows.Mode = DirectionalShadowMode::Off;
+        effective.Effects.PointShadows.Mode = PointShadowMode::Off;
+        effective.Effects.GlobalIllumination.Mode = GlobalIlluminationMode::Off;
+        effective.Effects.SurfaceLighting = SurfaceLightingMode::Native;
     }
 
   private:

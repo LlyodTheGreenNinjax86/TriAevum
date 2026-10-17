@@ -11,8 +11,11 @@
 
 #include <array>
 #include <cstdint>
+#include <functional>
 #include <memory>
+#include <optional>
 #include <string>
+#include <vector>
 
 namespace Fast::Oot3d {
 
@@ -63,8 +66,24 @@ struct NriTemporalUpscaleDispatchDesc {
     float FrameTimeMilliseconds = 16.6667F;
     float ViewUnitsPerMeter = 1.0F;
     float Sharpness = 0.0F;
+    // DLSS render preset (DlssRenderPreset); 0 the runtime's default.
+    uint8_t DlssPreset = 0;
     bool ResetHistory = false;
     SceneColorEncoding InputEncoding = SceneColorEncoding::Unknown;
+};
+
+// What a DLSS feature is created for. Each key keeps its own feature: a
+// native boundary composed at its scene target's extent and the presentation
+// at the display's extent are separate streams with separate outputs. A
+// dispatch reuses the live feature of its key, including one created ahead of
+// its first dispatch.
+struct NriDlssFeatureKey {
+    uint32_t OutputWidth = 0;
+    uint32_t OutputHeight = 0;
+    UpscalerQuality Quality = UpscalerQuality::Quality;
+    bool InputSrgb = true;
+    uint8_t Preset = 0;
+    bool operator==(const NriDlssFeatureKey&) const = default;
 };
 
 // Owns NRI wrapper objects plus resources explicitly created through the
@@ -101,6 +120,9 @@ class NriInteropContext final {
     bool CreateOwnedTexture2D(const NriOwnedTexture2DDesc& desc,
                               NriOwnedTexture2D& texture);
     [[nodiscard]] bool OwnsTexture(VkImage image) const;
+    // Nonzero for a live registration; never reused during this context's lifetime,
+    // even if Vulkan recycles an image handle or the device is reinitialized.
+    [[nodiscard]] uint64_t TextureGeneration(VkImage image) const;
     [[nodiscard]] bool DynamicRenderingAvailable() const;
     void DestroyOwnedTexture(VkImage image);
     void ForgetTexture(VkImage image);
@@ -121,11 +143,28 @@ class NriInteropContext final {
     [[nodiscard]] bool DlssAvailable() const;
     [[nodiscard]] const std::string& DlssUnavailableReason() const;
     bool DispatchDlss(const NriTemporalUpscaleDispatchDesc& desc);
+    // Creates the DLSS feature for `key` ahead of its first dispatch,
+    // recording into the frame's command buffer as the dispatch would.
+    bool PrepareDlss(uint32_t frameIndex, const NriDlssFeatureKey& key);
+    // The live features' keys, in key order; none before the first creation.
+    [[nodiscard]] std::vector<NriDlssFeatureKey> DlssFeatures() const;
+    // Advances whenever a feature is created or retired.
+    [[nodiscard]] uint64_t DlssFeatureGeneration() const;
 
     [[nodiscard]] bool Available() const;
     [[nodiscard]] const std::string& UnavailableReason() const;
 
+    // Retirement boundary for screen resources. A pass that replaces images,
+    // views or pipelines outside its own frame slot calls CompleteRecordedWork
+    // first: every command recorded so far, including the current frame's
+    // prefix, has then executed and recording continues in the same frame.
+    // The backend installs the boundary; without one it waits for the device.
+    void SetRecordedWorkBoundary(std::function<bool()> boundary);
+    [[nodiscard]] bool CompleteRecordedWork();
+
   private:
+    bool EnsureDlssFeature(uint32_t frameIndex, const NriDlssFeatureKey& key);
+
     friend class NriInteropAccess;
     struct Impl;
     std::unique_ptr<Impl> mImpl;

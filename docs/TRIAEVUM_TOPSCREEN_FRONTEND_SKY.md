@@ -34,6 +34,48 @@ owns this title/profile-specific composition policy:
 `oot3d_native_a32_window.cpp` is the integration boundary: native target routing,
 background-canvas classification, and the completed frame before interpolation.
 
+## Visual frames and the version choice (2026-10-05)
+
+`b09e3cb` closes one visual frame per guest frame and treats a later draw into
+the selected snapshot's source as the guest's next frame. The relocated menu is
+exactly such a draw, so from 2026-09-30 every TopScreen frontend menu was drawn
+over by the next frame and never shown. While the relocation is active the
+window now passes the menu canvases (`TopScreenFrontendMenuCanvases`, derived
+from `ResolveTopScreenFrontendTargetCommand`) to `FinishFrames`: draws on them
+continue their frame, earlier superseded frames included, and the composition
+above moves the snapshot after them. Without an active relocation the frame
+split is unchanged.
+
+The title's normal / Master Quest choice (`COmoteUraSelector`) is a lane of the
+root pause UI that runs in game mode 1, so the FileSelect/NameEntry
+discriminator never covered it (#28). `oot3d_native_omote_ura_selector.h`
+reads its owner, and from the moment its panels enter until they leave it owns
+the frontend presentation: TopScreen relocates it like File Select, the OoT3D
+profile presents the lower screen. Its background is its own texture, not the
+shared CommonBackground00: `OmoteUraSelector_LoadTextures` builds
+`rom:/misc/common_bg01.ctxb` into the CTXB resource at owner `+0x498`, and
+`CtxbResource_BuildTexture` stores the texture address at `+0x4C`. The bridge
+reports it while the choice is presented and the backdrop suppression above
+removes it like CommonBackground00 (the user's choice, 2026-10-05): the cards
+and header lie over the title scene. The native title logo, still drawn on the
+upper screen, shows in the gap between the cards.
+
+On hardware the game slides the cards onto the lower screen by itself shortly
+after the title appears, while the upper screen keeps the title. On one screen
+that covered the title without any input (user report, 2026-10-05), so
+TopScreen withholds the choice until the player acts
+(`ApplyTopScreenVersionChoiceReveal`, bridge `NativeVersionChoiceAwaitingReveal`):
+the title stays, and every guest input is withheld, until START, A or a touch
+reveals the cards. That press only reveals and is swallowed until released, so
+it never confirms a card. A press during the native title prompt (selector
+phases 1-2, before the panels enter) reaches the game as on hardware and counts
+as the reveal, so one press always suffices. The reveal lasts until the choice
+closes; the OoT3D two-screen profile is unchanged. Idle boot: the title stays
+up through frame 1450 with no reveal; S28, S01 early and S23 produce their
+accepted captures unchanged; S01 late (first START after the hidden panels have
+entered) now shows the choice on its first START and reaches File Select on the
+second, as the new captures show.
+
 ## Verification
 
 Fast ROM-free regression test (about three seconds including compilation):

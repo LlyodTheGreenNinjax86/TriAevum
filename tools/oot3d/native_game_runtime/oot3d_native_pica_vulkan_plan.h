@@ -64,6 +64,10 @@ struct Oot3dPicaVulkanTextureBinding {
     bool NativeContentHashAvailable = false;
     uint64_t NativeBaseLevelContentHash = 0;
     bool NativeBaseLevelContentHashAvailable = false;
+    // Explicit producers of this binding's bytes, carried from the immutable
+    // draw snapshot. Empty for an ordinary CPU-owned texture; never derived
+    // from a hash or from an absent hash.
+    std::vector<Fast::Renderer3ds::PicaTextureCopyReference> CopyReferences;
 
     [[nodiscard]] std::span<const uint8_t> ResolvedNativeBytes() const {
         return SharedNativeBytes != nullptr
@@ -82,12 +86,17 @@ struct Oot3dPicaVulkanDrawPlan {
     Oot3dPicaCompositionDomain CompositionDomain =
         Oot3dPicaCompositionDomain::Unknown;
     Oot3dPicaCompositionAttribution Composition;
+    Fast::Renderer3ds::PicaNativeLightBinding LightBinding;
     Oot3dPicaCanonicalDrawIdentity CanonicalIdentity;
     Oot3dPicaFragmentFeatureSet FragmentFeatures;
     Oot3dPicaGeneratedVertexShader VertexShader;
     Oot3dPicaGeneratedFragmentShader FragmentShader;
     std::shared_ptr<const std::string> SharedVertexShaderSource;
     std::shared_ptr<const std::string> SharedFragmentShaderSource;
+    // The parametric program of the same draw (hybrid preparation); no source
+    // when the draw has none or the specialized program is already parametric.
+    Oot3dPicaGeneratedFragmentShader UberFragmentShader;
+    std::shared_ptr<const std::string> SharedUberFragmentShaderSource;
     Oot3dPicaDecodedDrawState State;
     std::vector<Oot3dPicaVulkanVertexBinding> VertexBindings;
     std::vector<Oot3dPicaVulkanVertexAttribute> VertexAttributes;
@@ -130,6 +139,7 @@ struct Oot3dPicaVulkanDrawPlan {
 struct Oot3dPicaVulkanDrawOverrides {
     const Oot3dPicaVertexUniformState* VertexUniforms = nullptr;
     const Oot3dPicaFragmentUniformState* FragmentUniforms = nullptr;
+    const Fast::Renderer3ds::PicaNativeLightBinding* LightBinding = nullptr;
     const Oot3dPicaViewportState* Viewport = nullptr;
     const std::array<float, 4>* BlendConstantColor = nullptr;
     const std::vector<Oot3dPicaVulkanVertexBinding>* VertexBindings = nullptr;
@@ -185,8 +195,21 @@ struct Oot3dPicaVulkanCachedVertexStructuralState {
     uint64_t CanonicalProgramId = 0;
 };
 
+struct Oot3dPicaVulkanCachedUberFragment {
+    bool Available = false;
+    uint64_t StateKey = 0;
+    std::shared_ptr<const std::string> Source;
+    Oot3d::Renderer::PicaShaderSourceIdentity Identity;
+    Oot3d::Renderer::PicaShaderHookLayout Hooks;
+};
+
 struct Oot3dPicaVulkanShaderSourceCache {
     Oot3dPicaTevMode TevMode = Oot3dPicaTevMode::Specialized;
+    // Generate each specialized fragment program's parametric pair. The
+    // specialized state key determines every input of the parametric program.
+    bool UberFragments = false;
+    std::unordered_map<uint64_t, Oot3dPicaVulkanCachedUberFragment>
+        UberFragmentsBySpecializedKey;
     std::unordered_map<uint64_t, Oot3dPicaVulkanCachedShaderSource>
         VertexSources;
     std::unordered_map<uint64_t, Oot3dPicaVulkanCachedShaderSource>
@@ -233,6 +256,13 @@ bool BuildOot3dPicaVulkanDrawPlanAndConsumeResources(
     Oot3dPicaVulkanDrawPlan& plan,
     std::string* error = nullptr,
     Oot3dPicaVulkanShaderSourceCache* shaderCache = nullptr);
+
+// A plan restored from a visual savestate keeps its specialized program but
+// not its register packet. Its always-available pair is the parametric
+// program of its structural configuration (which the decisions of the
+// specialized program drive like any other). Plans without typed fragment
+// features (old savestates) or with a shadow-producing output keep no pair.
+void AttachOot3dPicaRestoredUberFragment(Oot3dPicaVulkanDrawPlan& plan);
 
 // Offline pipeline metadata only. Shares the exact live vertex-layout planner;
 // no texture/index/vertex payload is needed or fabricated. Not a drawable plan.

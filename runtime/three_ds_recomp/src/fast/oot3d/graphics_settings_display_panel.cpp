@@ -7,7 +7,7 @@ using SettingsUi::EnumCombo;
 
 bool GraphicsSettingsPanel::DrawDisplaySettings(GraphicsSettings& settings, const GraphicsCapabilities& capabilities) {
     bool changed = false;
-    ImGui::SeparatorText("Display");
+    ImGui::SeparatorText("Screen");
     const auto observed = GraphicsSettingsRuntime::Instance().DisplayMetrics();
     if (observed.OutputWidth != 0 && observed.OutputHeight != 0) {
         ImGui::Text("Output framebuffer: %u x %u (%.3f:1)", observed.OutputWidth,
@@ -97,7 +97,11 @@ bool GraphicsSettingsPanel::DrawDisplaySettings(GraphicsSettings& settings, cons
     ImGui::EndDisabled();
     if (upscalerOwnsScale) ImGui::TextDisabled("Render scale is set by upscaler quality.");
     changed |= ImGui::Checkbox("VSync", &settings.VSync);
+    return changed;
+}
 
+bool GraphicsSettingsPanel::DrawMotionSettings(GraphicsSettings& settings, const GraphicsCapabilities&) {
+    bool changed = false;
     ImGui::SeparatorText("Motion and camera");
     const char* const frameRates[] = {
         "Original 30 FPS", "Interpolated 2x (60 FPS)",
@@ -107,6 +111,11 @@ bool GraphicsSettingsPanel::DrawDisplaySettings(GraphicsSettings& settings, cons
     changed |= EnumCombo("Frame rate", settings.FrameRate, frameRates);
     changed |= ImGui::SliderFloat("Global scene FOV", &settings.FovMultiplier,
                                   1.0F, 1.5F, "%.2fx");
+    changed |= ImGui::Checkbox("Extended draw distance", &settings.ExtendedDrawDistance);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Draws and updates actors up to 5x farther, spawns bush, rock and tree groups farther "
+                          "away and removes the Kokiri fade. Distant actors keep moving, so gameplay can differ "
+                          "from the original.");
 
     return changed;
 }

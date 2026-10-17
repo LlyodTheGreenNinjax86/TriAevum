@@ -10,6 +10,7 @@ from unittest.mock import patch
 from audit_release import DEFAULT_POLICY, audit_release
 from common import atomic_write_json, sha256_file
 from package_release import package_release
+from test_vulkan_imports import pe_import_fixture
 
 
 FILES = {
@@ -39,6 +40,7 @@ FILES = {
     "LICENSES/GPL-2.0-or-later.txt": ("license", b"GPL test fixture\n"),
     "LICENSES/SDL2-zlib.txt": ("license", b"SDL zlib test fixture\n"),
     "LICENSES/SDL-GameControllerDB-zlib.txt": ("license", b"Controller DB zlib test fixture\n"),
+    "LICENSES/zstd-BSD-3-Clause.txt": ("license", b"zstd BSD test fixture\n"),
     "LICENSES/Aurora-MIT.txt": ("license", b"Aurora MIT test fixture\n"),
     "resources/gamecontrollerdb.txt": ("title_neutral_resource", b"# Controller DB fixture\n"),
     "msvcp140.dll": ("runtime_library", b"MZ C++ library fixture"),
@@ -53,6 +55,15 @@ FILES = {
         b"PyInstaller test fixture\n",
     ),
     "LICENSES/LLVM-exception.txt": ("license", b"LLVM exception fixture\n"),
+    "LICENSES/iMMERSE-MXAO.md": ("license", b"iMMERSE module exception fixture\n"),
+    "LICENSES/iMMERSE-LICENSE.txt": ("license", b"iMMERSE license fixture\n"),
+    "triaevum_immerse.dll": ("separately_licensed_module", b"MZ iMMERSE module fixture"),
+    # The DLSS module is the one binary allowed to contain NGX code.
+    "triaevum_dlss.dll": ("separately_licensed_module", b"MZ DLSS module fixture NVSDK_NGX_VULKAN_Init"),
+    "nvngx_dlss.dll": ("separately_licensed_module", b"MZ NVIDIA DLSS runtime fixture"),
+    "LICENSES/NVIDIA-DLSS-SDK-LICENSE.txt": ("license", b"NVIDIA RTX SDKs licence fixture\n"),
+    "LICENSES/TriAevum-DLSS-module.md": ("license", b"DLSS module boundary fixture\n"),
+    "resources/environments/scene-0043.environment.json": ("default_environment_profile", b"{}\n"),
     "recipes/oot3d.json": ("revision_recipe", b'{"format":"recipe-test"}\n'),
 }
 
@@ -167,6 +178,55 @@ class PublicReleaseAuditTests(unittest.TestCase):
                                     enforce_readiness=False)
             self.assertFalse((root / "output").exists())
 
+    def test_separately_licensed_module_keeps_its_role(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            write_clean_package(root)
+            manifest_path = root / "release-manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            for item in manifest["files"]:
+                if item["path"] == "triaevum_immerse.dll":
+                    item["role"] = "runtime_library"
+            atomic_write_json(manifest_path, manifest)
+            result = audit_release(root)
+            self.assertFalse(result.ok)
+            self.assertTrue(any("separately licensed" in error for error in result.errors), result.errors)
+
+    def test_dlss_module_and_nvidia_runtime_keep_their_role(self) -> None:
+        for relative in ("triaevum_dlss.dll", "nvngx_dlss.dll"):
+            with self.subTest(path=relative), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                write_clean_package(root)
+                manifest_path = root / "release-manifest.json"
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                for item in manifest["files"]:
+                    if item["path"] == relative:
+                        item["role"] = "runtime_library"
+                atomic_write_json(manifest_path, manifest)
+                result = audit_release(root)
+                self.assertFalse(result.ok)
+                self.assertTrue(any(relative in error and "separately licensed" in error
+                                    for error in result.errors), result.errors)
+
+    def test_rejects_ngx_code_outside_the_dlss_module(self) -> None:
+        for relative in ("TriAevum.exe", "msvcp140.dll"):
+            with self.subTest(path=relative), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                write_clean_package(root)
+                path = root / relative
+                # Across the scanner's chunk boundary, too.
+                path.write_bytes(b"MZ" + b"\0" * (8 * 1024 * 1024 - 5) + b"NVSDK_NGX_Init")
+                manifest_path = root / "release-manifest.json"
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                for item in manifest["files"]:
+                    if item["path"] == relative:
+                        item.update(bytes=path.stat().st_size, sha256=sha256_file(path))
+                atomic_write_json(manifest_path, manifest)
+                result = audit_release(root)
+                self.assertFalse(result.ok)
+                self.assertTrue(any(relative in error and "proprietary SDK code" in error
+                                    for error in result.errors), result.errors)
+
     def test_accepts_exact_clean_allowlist(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -174,6 +234,85 @@ class PublicReleaseAuditTests(unittest.TestCase):
             result = audit_release(root)
             self.assertTrue(result.ok, result.errors)
             self.assertEqual(result.summary["verified_files"], len(FILES) + 1)
+
+    def test_runtime_contract_excludes_experimental_global_illumination(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            write_clean_package(root)
+            manifest_path = root / "release-manifest.json"
+            manifest = json.loads(manifest_path.read_text())
+            runtime = next(item for item in manifest["files"] if item["path"] == "TriAevum.exe")
+            # A runtime contract also binds the corresponding source to its commit.
+            source = root / "source/TriAevum-source.zip"
+            with zipfile.ZipFile(source, "a") as archive:
+                archive.writestr("SOURCE_ARCHIVE_MANIFEST.json", json.dumps({"source_commit": "0" * 40}))
+            item = next(item for item in manifest["files"] if item["role"] == "corresponding_source")
+            item.update(bytes=source.stat().st_size, sha256=sha256_file(source))
+
+            def audit(capability, mode: str, developer_tools=False) -> list[str]:
+                capabilities = {"nri": True, "f1": True, "topscreen": True}
+                if capability is not None:
+                    capabilities["experimental_global_illumination"] = capability
+                if developer_tools is not None:
+                    capabilities["developer_tools"] = developer_tools
+                product = {
+                    "format": "triaevum_product_info_v1", "runtime": "oot3d_native_game",
+                    "source_commit": "0" * 40, "whole_aot_plugin_abi": 2, "private_title_loaded": False,
+                    "capabilities": capabilities,
+                    "default_config": {"Graphics": {
+                        "Preset": "Enhanced", "FrameRate": {"Mode": "Interpolated2x"},
+                        "Effects": {"GlobalIllumination": {"Mode": mode}}}},
+                }
+                manifest["release"]["runtime_contract"] = {"runtime_sha256": runtime["sha256"], "product": product}
+                atomic_write_json(manifest_path, manifest)
+                return list(audit_release(root).errors)
+
+            self.assertEqual(audit(False, "Off"), [])
+            for capability, mode in ((True, "Off"), (None, "Off"), (False, "ScreenSpace")):
+                errors = audit(capability, mode)
+                self.assertTrue(any("global illumination" in error for error in errors), errors)
+            # A developer build (warp screen, warp points) is never a release.
+            for developer_tools in (True, None):
+                errors = audit(False, "Off", developer_tools)
+                self.assertTrue(any("developer tools" in error for error in errors), errors)
+
+    def test_rejects_binary_importing_vulkan_commands_an_older_loader_lacks(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            write_clean_package(root)
+            manifest_path = root / "release-manifest.json"
+            manifest = json.loads(manifest_path.read_text())
+            runtime = root / "TriAevum.exe"
+
+            def audit(commands: list[str]) -> list[str]:
+                runtime.write_bytes(pe_import_fixture({"vulkan-1.dll": commands}))
+                item = next(item for item in manifest["files"] if item["path"] == "TriAevum.exe")
+                item.update(bytes=runtime.stat().st_size, sha256=sha256_file(runtime))
+                atomic_write_json(manifest_path, manifest)
+                return list(audit_release(root).errors)
+
+            self.assertEqual(audit(["vkCreateInstance", "vkQueuePresentKHR"]), [])
+            self.assertEqual(audit(["vkCreateInstance", "vkWaitSemaphores"]),
+                             ["TriAevum.exe imports Vulkan commands that older loaders lack: vkWaitSemaphores"])
+
+    def test_on_demand_vulkan_runtime_may_import_newer_commands(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            write_clean_package(root)
+            manifest_path = root / "release-manifest.json"
+            manifest = json.loads(manifest_path.read_text())
+            library = root / "amd_fidelityfx_vk.dll"
+            library.write_bytes(pe_import_fixture({"vulkan-1.dll": ["vkWaitSemaphores"]}))
+            entry = {"path": "amd_fidelityfx_vk.dll", "role": "optional_vulkan_runtime",
+                     "bytes": library.stat().st_size, "sha256": sha256_file(library)}
+            manifest["files"].append(entry)
+            atomic_write_json(manifest_path, manifest)
+            self.assertEqual(list(audit_release(root).errors), [])
+            # The same library as an ordinary runtime library loads at startup.
+            entry["role"] = "runtime_library"
+            atomic_write_json(manifest_path, manifest)
+            self.assertEqual(list(audit_release(root).errors),
+                             ["amd_fidelityfx_vk.dll imports Vulkan commands that older loaders lack: vkWaitSemaphores"])
 
     def test_rejects_private_file_hidden_in_source_archive(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

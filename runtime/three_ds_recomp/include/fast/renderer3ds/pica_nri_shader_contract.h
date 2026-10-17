@@ -12,6 +12,7 @@ enum class PicaNriDescriptorKind : uint8_t {
     Texture,
     StorageTexture,
     Sampler,
+    StructuredBuffer,
 };
 
 enum class PicaNriShaderStage : uint8_t {
@@ -37,6 +38,10 @@ struct PicaNriFragmentShaderExtensions {
     // Optional combined sampler emitted by an extension shader hook. The
     // common renderer assigns its image/sampler pair to bindings 10 and 11.
     std::string_view DirectionalShadowSampler;
+    // Optional point-shadow atlas sampler: image/sampler at bindings 27 and 28.
+    std::string_view PointShadowSampler;
+    // Optional contact-shadow visibility sampler: bindings 29 and 30.
+    std::string_view ContactShadowSampler;
 };
 
 // This binding contract deliberately matches the original PICA bindings for
@@ -45,7 +50,12 @@ struct PicaNriFragmentShaderExtensions {
 // lighting extension: history texture, split sampler and receiver state.
 // Bindings 13-14 are the native fragment-lighting LUT image and sampler.
 // Binding 15 is an optional surface-style constant buffer, not native PICA state.
-constexpr std::array<PicaNriDescriptorBinding, 16>
+// Binding 16 contains the selected native lights and unlit material inputs.
+// Bindings 17-25 carry opt-in PBR parameters and normal/ORM/emissive/height maps.
+// Binding 26 is read-only, geometry-owned UV-seam metadata.
+// Bindings 27-28 are the optional point-shadow atlas image and sampler.
+// Bindings 29-30 are the optional contact-shadow visibility and sampler.
+constexpr std::array<PicaNriDescriptorBinding, 31>
     kPicaNriDescriptorBindings{{
         {0U, PicaNriDescriptorKind::ConstantBuffer,
          PicaNriShaderStage::Vertex},
@@ -78,6 +88,36 @@ constexpr std::array<PicaNriDescriptorBinding, 16>
         {14U, PicaNriDescriptorKind::Sampler,
          PicaNriShaderStage::Fragment},
         {15U, PicaNriDescriptorKind::ConstantBuffer,
+         PicaNriShaderStage::Fragment},
+        {16U, PicaNriDescriptorKind::ConstantBuffer,
+         PicaNriShaderStage::Fragment},
+        {17U, PicaNriDescriptorKind::ConstantBuffer,
+         PicaNriShaderStage::Fragment},
+        {18U, PicaNriDescriptorKind::Texture,
+         PicaNriShaderStage::Fragment},
+        {19U, PicaNriDescriptorKind::Texture,
+         PicaNriShaderStage::Fragment},
+        {20U, PicaNriDescriptorKind::Texture,
+         PicaNriShaderStage::Fragment},
+        {21U, PicaNriDescriptorKind::Sampler,
+         PicaNriShaderStage::Fragment},
+        {22U, PicaNriDescriptorKind::Sampler,
+         PicaNriShaderStage::Fragment},
+        {23U, PicaNriDescriptorKind::Sampler,
+         PicaNriShaderStage::Fragment},
+        {24U, PicaNriDescriptorKind::Texture,
+         PicaNriShaderStage::Fragment},
+        {25U, PicaNriDescriptorKind::Sampler,
+         PicaNriShaderStage::Fragment},
+        {26U, PicaNriDescriptorKind::StructuredBuffer,
+         PicaNriShaderStage::Fragment},
+        {27U, PicaNriDescriptorKind::Texture,
+         PicaNriShaderStage::Fragment},
+        {28U, PicaNriDescriptorKind::Sampler,
+         PicaNriShaderStage::Fragment},
+        {29U, PicaNriDescriptorKind::Texture,
+         PicaNriShaderStage::Fragment},
+        {30U, PicaNriDescriptorKind::Sampler,
          PicaNriShaderStage::Fragment},
     }};
 

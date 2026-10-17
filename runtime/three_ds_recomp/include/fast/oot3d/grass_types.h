@@ -21,6 +21,17 @@ struct GrassTextureSelector {
     uint8_t MapperSlotMask = 0x07;
 };
 
+// A rectangle of a grass mask, in its normalized texture coordinates after
+// wrap (u across, v down the rows, as the editor's preview shows it).
+struct GrassMaskRect {
+    float MinU = 0.0F;
+    float MinV = 0.0F;
+    float MaxU = 1.0F;
+    float MaxV = 1.0F;
+    bool operator==(const GrassMaskRect&) const = default;
+};
+inline constexpr size_t kMaximumGrassMaskRects = 16U;
+
 struct GrassPlacementRule {
     uint32_t RuleId = 0;
     GrassTextureSelector Target;
@@ -34,7 +45,35 @@ struct GrassPlacementRule {
     float OutputWhite = 1.0F;
     float MaximumSlopeDegrees = 48.0F;
     float NormalOffset = 0.5F;
+    // Active rectangles: when any are listed, the mask applies only inside
+    // them and is zero elsewhere (as a black mask); none: all of it applies.
+    std::vector<GrassMaskRect> ActiveRects;
+    // Inherited rules only (a twin texture's, never configured or saved):
+    // its samples mapped onto the source texture's range before the levels,
+    // and the configured rule they come from.
+    float SampleScale = 1.0F;
+    float SampleOffset = 0.0F;
+    uint32_t InheritedFrom = 0U;
 };
+
+enum class GrassMaskMode : uint8_t { Automatic, Custom, Off };
+
+// An override for a native overlay texture. Exact native identity and size:
+// visual texture twins can have different alpha and must not inherit cutouts.
+struct GrassMaskRule {
+    GrassMaskMode Mode = GrassMaskMode::Automatic;
+    GrassPlacementRule Coverage = [] {
+        GrassPlacementRule rule;
+        rule.Channel = GrassSampleChannel::Alpha;
+        rule.InputBlack = 0.0F;
+        return rule;
+    }();
+    float Strength = 1.0F;
+};
+
+[[nodiscard]] const GrassMaskRule* FindGrassMaskRule(const std::vector<GrassMaskRule>& rules, uint64_t hash,
+                                                     uint16_t width, uint16_t height);
+void NormalizeGrassMaskRule(GrassMaskRule& rule);
 
 struct GrassGenerationSettings {
     float InstancesPerSquareMeter = 8.0F;
@@ -51,7 +90,7 @@ struct GrassGenerationSettings {
 };
 
 struct GrassInteractor {
-    enum class Kind : uint8_t { PlayerLink, SceneActor };
+    enum class Kind : uint8_t { PlayerLink, SceneActor, Epona };
     Kind Type = Kind::PlayerLink;
     uint64_t StableId = 1;
     uint64_t ContextId = 0;

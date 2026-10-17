@@ -22,11 +22,32 @@ def main():
     p.add_argument("--jobs", type=int, default=2)
     p.add_argument("--object-cache", type=Path)
     p.add_argument("--max-new-objects", type=int)
+    p.add_argument("--timeout-seconds", type=int, default=600)
+    pgo = p.add_mutually_exclusive_group()
+    pgo.add_argument("--pgo-generate", action="store_true",
+                     help="instrument the module; LLVM_PROFILE_FILE names the .profraw output")
+    pgo.add_argument("--pgo-generate-ir", action="store_true",
+                     help="like --pgo-generate with IR-level counters; its profile enables CS-PGO")
+    pgo.add_argument("--pgo-use", type=Path, help="merged .profdata from real workloads")
+    # Context-sensitive PGO runs in the ThinLTO backend after inlining, so it
+    # changes only the link: objects compiled with --pgo-use are reused.
+    cspgo = p.add_mutually_exclusive_group()
+    cspgo.add_argument("--cspgo-generate", action="store_true",
+                       help="with --pgo-use: add post-inline counters at link time")
+    cspgo.add_argument("--cspgo-use", type=Path,
+                       help="with --pgo-use: merged profile including context-sensitive counters")
     args = p.parse_args()
+    if (args.cspgo_generate or args.cspgo_use) and not args.pgo_use:
+        p.error("context-sensitive PGO requires --pgo-use")
     repo = TOOLS.parent
     args.output.mkdir(parents=True, exist_ok=True)
     cache_root = args.object_cache or args.output / "objects"
-    toolchain = NativeToolchain(compiler=args.compiler, archiver=args.archiver)
+    profile_mode = ("generate" if args.pgo_generate else "generate-ir" if args.pgo_generate_ir
+                    else "use" if args.pgo_use else "none")
+    toolchain = NativeToolchain(compiler=args.compiler, archiver=args.archiver,
+                                profile_instrumentation=profile_mode,
+                                profile_data=args.pgo_use.resolve() if args.pgo_use else None)
+    profile_flags = cache._profile_arguments(toolchain)
     if args.max_new_objects is not None:
         # Preflight uses the same identities as the builder. Refuse accidental
         # full rebuilds when measuring a small emitter-only experiment.
@@ -61,18 +82,50 @@ def main():
     compile_command = [str(args.compiler), "--target=x86_64-pc-windows-msvc",
         "/nologo", "/TP", "/EHsc", "/O2", "/Ob2", "/DNDEBUG", "/std:c++20",
         "/MT", "/bigobj", "/fp:strict", "/w", "/Zc:preprocessor", "/Brepro",
-        "/DNOMINMAX", "/DOOT3D_NATIVE_GENERATED_WHOLE_AOT=1",
+        "/DNOMINMAX", "/DOOT3D_NATIVE_GENERATED_WHOLE_AOT=1", *profile_flags,
         *(f"/I{x}" for x in (args.generated, runtime, a32, a32 / "upstream", args.include)),
         "/c", f"/Fo{obj}", str(runtime / "triaevum_title_whole_aot_plugin.cpp")]
     link_command = [str(args.compiler), "--target=x86_64-pc-windows-msvc", "/nologo",
         "/LD", "/MT", f"/Fe{dll}", str(obj), archive["archive"], str(args.support),
+        # The driver adds the profile runtime only when generating counters.
+        *(("-fprofile-instr-generate",) if args.pgo_generate or args.cspgo_generate else ()),
+        *(("-fprofile-generate",) if args.pgo_generate_ir else ()),
         "-fuse-ld=lld", "/link", "/NOIMPLIB", "/OPT:REF", "/OPT:ICF",
-        "/INCREMENTAL:NO", "/Brepro", f"/threads:{args.jobs}", f"/MAP:{args.output / 'title.map'}"]
-    for label, command in (("wrapper", compile_command), ("link", link_command)):
+        "/INCREMENTAL:NO", "/Brepro", f"/threads:{args.jobs}",
+        f"/OPT:LLDLTOJOBS={args.jobs}", f"/lldltocache:{args.output / 'thinlto-cache'}",
+        f"/MAP:{args.output / 'title.map'}",
+        *(("/lto-cs-profile-generate",) if args.cspgo_generate else ()),
+        *((f"/lto-cs-profile-file:{args.cspgo_use.resolve()}",) if args.cspgo_use else ())]
+    steps = [("wrapper", compile_command)]
+    if args.cspgo_generate:
+        # Link-time-only instrumentation leaves the runtime's default bias
+        # variables undefined on COFF; zero means no counter relocation.
+        bias = args.output / "cspgo_profile_bias.c"
+        bias.write_text("\n".join((
+            "#include <stdint.h>",
+            "intptr_t __llvm_profile_counter_bias = 0;",
+            "intptr_t __llvm_profile_bitmap_bias = 0;", "")), encoding="ascii")
+        bias_obj = args.output / "cspgo_profile_bias.obj"
+        steps.append(("bias", [str(args.compiler), "--target=x86_64-pc-windows-msvc", "/nologo",
+                               "/MT", "/c", f"/Fo{bias_obj}", str(bias)]))
+        link_command.insert(link_command.index("-fuse-ld=lld"), str(bias_obj))
+    steps.append(("link", link_command))
+    for label, command in steps:
         print(f"Starting {label}", flush=True)
-        result = subprocess.run(command, capture_output=True, text=True, timeout=600)
-        (args.output / f"{label}.log").write_text(result.stdout + result.stderr)
-        result.check_returncode()
+        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            stdout, stderr = process.communicate(timeout=args.timeout_seconds)
+        except subprocess.TimeoutExpired:
+            # clang-cl owns an lld child. Killing only the driver leaves a
+            # memory-heavy linker running after the experiment has failed.
+            subprocess.run(["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                           capture_output=True, check=False)
+            stdout, stderr = process.communicate()
+            (args.output / f"{label}.log").write_text(stdout + stderr)
+            raise RuntimeError(f"{label} exceeded {args.timeout_seconds} seconds")
+        (args.output / f"{label}.log").write_text(stdout + stderr)
+        if process.returncode:
+            raise subprocess.CalledProcessError(process.returncode, command)
     print(f"Built {dll}: {dll.stat().st_size} bytes", flush=True)
 
 

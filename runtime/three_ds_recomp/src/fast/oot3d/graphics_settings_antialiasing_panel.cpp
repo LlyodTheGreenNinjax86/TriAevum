@@ -1,10 +1,12 @@
 #include "fast/oot3d/graphics_settings_window.h"
+#include "fast/oot3d/dlss_module_loader.h"
 #include "fast/oot3d/settings_panel_widgets.h"
 
 namespace Fast::Oot3d {
 bool GraphicsSettingsPanel::DrawAntialiasingSettings(
     GraphicsSettings& settings, const GraphicsCapabilities& capabilities) {
     bool changed = false;
+    ImGui::SeparatorText("Antialiasing and upscaling");
     const char* const modes[] = {"Off", "FXAA", "SMAA 1x (High)", "MSAA", "Temporal AA", "NRI Upscaler"};
     changed |= SettingsUi::ValidatedCombo<AntiAliasingMode>(
         "Mode", settings, capabilities, modes,
@@ -56,6 +58,17 @@ bool GraphicsSettingsPanel::DrawAntialiasingSettings(
             });
         const char* const qualities[] = {"Native", "Ultra quality", "Quality", "Balanced", "Performance", "Ultra performance"};
         changed |= SettingsUi::EnumCombo("Quality", settings.UpscalerMode, qualities);
+        if (settings.Upscaler == UpscalerProvider::Dlss) {
+            const char* const models[] = {"Default", "Transformer (K)", "CNN (E/F)"};
+            changed |= SettingsUi::EnumCombo("DLSS model", settings.UpscalerDlssModel, models);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Transformer: the sharpest, most stable image. CNN: the convolutional network "
+                                  "(preset F at Ultra performance), about half the transformer's cost. Default: "
+                                  "the runtime's choice, the most expensive on the RTX 3060 measured.");
+            // NVIDIA's DLSS SDK licence: DLSS is credited where it is offered.
+            if (const auto* module = DlssModule(); module != nullptr && module->Attribution != nullptr)
+                ImGui::TextWrapped("%s", module->Attribution);
+        }
         // Only NIS and FSR consume this setting. DLSS and XeSS do not.
         if (settings.Upscaler == UpscalerProvider::Nis || settings.Upscaler == UpscalerProvider::Fsr)
             changed |= ImGui::SliderFloat("Sharpness", &settings.UpscalerSharpness, 0.0F, 1.0F, "%.2f");

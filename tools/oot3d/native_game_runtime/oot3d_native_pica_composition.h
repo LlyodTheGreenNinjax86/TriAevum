@@ -1,10 +1,12 @@
 #pragma once
 
 #include "oot3d_native_pica_frontend.h"
+#include "oot3d_native_a32_lighting.h"
 
 #include <cstdint>
 #include <deque>
 #include <optional>
+#include <unordered_map>
 #include <span>
 #include <string>
 #include <vector>
@@ -19,7 +21,15 @@ namespace Oot3dNativeGame {
 inline constexpr uint32_t kOot3dCmbRendererSubmitDrawHandleEntry =
     0x0030F4D0U;
 inline constexpr uint32_t kOot3dObjectKankyoDrawEntry = 0x00297508U;
+inline constexpr uint32_t kOot3dActorDrawEntry = 0x002D5F68U;
 inline constexpr uint32_t kOot3dActorDrawCallbackReturn = 0x002D6314U;
+// ACTOR_EN_MAG: the title logo composited over the opening. The full
+// per-pixel model lights it by its own native lights, apart from the scene.
+inline constexpr uint16_t kOot3dTitleLogoActorId = 0x0171U;
+// Actor draw identities are (actor id << 32) | actor address.
+[[nodiscard]] constexpr bool IsTitleLogoActor(uint64_t actorIdentity) noexcept {
+    return actorIdentity != 0U && (actorIdentity >> 32U) == kOot3dTitleLogoActorId;
+}
 inline constexpr uint32_t kOot3dSceneRendererSubmitConfiguredModelPassEntry =
     0x002D9664U;
 inline constexpr uint32_t kOot3dEnvironmentRendererUpdateGameplayFadeLayersEntry =
@@ -39,6 +49,9 @@ inline constexpr uint32_t kOot3dEnvironmentRendererSubmitNormalizedColor4Entry =
 inline constexpr uint32_t kOot3dRendererCommandListExecuteEntry = 0x0035BF50U;
 inline constexpr uint32_t kOot3dKankyoEffectPrimitiveDrawEntry = 0x003FB5ECU;
 inline constexpr uint32_t kOot3dPicaPrimitivePacketBuilderEntry = 0x00313444U;
+inline constexpr uint32_t kOot3dGameplayDrawEntry = 0x002E25F0U;
+inline constexpr uint32_t kOot3dModelQueueSubmitEntry = 0x00372170U;
+inline constexpr uint32_t kOot3dModelQueueSetSlotEntry = 0x0031487CU;
 
 std::span<const uint32_t> Oot3dNativePicaCompositionHookPcs() noexcept;
 
@@ -98,6 +111,7 @@ class Oot3dNativePicaCompositionTracker final
         std::string* error = nullptr) override;
 
     void Reset() noexcept;
+    void SetRoomShadowShellsEnabled(bool enabled) { mLighting.SetRoomShadowShellsEnabled(enabled); }
     [[nodiscard]] const Oot3dNativePicaCompositionStats& Stats() const
         noexcept;
 
@@ -117,13 +131,35 @@ class Oot3dNativePicaCompositionTracker final
         uint32_t ReturnPc = 0;
         bool BeginAddressValid = false;
         Oot3dPicaCompositionAttribution Attribution;
+        Fast::Renderer3ds::PicaNativeLightBinding LightBinding;
     };
 
     bool RecordPendingSpan(Oot3dPicaCommandListCompositionSpan span);
 
     static constexpr size_t MaximumPendingSpans = 16384U;
+    struct QueuedComposition {
+        uint32_t SlotAddress = 0;
+        Oot3dPicaCompositionAttribution Attribution;
+    };
+    std::vector<QueuedComposition> mQueuedComposition;
+    Oot3dPicaCompositionAttribution mActiveCmbAttribution;
+    std::vector<uint64_t> mActorDrawStack;
+
 
     std::optional<uint8_t> mActiveCmbPass;
+    uint32_t mActiveCmbRenderer = 0;
+    // Native actor lifetimes are independent: recycling one actor must not
+    // invalidate a surviving instance. Non-actor CMBs use the tracker lifetime
+    // together with the renderer's continuity epoch.
+    uint64_t mNextTemporalLifetime = 1;
+    uint64_t mWorldTemporalLifetime = 1;
+    std::unordered_map<uint32_t, uint64_t> mActorLifetimes;
+    [[nodiscard]] uint64_t ActorTemporalLifetime(uint64_t owner) const {
+        const auto found = mActorLifetimes.find(static_cast<uint32_t>(owner));
+        return found == mActorLifetimes.end() ? 0 : found->second;
+    }
+    std::vector<uint32_t> mProjectedShadowRenderers;
+    NativeA32LightingProbe mLighting;
     std::optional<uint32_t> mActiveCmbReturnPc;
     std::optional<ActiveAtmosphereScope> mActiveAtmosphereScope;
     std::optional<ActiveAtmosphereScope> mActiveUiScope;

@@ -7,6 +7,8 @@
 #include "fast/renderer3ds/nri_pica_pipeline_identity.h"
 #include "fast/renderer3ds/pica_device_pipeline_pool.h"
 #include "fast/renderer3ds/pica_nri_upload.h"
+#include "fast/renderer3ds/pica_preparation_queue.h"
+#include "fast/renderer3ds/vulkan_pipeline_cache_store.h"
 
 #ifdef ENABLE_RENDERER3DS_NRI
 #include "nri_pica_upload_arena.h"
@@ -19,13 +21,22 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdio>
+#include <cstdlib>
 #include <limits>
+#include <string>
 #include <map>
+#include <mutex>
+#include <set>
 #include <unordered_map>
 #include <vector>
 
 namespace Fast::Renderer3ds {
 namespace {
+
+// Image/sampler pairs a PICA draw binds: the native units and the extension
+// samplers (shadow atlases, contact shadows).
+constexpr size_t kTextureSlotCount = 11U;
 
 #ifdef ENABLE_RENDERER3DS_NRI
 nri::Topology ToNriTopology(VkPrimitiveTopology topology) {
@@ -207,6 +218,9 @@ struct NriPicaSamplerKey {
 };
 
 struct NriPicaPipelineBridge::Impl {
+    // Preparation threads update statistics and the lazily created cache.
+    mutable std::mutex StatisticsMutex;
+    std::mutex PipelineCacheMutex;
     NriPicaPipelineStatistics Statistics;
     NriPicaInterop* Interop = nullptr;
     std::string Reason = "NRI PICA pipeline bridge is not initialized";
@@ -216,24 +230,76 @@ struct NriPicaPipelineBridge::Impl {
     PicaDevicePipelinePool<nri::Pipeline> OwnedPipelineObjects;
     NriPicaPipelineIdentity OwnedPipelineIdentity;
     std::map<NriPicaPipelineId, bool> OwnedPipelineUsesBlendConstants;
+    // A background creation owns a copy of its description; ids that asked
+    // for an equal pipeline meanwhile adopt the same object.
+    struct OwnedCreation {
+        NriPicaGraphicsPipelineDesc Desc;
+        std::vector<uint32_t> Vertex;
+        std::vector<uint32_t> Fragment;
+        std::vector<VkVertexInputBindingDescription> Bindings;
+        std::vector<VkVertexInputAttributeDescription> Attributes;
+        NriPicaPipelineFactory Factory = NriPicaPipelineFactory::Default;
+        std::vector<uint8_t> Key;
+        std::vector<NriPicaPipelineId> Ids;
+        nri::Pipeline* Result = nullptr;
+        std::shared_ptr<PicaPreparationTask> Task;
+        PicaPreparationQueue* Queue = nullptr;
+    };
+    std::map<std::vector<uint8_t>, std::shared_ptr<OwnedCreation>> PendingCreations;
+    std::map<NriPicaPipelineId, std::shared_ptr<OwnedCreation>> PendingOwned;
+    std::set<NriPicaPipelineId> FailedOwned;
     nri::PipelineLayout* DescriptorLayout = nullptr;
     nri::PipelineCache* PipelineCache = nullptr;
     bool PipelineCacheAttempted = false;
-    struct FrameDescriptors {
+    struct DescriptorPoolBlock {
         nri::DescriptorPool* Pool = nullptr;
         std::vector<nri::DescriptorSet*> Sets;
+    };
+    struct FrameDescriptors {
+        std::vector<DescriptorPoolBlock> Pools;
         std::vector<nri::Descriptor*> TransientViews;
         std::unique_ptr<NriPicaUploadArena> UploadArena;
         uint64_t FrameId = std::numeric_limits<uint64_t>::max();
-        uint32_t Used = 0;
+        size_t Used = 0;
+        // The seam binding of draws without seam data (one of TransientViews).
+        nri::Descriptor* SeamFallback = nullptr;
+        VkBuffer SeamFallbackBuffer = VK_NULL_HANDLE;
     };
     std::vector<FrameDescriptors> Frames;
     std::map<NriPicaSamplerKey, nri::Descriptor*> Samplers;
+    // Last sampler per texture slot in BindOwnedDraw.
+    std::array<std::pair<NriPicaSamplerKey, nri::Descriptor*>, kTextureSlotCount> RecentSamplers{};
     bool OwnedDraws = false;
     bool PreferOwnedUploads = false;
     bool PipelineLibrariesEnabled = false;
+    bool PipelineLibrariesAvailable = false;
     bool LastDrawUploadsOwned = false;
     uint64_t LastDrawUploadBytes = 0;
+    uint32_t DescriptorSetsPerPool = 0;
+
+    bool AddDescriptorPool(FrameDescriptors& frame, nri::CoreInterface& core,
+                           nri::Device& device) {
+        frame.Pools.emplace_back();
+        auto& block = frame.Pools.back();
+        block.Sets.resize(DescriptorSetsPerPool);
+        nri::DescriptorPoolDesc pool{};
+        pool.descriptorSetMaxNum = DescriptorSetsPerPool;
+        pool.constantBufferMaxNum =
+            static_cast<uint32_t>(std::tuple_size_v<decltype(NriPicaOwnedDrawDesc::Uniforms)>) *
+            DescriptorSetsPerPool;
+        pool.textureMaxNum = static_cast<uint32_t>(kTextureSlotCount) * DescriptorSetsPerPool;
+        pool.storageTextureMaxNum = DescriptorSetsPerPool;
+        pool.samplerMaxNum = static_cast<uint32_t>(kTextureSlotCount) * DescriptorSetsPerPool;
+        pool.structuredBufferMaxNum = DescriptorSetsPerPool;
+        if (core.CreateDescriptorPool(device, pool, block.Pool) != nri::Result::SUCCESS ||
+            core.AllocateDescriptorSets(*block.Pool, *DescriptorLayout, 0,
+                block.Sets.data(), DescriptorSetsPerPool, 0) != nri::Result::SUCCESS) {
+            if (block.Pool != nullptr) core.DestroyDescriptorPool(block.Pool);
+            frame.Pools.pop_back();
+            return false;
+        }
+        return true;
+    }
 #endif
 };
 
@@ -254,7 +320,8 @@ bool NriPicaPipelineBridge::Initialize(
     return false;
 #else
     if (config.FrameSlotCount == 0U ||
-        config.MaxDrawsPerFrame == 0U) {
+        config.DescriptorSetsPerPool == 0U ||
+        config.DescriptorSetsPerPool > std::numeric_limits<uint32_t>::max() / 9U) {
         mImpl->Reason = "NRI PICA execution configuration is invalid";
         return false;
     }
@@ -272,6 +339,8 @@ bool NriPicaPipelineBridge::Initialize(
                 return nri::DescriptorType::STORAGE_TEXTURE;
             case PicaNriDescriptorKind::Sampler:
                 return nri::DescriptorType::SAMPLER;
+            case PicaNriDescriptorKind::StructuredBuffer:
+                return nri::DescriptorType::STRUCTURED_BUFFER;
         }
         return nri::DescriptorType::MUTABLE;
     };
@@ -319,32 +388,20 @@ bool NriPicaPipelineBridge::Initialize(
     mImpl->OwnedDraws = config.OwnedDraws;
     mImpl->PreferOwnedUploads = config.PreferOwnedUploads;
     mImpl->PipelineLibrariesEnabled = config.PipelineLibrariesEnabled;
+    mImpl->PipelineLibrariesAvailable =
+        config.PipelineLibrariesEnabled || config.PipelineLibrariesAvailable;
+    mImpl->DescriptorSetsPerPool = config.DescriptorSetsPerPool;
     if (mImpl->OwnedDraws) {
         for (auto& frame : mImpl->Frames) {
-            nri::DescriptorPoolDesc pool{};
-            pool.descriptorSetMaxNum = config.MaxDrawsPerFrame;
-            pool.constantBufferMaxNum =
-                5U * config.MaxDrawsPerFrame;
-            pool.textureMaxNum = 5U * config.MaxDrawsPerFrame;
-            pool.storageTextureMaxNum = config.MaxDrawsPerFrame;
-            pool.samplerMaxNum = 5U * config.MaxDrawsPerFrame;
-            frame.Sets.resize(config.MaxDrawsPerFrame);
-            if (core->CreateDescriptorPool(
-                    *device, pool, frame.Pool) !=
-                    nri::Result::SUCCESS ||
-                core->AllocateDescriptorSets(
-                    *frame.Pool, *mImpl->DescriptorLayout, 0,
-                    frame.Sets.data(),
-                    static_cast<uint32_t>(frame.Sets.size()), 0) !=
-                    nri::Result::SUCCESS) {
+            if (!mImpl->AddDescriptorPool(frame, *core, *device)) {
                 mImpl->OwnedDraws = false;
                 break;
             }
         }
         if (!mImpl->OwnedDraws) {
             for (auto& frame : mImpl->Frames) {
-                if (frame.Pool != nullptr)
-                    core->DestroyDescriptorPool(frame.Pool);
+                for (const auto& block : frame.Pools)
+                    core->DestroyDescriptorPool(block.Pool);
                 frame = {};
             }
         }
@@ -360,6 +417,7 @@ bool NriPicaPipelineBridge::InitializePipelineCache(std::span<const uint8_t> dat
     return false;
 #else
     if (!Available()) return false;
+    std::lock_guard lock(mImpl->PipelineCacheMutex);
     if (mImpl->PipelineCacheAttempted) return mImpl->PipelineCache != nullptr;
     mImpl->PipelineCacheAttempted = true;
     nri::PipelineCacheDesc desc{};
@@ -367,8 +425,10 @@ bool NriPicaPipelineBridge::InitializePipelineCache(std::span<const uint8_t> dat
     desc.size = data.size();
     auto* core = mImpl->Interop->Core();
     auto result = core->CreatePipelineCache(*mImpl->Interop->Device(), desc, mImpl->PipelineCache);
-    if (result == nri::Result::SUCCESS && mImpl->PipelineCache != nullptr)
+    if (result == nri::Result::SUCCESS && mImpl->PipelineCache != nullptr) {
+        std::lock_guard statistics(mImpl->StatisticsMutex);
         mImpl->Statistics.InitialCacheBytes = data.size();
+    }
     if (result != nri::Result::SUCCESS && !data.empty()) {
         mImpl->PipelineCache = nullptr;
         desc = {};
@@ -386,8 +446,12 @@ std::vector<uint8_t> NriPicaPipelineBridge::GetPipelineCacheData() const {
     if (!Available() || mImpl->PipelineCache == nullptr) return {};
     auto* core = mImpl->Interop->Core();
     uint64_t size = 0;
+    // No size policy here: the store keeps or drops the cache (it outgrows the
+    // plain 64 MiB limit; capping it here once left it silently unsaved).
+    // Only an implausible size is refused before allocating it.
+    constexpr uint64_t kImplausibleBytes = 4ULL * kMaximumNriPipelineCacheBytes;
     if (core->GetPipelineCacheData(*mImpl->PipelineCache, nullptr, size) != nri::Result::SUCCESS ||
-        size == 0 || size > 64ULL * 1024ULL * 1024ULL) return {};
+        size == 0 || size > kImplausibleBytes) return {};
     std::vector<uint8_t> data(static_cast<size_t>(size));
     if (core->GetPipelineCacheData(*mImpl->PipelineCache, data.data(), size) != nri::Result::SUCCESS ||
         size == 0 || size > data.size()) return {};
@@ -396,8 +460,85 @@ std::vector<uint8_t> NriPicaPipelineBridge::GetPipelineCacheData() const {
 #endif
 }
 
+uint64_t NriPicaTraceProgramHash(std::span<const uint32_t> words) noexcept {
+    uint64_t hash = 1469598103934665603ULL;
+    for (const uint32_t word : words)
+        for (int shift = 0; shift < 32; shift += 8) {
+            hash ^= (word >> shift) & 0xffU;
+            hash *= 1099511628211ULL;
+        }
+    return hash;
+}
+
+bool NriPicaPipelineTraceEnabled() noexcept {
+    static const bool enabled = [] {
+        const char* value = std::getenv("TRIAEVUM_NRI_PIPELINE_TRACE");
+        return value != nullptr && value[0] == '1';
+    }();
+    return enabled;
+}
+
 #ifdef ENABLE_RENDERER3DS_NRI
-nri::Pipeline* NriPicaPipelineBridge::CreatePipeline(const NriPicaGraphicsPipelineDesc& desc) {
+namespace {
+// TRIAEVUM_NRI_PIPELINE_TRACE=1: one line per created pipeline with the full
+// creation input (programs by content hash), so a prepared cache can be
+// compared field by field with what a game session creates.
+void TracePipelineCreation(const NriPicaGraphicsPipelineDesc& desc, bool libraries, long long nanoseconds) {
+    if (!NriPicaPipelineTraceEnabled())
+        return;
+    std::string line = "TRIAEVUM_NRI_PIPELINE_CREATE";
+    char buffer[160];
+    std::snprintf(buffer, sizeof(buffer), " vs=%016llx fs=%016llx libraries=%u ms=%.3f",
+                  static_cast<unsigned long long>(NriPicaTraceProgramHash(desc.VertexSpirv)),
+                  static_cast<unsigned long long>(NriPicaTraceProgramHash(desc.FragmentSpirv)), libraries ? 1U : 0U,
+                  static_cast<double>(nanoseconds) / 1.0e6);
+    line += buffer;
+    std::snprintf(buffer, sizeof(buffer),
+                  " topo=%u cull=%u front=%u samples=%u a2c=%u depth=%u/%u/%u stencil=%u logic=%u/%u ds=%u colors=%u",
+                  unsigned(desc.Topology), unsigned(desc.CullMode), unsigned(desc.FrontFace), unsigned(desc.Samples),
+                  unsigned(desc.AlphaToCoverage), unsigned(desc.DepthTest), unsigned(desc.DepthWrite),
+                  unsigned(desc.DepthCompare), unsigned(desc.StencilTest), unsigned(desc.LogicOpEnabled),
+                  unsigned(desc.LogicOp), unsigned(desc.DepthStencilFormat), desc.ColorAttachmentCount);
+    line += buffer;
+    if (desc.StencilTest) {
+        for (const auto* face : { &desc.FrontStencil, &desc.BackStencil }) {
+            std::snprintf(buffer, sizeof(buffer), " st=%u/%u/%u/%u/%x/%x", unsigned(face->failOp),
+                          unsigned(face->passOp), unsigned(face->depthFailOp), unsigned(face->compareOp),
+                          face->compareMask, face->writeMask);
+            line += buffer;
+        }
+    }
+    for (uint32_t index = 0; index < desc.ColorAttachmentCount && index < desc.Colors.size(); ++index) {
+        const auto& color = desc.Colors[index];
+        std::snprintf(buffer, sizeof(buffer), " c%u=%u:%u:%u/%u/%u/%u/%u/%u:%x", index,
+                      unsigned(desc.ColorFormats[index]), unsigned(color.blendEnable),
+                      unsigned(color.srcColorBlendFactor), unsigned(color.dstColorBlendFactor),
+                      unsigned(color.colorBlendOp), unsigned(color.srcAlphaBlendFactor),
+                      unsigned(color.dstAlphaBlendFactor), unsigned(color.alphaBlendOp), color.colorWriteMask);
+        line += buffer;
+    }
+    for (const auto& binding : desc.VertexBindings) {
+        std::snprintf(buffer, sizeof(buffer), " b%u=%u/%u", binding.binding, binding.stride,
+                      unsigned(binding.inputRate));
+        line += buffer;
+    }
+    for (const auto& attribute : desc.VertexAttributes) {
+        std::snprintf(buffer, sizeof(buffer), " a%u=%u/%u/%u", attribute.location, attribute.binding,
+                      unsigned(attribute.format), attribute.offset);
+        line += buffer;
+    }
+    line += '\n';
+    std::fputs(line.c_str(), stderr);
+}
+} // namespace
+
+nri::PipelineCache* NriPicaPipelineBridge::PipelineCache() const {
+    std::lock_guard lock(mImpl->PipelineCacheMutex);
+    return mImpl->PipelineCache;
+}
+
+nri::Pipeline* NriPicaPipelineBridge::CreatePipeline(const NriPicaGraphicsPipelineDesc& desc,
+                                                     NriPicaPipelineFactory factory) {
     if (!Available() || desc.VertexSpirv.empty() || desc.FragmentSpirv.empty() ||
         desc.ColorAttachmentCount == 0U || desc.ColorAttachmentCount > kPicaColorAttachmentCount ||
         desc.VertexBindings.size() > std::numeric_limits<uint8_t>::max() ||
@@ -518,7 +659,10 @@ nri::Pipeline* NriPicaPipelineBridge::CreatePipeline(const NriPicaGraphicsPipeli
     }
     pipeline.shaders = shaders.data();
     pipeline.shaderNum = static_cast<uint32_t>(shaders.size());
-    if (mImpl->PipelineLibrariesEnabled)
+    const bool libraries = factory == NriPicaPipelineFactory::Libraries
+        ? mImpl->PipelineLibrariesAvailable
+        : factory == NriPicaPipelineFactory::Default && mImpl->PipelineLibrariesEnabled;
+    if (libraries)
         pipeline.flags = nri::GraphicsPipelineBits::USE_GRAPHICS_PIPELINE_LIBRARY;
     // Reuse driver compilation across layout/raster variants and Reset().
     // Cache failure is non-fatal: the same canonical pipeline remains valid.
@@ -526,11 +670,14 @@ nri::Pipeline* NriPicaPipelineBridge::CreatePipeline(const NriPicaGraphicsPipeli
     pipeline.cache = mImpl->PipelineCache;
     nri::Pipeline* owned = nullptr;
     const auto start = std::chrono::steady_clock::now();
-    ++mImpl->Statistics.CreationAttempts;
     const auto result = mImpl->Interop->Core()->CreateGraphicsPipeline(
         *mImpl->Interop->Device(), pipeline, owned);
-    mImpl->Statistics.CreationNanoseconds += std::chrono::duration_cast<std::chrono::nanoseconds>(
+    const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now() - start).count();
+    TracePipelineCreation(desc, libraries, elapsed);
+    std::lock_guard statistics(mImpl->StatisticsMutex);
+    ++mImpl->Statistics.CreationAttempts;
+    mImpl->Statistics.CreationNanoseconds += elapsed;
     if (result != nri::Result::SUCCESS || owned == nullptr)
         return nullptr;
     ++mImpl->Statistics.Created;
@@ -538,12 +685,14 @@ nri::Pipeline* NriPicaPipelineBridge::CreatePipeline(const NriPicaGraphicsPipeli
 }
 #endif
 
-bool NriPicaPipelineBridge::PreparePipeline(const NriPicaGraphicsPipelineDesc& desc) {
+bool NriPicaPipelineBridge::PreparePipeline(const NriPicaGraphicsPipelineDesc& desc,
+                                            NriPicaPipelineFactory factory) {
 #ifndef ENABLE_RENDERER3DS_NRI
     (void)desc;
+    (void)factory;
     return false;
 #else
-    auto* pipeline = CreatePipeline(desc);
+    auto* pipeline = CreatePipeline(desc, factory);
     if (!pipeline) return false;
     mImpl->Interop->Core()->DestroyPipeline(pipeline);
     return true;
@@ -551,26 +700,189 @@ bool NriPicaPipelineBridge::PreparePipeline(const NriPicaGraphicsPipelineDesc& d
 }
 
 NriPicaPipelineStatistics NriPicaPipelineBridge::PipelineStatistics() const {
+    std::lock_guard statistics(mImpl->StatisticsMutex);
     return mImpl->Statistics;
 }
 
-bool NriPicaPipelineBridge::CreateOwnedPipeline(
-    NriPicaPipelineId pipelineId, const NriPicaGraphicsPipelineDesc& desc) {
+#ifdef ENABLE_RENDERER3DS_NRI
+namespace {
+bool UsesBlendConstants(const NriPicaGraphicsPipelineDesc& desc) {
+    return std::any_of(desc.Colors.begin(), desc.Colors.end(),
+        [](const VkPipelineColorBlendAttachmentState& color) {
+            return ReferencesBlendConstants(color.srcColorBlendFactor) ||
+                   ReferencesBlendConstants(color.dstColorBlendFactor) ||
+                   ReferencesBlendConstants(color.srcAlphaBlendFactor) ||
+                   ReferencesBlendConstants(color.dstAlphaBlendFactor);
+        });
+}
+
+bool ValidOwnedDesc(const NriPicaGraphicsPipelineDesc& desc) {
+    return !desc.VertexSpirv.empty() && !desc.FragmentSpirv.empty() &&
+           desc.ColorAttachmentCount != 0 && desc.ColorAttachmentCount <= kPicaColorAttachmentCount;
+}
+} // namespace
+
+void NriPicaPipelineBridge::AdoptOwnedPipeline(
+    NriPicaPipelineId pipelineId, std::shared_ptr<nri::Pipeline> owned,
+    const NriPicaGraphicsPipelineDesc& desc) {
+    mImpl->OwnedPipelines.emplace(pipelineId, std::move(owned));
+    mImpl->OwnedPipelineUsesBlendConstants.emplace(pipelineId, UsesBlendConstants(desc));
+}
+#endif
+
+NriPicaPipelineRequest NriPicaPipelineBridge::RequestOwnedPipeline(
+    NriPicaPipelineId pipelineId, const NriPicaGraphicsPipelineDesc& desc,
+    NriPicaPipelineFactory factory, PicaPreparationQueue& queue) {
 #ifndef ENABLE_RENDERER3DS_NRI
     (void)pipelineId;
     (void)desc;
+    (void)factory;
+    (void)queue;
+    return NriPicaPipelineRequest::Failed;
+#else
+    if (mImpl->OwnedPipelines.contains(pipelineId)) return NriPicaPipelineRequest::Ready;
+    if (mImpl->FailedOwned.contains(pipelineId)) return NriPicaPipelineRequest::Failed;
+    if (mImpl->PendingOwned.contains(pipelineId)) return PollOwnedPipeline(pipelineId);
+    if (!pipelineId || !Available() || !ValidOwnedDesc(desc)) {
+        mImpl->FailedOwned.insert(pipelineId);
+        return NriPicaPipelineRequest::Failed;
+    }
+    auto key = mImpl->OwnedPipelineIdentity.Build(desc);
+    if (auto owned = mImpl->OwnedPipelineObjects.Find(key)) {
+        std::lock_guard statistics(mImpl->StatisticsMutex);
+        ++mImpl->Statistics.OwnedReuses;
+        AdoptOwnedPipeline(pipelineId, std::move(owned), desc);
+        return NriPicaPipelineRequest::Ready;
+    }
+    if (const auto pending = mImpl->PendingCreations.find(key); pending != mImpl->PendingCreations.end()) {
+        pending->second->Ids.push_back(pipelineId);
+        mImpl->PendingOwned.emplace(pipelineId, pending->second);
+        return PollOwnedPipeline(pipelineId);
+    }
+    auto creation = std::make_shared<Impl::OwnedCreation>();
+    creation->Desc = desc;
+    creation->Vertex.assign(desc.VertexSpirv.begin(), desc.VertexSpirv.end());
+    creation->Fragment.assign(desc.FragmentSpirv.begin(), desc.FragmentSpirv.end());
+    creation->Bindings.assign(desc.VertexBindings.begin(), desc.VertexBindings.end());
+    creation->Attributes.assign(desc.VertexAttributes.begin(), desc.VertexAttributes.end());
+    creation->Desc.VertexSpirv = creation->Vertex;
+    creation->Desc.FragmentSpirv = creation->Fragment;
+    creation->Desc.VertexBindings = creation->Bindings;
+    creation->Desc.VertexAttributes = creation->Attributes;
+    creation->Factory = factory;
+    creation->Key = key;
+    creation->Ids.push_back(pipelineId);
+    creation->Queue = &queue;
+    {
+        std::lock_guard statistics(mImpl->StatisticsMutex);
+        ++mImpl->Statistics.BackgroundRequests;
+    }
+    // Reset() completes every pending creation before the bridge state goes.
+    creation->Task = queue.Submit([this, raw = creation.get()] {
+        raw->Result = CreatePipeline(raw->Desc, raw->Factory);
+    });
+    mImpl->PendingCreations.emplace(std::move(key), creation);
+    mImpl->PendingOwned.emplace(pipelineId, std::move(creation));
+    return PollOwnedPipeline(pipelineId);
+#endif
+}
+
+NriPicaPipelineRequest NriPicaPipelineBridge::PollOwnedPipeline(NriPicaPipelineId pipelineId) {
+#ifndef ENABLE_RENDERER3DS_NRI
+    (void)pipelineId;
+    return NriPicaPipelineRequest::Failed;
+#else
+    if (mImpl->OwnedPipelines.contains(pipelineId)) return NriPicaPipelineRequest::Ready;
+    const auto pending = mImpl->PendingOwned.find(pipelineId);
+    if (pending == mImpl->PendingOwned.end()) return NriPicaPipelineRequest::Failed;
+    const auto creation = pending->second;
+    if (!creation->Task->Done()) return NriPicaPipelineRequest::Pending;
+    mImpl->PendingCreations.erase(creation->Key);
+    if (creation->Result == nullptr) {
+        for (const auto id : creation->Ids) {
+            mImpl->PendingOwned.erase(id);
+            mImpl->FailedOwned.insert(id);
+        }
+        return NriPicaPipelineRequest::Failed;
+    }
+    std::shared_ptr<nri::Pipeline> owned(creation->Result,
+        [core = mImpl->Interop->Core()](nri::Pipeline* value) { core->DestroyPipeline(value); });
+    creation->Result = nullptr;
+    {
+        std::lock_guard statistics(mImpl->StatisticsMutex);
+        ++mImpl->Statistics.BackgroundCreated;
+    }
+    for (const auto id : creation->Ids) {
+        mImpl->PendingOwned.erase(id);
+        AdoptOwnedPipeline(id, owned, creation->Desc);
+    }
+    mImpl->OwnedPipelineObjects.Retain(creation->Key, std::move(owned));
+    return mImpl->OwnedPipelines.contains(pipelineId) ? NriPicaPipelineRequest::Ready
+                                                      : NriPicaPipelineRequest::Failed;
+#endif
+}
+
+NriPicaPipelineRequest NriPicaPipelineBridge::CompleteOwnedPipeline(NriPicaPipelineId pipelineId) {
+#ifndef ENABLE_RENDERER3DS_NRI
+    (void)pipelineId;
+    return NriPicaPipelineRequest::Failed;
+#else
+    const auto pending = mImpl->PendingOwned.find(pipelineId);
+    if (pending != mImpl->PendingOwned.end() && !pending->second->Task->Done()) {
+        {
+            std::lock_guard statistics(mImpl->StatisticsMutex);
+            ++mImpl->Statistics.BackgroundCompletions;
+        }
+        const auto creation = pending->second;
+        creation->Queue->Complete(*creation->Task);
+    }
+    return PollOwnedPipeline(pipelineId);
+#endif
+}
+
+size_t NriPicaPipelineBridge::PendingOwnedPipelineCount() const {
+#ifdef ENABLE_RENDERER3DS_NRI
+    return mImpl->PendingCreations.size();
+#else
+    return 0U;
+#endif
+}
+
+#ifdef ENABLE_RENDERER3DS_NRI
+void NriPicaPipelineBridge::CompleteAllPendingPipelines() {
+    for (const auto& [key, creation] : mImpl->PendingCreations) {
+        creation->Queue->Complete(*creation->Task);
+        if (creation->Result != nullptr && mImpl->Interop != nullptr)
+            mImpl->Interop->Core()->DestroyPipeline(creation->Result);
+        creation->Result = nullptr;
+    }
+    mImpl->PendingCreations.clear();
+    mImpl->PendingOwned.clear();
+    mImpl->FailedOwned.clear();
+}
+#endif
+
+bool NriPicaPipelineBridge::CreateOwnedPipeline(
+    NriPicaPipelineId pipelineId, const NriPicaGraphicsPipelineDesc& desc,
+    NriPicaPipelineFactory factory) {
+#ifndef ENABLE_RENDERER3DS_NRI
+    (void)pipelineId;
+    (void)desc;
+    (void)factory;
     return false;
 #else
+    if (mImpl->PendingOwned.contains(pipelineId))
+        return CompleteOwnedPipeline(pipelineId) == NriPicaPipelineRequest::Ready;
     if (!pipelineId || mImpl->OwnedPipelines.contains(pipelineId) || !Available() ||
-        desc.VertexSpirv.empty() || desc.FragmentSpirv.empty() ||
-        desc.ColorAttachmentCount == 0 || desc.ColorAttachmentCount > kPicaColorAttachmentCount)
+        !ValidOwnedDesc(desc))
         return false;
     auto key = mImpl->OwnedPipelineIdentity.Build(desc);
     auto owned = mImpl->OwnedPipelineObjects.Find(key);
     if (owned) {
+        std::lock_guard statistics(mImpl->StatisticsMutex);
         ++mImpl->Statistics.OwnedReuses;
     } else {
-        auto* pipeline = CreatePipeline(desc);
+        auto* pipeline = CreatePipeline(desc, factory);
         if (!pipeline) {
             return false;
         }
@@ -580,21 +892,7 @@ bool NriPicaPipelineBridge::CreateOwnedPipeline(
             });
         mImpl->OwnedPipelineObjects.Retain(std::move(key), owned);
     }
-    mImpl->OwnedPipelines.emplace(pipelineId, std::move(owned));
-    const bool usesBlendConstants = std::any_of(
-        desc.Colors.begin(), desc.Colors.end(),
-        [](const VkPipelineColorBlendAttachmentState& color) {
-            return ReferencesBlendConstants(
-                       color.srcColorBlendFactor) ||
-                   ReferencesBlendConstants(
-                       color.dstColorBlendFactor) ||
-                   ReferencesBlendConstants(
-                       color.srcAlphaBlendFactor) ||
-                   ReferencesBlendConstants(
-                       color.dstAlphaBlendFactor);
-        });
-    mImpl->OwnedPipelineUsesBlendConstants.emplace(
-        pipelineId, usesBlendConstants);
+    AdoptOwnedPipeline(pipelineId, std::move(owned), desc);
     return true;
 #endif
 }
@@ -629,17 +927,24 @@ bool NriPicaPipelineBridge::BindOwnedDraw(
     nri::Device* device = mImpl->Interop->Device();
     if (pipeline == mImpl->OwnedPipelines.end() ||
         command == nullptr || core == nullptr || device == nullptr ||
-        frame.Pool == nullptr)
+        frame.Pools.empty())
         return false;
     if (frame.FrameId != desc.FrameId) {
         for (nri::Descriptor* view : frame.TransientViews)
             core->DestroyDescriptor(view);
         frame.TransientViews.clear();
+        frame.SeamFallback = nullptr;
+        frame.SeamFallbackBuffer = VK_NULL_HANDLE;
         frame.FrameId = desc.FrameId;
         frame.Used = 0;
     }
-    if (frame.Used >= frame.Sets.size())
+    const size_t poolIndex = frame.Used / mImpl->DescriptorSetsPerPool;
+    // Earlier sets are already referenced by recorded commands. Retain their
+    // pools and reuse every block only when this frame slot's fence has passed.
+    if (poolIndex == frame.Pools.size() &&
+        !mImpl->AddDescriptorPool(frame, *core, *device))
         return false;
+    auto& descriptorPool = frame.Pools[poolIndex];
 
     nri::Buffer* uniformBuffer = nullptr;
     nri::Buffer* vertexBuffer = nullptr;
@@ -662,7 +967,7 @@ bool NriPicaPipelineBridge::BindOwnedDraw(
         frame.UploadArena->Configure(
             *core, *device, desc.UniformBufferSize,
             desc.VertexBufferSize)) {
-        std::array<PicaNriUploadRange, 5> uniformRanges{};
+        std::array<PicaNriUploadRange, kNriPicaUniformBindingCount> uniformRanges{};
         for (size_t index = 0; index < uniformRanges.size(); ++index) {
             uniformRanges[index] = {
                 desc.Uniforms[index].Offset,
@@ -709,7 +1014,7 @@ bool NriPicaPipelineBridge::BindOwnedDraw(
             return false;
     }
 
-    std::array<nri::Descriptor*, 5> constantBuffers{};
+    std::array<nri::Descriptor*, kNriPicaUniformBindingCount> constantBuffers{};
     for (size_t index = 0; index < constantBuffers.size(); ++index) {
         const auto& source = desc.Uniforms[index];
         if (source.Size == 0U ||
@@ -737,13 +1042,60 @@ bool NriPicaPipelineBridge::BindOwnedDraw(
         frame.TransientViews.push_back(constantBuffers[index]);
     }
 
-    std::array<NriPicaTextureBindingDesc, 5> textureSources{};
+    // Keep the source arena for seam data even when the optional NRI upload
+    // arena owns the seven constant ranges. No second copy of geometry metadata.
+    nri::Descriptor* seamBuffer = nullptr;
+    if (desc.SeamGeometry.Size != 0) {
+        if (!mImpl->Interop->WrapBuffer(desc.UniformBuffer, desc.UniformBufferSize, desc.UniformMappedMemory))
+            return false;
+        const auto seamRange = desc.SeamGeometry;
+        if (seamRange.Offset > desc.UniformBufferSize ||
+            seamRange.Size > desc.UniformBufferSize - seamRange.Offset)
+            return false;
+        nri::BufferViewDesc seamView{};
+        seamView.buffer = mImpl->Interop->Buffer(desc.UniformBuffer);
+        seamView.type = nri::BufferView::STRUCTURED_BUFFER;
+        seamView.structureStride = 16;
+        seamView.offset = seamRange.Offset;
+        seamView.size = seamRange.Size;
+        if (core->CreateBufferView(seamView, seamBuffer) != nri::Result::SUCCESS)
+            return false;
+        frame.TransientViews.push_back(seamBuffer);
+    } else {
+        // Binding 26 is in every set, and the always-available surface programs
+        // declare it (they read it only when the draw's decisions select seam
+        // softening). A draw without seam data binds a valid view instead of
+        // leaving a statically used descriptor unwritten.
+        if (frame.SeamFallback == nullptr || frame.SeamFallbackBuffer != desc.UniformBuffer) {
+            if (desc.UniformBufferSize < 16U ||
+                !mImpl->Interop->WrapBuffer(desc.UniformBuffer, desc.UniformBufferSize, desc.UniformMappedMemory))
+                return false;
+            nri::BufferViewDesc fallback{};
+            fallback.buffer = mImpl->Interop->Buffer(desc.UniformBuffer);
+            fallback.type = nri::BufferView::STRUCTURED_BUFFER;
+            fallback.structureStride = 16;
+            fallback.offset = 0;
+            fallback.size = 16;
+            nri::Descriptor* view = nullptr;
+            if (core->CreateBufferView(fallback, view) != nri::Result::SUCCESS)
+                return false;
+            frame.TransientViews.push_back(view);
+            frame.SeamFallback = view;
+            frame.SeamFallbackBuffer = desc.UniformBuffer;
+        }
+        seamBuffer = frame.SeamFallback;
+    }
+
+    std::array<NriPicaTextureBindingDesc, kTextureSlotCount> textureSources{};
     std::copy(desc.Textures.begin(), desc.Textures.end(),
               textureSources.begin());
     textureSources[3] = desc.DirectionalShadowTexture;
     textureSources[4] = desc.LightingLutTexture;
-    std::array<nri::Descriptor*, 5> textures{};
-    std::array<nri::Descriptor*, 5> samplers{};
+    std::copy(desc.PbrTextures.begin(), desc.PbrTextures.end(), textureSources.begin() + 5);
+    textureSources[9] = desc.PointShadowTexture;
+    textureSources[10] = desc.ContactShadowTexture;
+    std::array<nri::Descriptor*, kTextureSlotCount> textures{};
+    std::array<nri::Descriptor*, kTextureSlotCount> samplers{};
     for (size_t index = 0; index < textures.size(); ++index) {
         const auto& source = textureSources[index];
         if (source.Image == VK_NULL_HANDLE ||
@@ -763,6 +1115,15 @@ bool NriPicaPipelineBridge::BindOwnedDraw(
             source.MinFilter, source.MagFilter, source.MipmapMode,
             source.AddressU, source.AddressV, source.MipBias,
             source.MinLod, source.MaxLod, source.Integer};
+        // Consecutive draws mostly repeat each slot's sampler. Equal keys are
+        // equivalent under the map's ordering, and map entries live until
+        // Shutdown resets the whole Impl, so the remembered descriptor is the
+        // one the lookup would return.
+        auto& recent = mImpl->RecentSamplers[index];
+        if (recent.second != nullptr && recent.first == key) {
+            samplers[index] = recent.second;
+            continue;
+        }
         auto [sampler, inserted] =
             mImpl->Samplers.try_emplace(key, nullptr);
         if (inserted) {
@@ -790,6 +1151,7 @@ bool NriPicaPipelineBridge::BindOwnedDraw(
             }
         }
         samplers[index] = sampler->second;
+        recent = {key, sampler->second};
     }
 
     if (!mImpl->Interop->WrapTexture(
@@ -802,8 +1164,9 @@ bool NriPicaPipelineBridge::BindOwnedDraw(
     if (storage == nullptr)
         return false;
 
-    nri::DescriptorSet* set = frame.Sets[frame.Used++];
-    const std::array<nri::UpdateDescriptorRangeDesc, 16> updates{{
+    nri::DescriptorSet* set =
+        descriptorPool.Sets[frame.Used++ % mImpl->DescriptorSetsPerPool];
+    const std::array<nri::UpdateDescriptorRangeDesc, kPicaNriDescriptorBindings.size()> updates{{
         {set, 0, 0, &constantBuffers[0], 1},
         {set, 1, 0, &textures[0], 1},
         {set, 2, 0, &textures[1], 1},
@@ -820,10 +1183,25 @@ bool NriPicaPipelineBridge::BindOwnedDraw(
         {set, 13, 0, &textures[4], 1},
         {set, 14, 0, &samplers[4], 1},
         {set, 15, 0, &constantBuffers[4], 1},
+        {set, 16, 0, &constantBuffers[5], 1},
+        {set, 17, 0, &constantBuffers[6], 1},
+        {set, 18, 0, &textures[5], 1},
+        {set, 19, 0, &textures[6], 1},
+        {set, 20, 0, &textures[7], 1},
+        {set, 21, 0, &samplers[5], 1},
+        {set, 22, 0, &samplers[6], 1},
+        {set, 23, 0, &samplers[7], 1},
+        {set, 24, 0, &textures[8], 1},
+        {set, 25, 0, &samplers[8], 1},
+        {set, 27, 0, &textures[9], 1},
+        {set, 28, 0, &samplers[9], 1},
+        {set, 29, 0, &textures[10], 1},
+        {set, 30, 0, &samplers[10], 1},
+        // The draw's seam data, or the frame's fallback view.
+        {set, 26, 0, &seamBuffer, 1},
     }};
-    core->UpdateDescriptorRanges(
-        updates.data(), static_cast<uint32_t>(updates.size()));
-    core->CmdSetDescriptorPool(*command, *frame.Pool);
+    core->UpdateDescriptorRanges(updates.data(), static_cast<uint32_t>(updates.size()));
+    core->CmdSetDescriptorPool(*command, *descriptorPool.Pool);
     core->CmdSetPipelineLayout(
         *command, nri::BindPoint::GRAPHICS,
         *mImpl->DescriptorLayout);
@@ -952,6 +1330,13 @@ bool NriPicaPipelineBridge::Bind(
 
 void NriPicaPipelineBridge::ForgetOwned(NriPicaPipelineId pipelineId) {
 #ifdef ENABLE_RENDERER3DS_NRI
+    mImpl->FailedOwned.erase(pipelineId);
+    if (const auto pending = mImpl->PendingOwned.find(pipelineId); pending != mImpl->PendingOwned.end()) {
+        // The creation continues for the other ids that asked for it.
+        auto& ids = pending->second->Ids;
+        ids.erase(std::remove(ids.begin(), ids.end(), pipelineId), ids.end());
+        mImpl->PendingOwned.erase(pending);
+    }
     if (const auto owned = mImpl->OwnedPipelines.find(pipelineId);
         owned != mImpl->OwnedPipelines.end()) {
         mImpl->OwnedPipelines.erase(owned);
@@ -976,6 +1361,7 @@ void NriPicaPipelineBridge::Forget(VkPipeline pipeline) {
 
 void NriPicaPipelineBridge::Reset() {
 #ifdef ENABLE_RENDERER3DS_NRI
+    CompleteAllPendingPipelines();
     if (mImpl->Interop != nullptr) {
         for (auto& [_, pipeline] : mImpl->Pipelines)
             mImpl->Interop->DestroyPipelineWrapper(pipeline);
@@ -997,8 +1383,8 @@ void NriPicaPipelineBridge::Shutdown() {
             for (nri::Descriptor* view : frame.TransientViews)
                 core->DestroyDescriptor(view);
             frame.UploadArena.reset();
-            if (frame.Pool != nullptr)
-                core->DestroyDescriptorPool(frame.Pool);
+            for (const auto& block : frame.Pools)
+                if (block.Pool != nullptr) core->DestroyDescriptorPool(block.Pool);
         }
         for (auto& [_, sampler] : mImpl->Samplers)
             core->DestroyDescriptor(sampler);
@@ -1010,7 +1396,7 @@ void NriPicaPipelineBridge::Shutdown() {
         mImpl->PipelineCache = nullptr;
     }
 #endif
-    *mImpl = {};
+    mImpl = std::make_unique<Impl>();
     mImpl->Reason = "NRI PICA pipeline bridge is not initialized";
 }
 
@@ -1031,7 +1417,7 @@ bool NriPicaPipelineBridge::DescriptorsOwnedByNri() const {
            std::all_of(
                mImpl->Frames.begin(), mImpl->Frames.end(),
                [](const Impl::FrameDescriptors& frame) {
-                   return frame.Pool != nullptr;
+                   return !frame.Pools.empty();
                });
 #else
     return false;

@@ -3,8 +3,10 @@
 #include "fast/renderer3ds/pica_composition.h"
 #include "fast/renderer3ds/pica_frame_timing.h"
 #include "fast/renderer3ds/pica_native_state.h"
+#include "fast/renderer3ds/pica_light_binding.h"
 #include "fast/renderer3ds/pica_shader_hooks.h"
 #include "fast/renderer3ds/pica_shader_source_identity.h"
+#include "fast/renderer3ds/pica_texture_copy_plan.h"
 #include "fast/renderer3ds/pica_vertex_artifact.h"
 
 #include <cmath>
@@ -27,6 +29,7 @@ struct PicaDrawView {
     PicaCompositionDomain CompositionDomain =
         PicaCompositionDomain::Unknown;
     PicaCompositionAttribution Composition;
+    PicaNativeLightBinding LightBinding;
     uint32_t CanonicalDescriptorSchemaVersion = 0;
     uint64_t CanonicalVertexProgramId = 0;
     uint64_t CanonicalFragmentProgramId = 0;
@@ -42,6 +45,13 @@ struct PicaDrawView {
     PicaShaderSourceIdentity FragmentShaderSourceIdentity;
     PicaTemporalVertexProgramView TemporalVertexProgram;
     PicaShaderHookLayout FragmentShaderHooks;
+    // The always-available program of the same draw (hybrid preparation):
+    // its parametric fragment program, drawn while the specialized program
+    // above is still being prepared. Empty when the draw has none.
+    uint64_t UberFragmentShaderKey = 0;
+    std::string_view UberFragmentShaderSource;
+    PicaShaderSourceIdentity UberFragmentShaderSourceIdentity;
+    PicaShaderHookLayout UberFragmentShaderHooks;
     PicaFragmentFeatureView FragmentFeatures;
     std::span<const uint8_t> VertexUniformBytes;
     std::span<const uint8_t> FragmentUniformBytes;
@@ -92,6 +102,9 @@ struct PicaDrawView {
     PicaCompareFunction DepthCompare = PicaCompareFunction::Always;
     PicaStencilState Stencil;
     std::span<const PicaVertexArtifact> VertexArtifacts;
+    // Explicit producer proof of a stationary world surface. Unknown/moving
+    // draws must not inherit camera-only history after a correspondence miss.
+    bool TemporalCameraOnly = false;
 };
 
 // Projects the full transient draw facade into the compact ordered metadata
@@ -133,6 +146,11 @@ struct PicaDisplayTransferView {
     PicaPresentationMode PresentationMode = PicaPresentationMode::Replace;
     uint32_t TextureCopyBytes = 0;
     uint64_t AfterDrawSubmissionId = 0;
+    // Real ordered execution still owing the guest a visible device write and
+    // one completion. Visibility may be backed by an immutable GPU producer
+    // plus guarded CPU materialization; it need not mean copying into RAM now.
+    // Replays/restored transfers leave this false and never complete twice.
+    bool MaterializeGuest = false;
 };
 
 struct PicaPhysicalMemoryWrite {
@@ -152,6 +170,26 @@ struct PicaMemoryFillView {
 enum class PicaTextureSnapshotFormat : uint8_t {
     Rgba8 = 0,
     R32Uint = 1,
+};
+
+// Producer identity of a record an ordered raw PICA TextureCopy produced. The
+// triple (RenderTargetNamespace, CompletionId, AfterDrawSubmissionId) is the
+// same key the backend registers the copy version under and the same identity a
+// sampled draw references, so a restore rebuilds the producer instead of
+// guessing it from content.
+struct PicaTextureCopyIdentity {
+    uint64_t RenderTargetNamespace = 0;
+    uint64_t CompletionId = 0;
+    uint64_t AfterDrawSubmissionId = 0;
+    // Copy source (the native color target the raw copy encoded).
+    uint32_t SourcePhysicalAddress = 0;
+    uint32_t SourceWidth = 0;
+    uint32_t SourceHeight = 0;
+    uint8_t SourceNativeFormat = 0;
+    // Destination subranges this producer owns.
+    std::vector<PicaRawCopySpan> Spans;
+    uint8_t ColorEncoding = 0;
+    bool SceneEffectsResolved = false;
 };
 
 // Portable decoded texture-cache entry. The source PICA identity is retained
@@ -182,6 +220,13 @@ struct PicaTextureCacheEntrySnapshot {
     uint64_t CustomReplacementHash = 0;
     bool CustomReplacementPending = false;
     bool CustomReplacementReady = false;
+    // Ordered raw-copy producer of this record, present only when the record is
+    // a GPU copy version. Ownership is never inferred from ContentHash, from
+    // the image size or from an absent hash: an entry with HasCopyProducer
+    // false is an ordinary texture. ImageWidth/ImageHeight/PixelBytes above
+    // remain the full captured GPU image at its internal extent.
+    bool HasCopyProducer = false;
+    PicaTextureCopyIdentity CopyProducer;
     std::vector<uint8_t> PixelBytes;
 };
 
@@ -195,11 +240,18 @@ struct PicaRenderTargetColorSnapshot {
     uint16_t FramebufferHeight = 0;
     uint8_t FramebufferColorFormat = 0;
     uint8_t FramebufferDepthFormat = 0;
+    // 0 (kPicaGuestExtentRenderScalePermille): stored at the framebuffer's
+    // guest extent with colour, depth and stencil only, recreated at the
+    // restoring renderer's scale. Otherwise a legacy snapshot at that scale
+    // with every guide.
     uint16_t RenderScalePermille = 1000;
     uint32_t ImageWidth = 0;
     uint32_t ImageHeight = 0;
     uint8_t SampleCount = 1;
     bool WBuffering = false;
+    // The saved colour is the content a resolved native boundary left, so a
+    // display of it before any further draw must not re-run the scene stages.
+    bool SceneEffectsResolved = false;
     std::vector<uint8_t> ColorRgba8;
     std::vector<uint8_t> NormalGuideRgba8;
     std::vector<uint8_t> MaterialGuideRgba8;
@@ -219,6 +271,10 @@ struct PicaDisplayImageColorSnapshot {
     uint32_t ImageWidth = 0;
     uint32_t ImageHeight = 0;
     bool Initialized = false;
+    // Same meaning as the color-target flag: the saved colour already carries
+    // resolved native effects, so a display of this image must not re-run the
+    // scene stages even when its source target is gone.
+    bool SceneEffectsResolved = false;
     std::vector<uint8_t> ColorRgba8;
 
     bool HasDepthTarget = false;
@@ -242,10 +298,19 @@ struct PicaPresentationStateSnapshot {
 class PicaRenderBackend {
   public:
     using PhysicalMemoryRead = std::function<bool(uint32_t, std::span<uint8_t>)>;
-    using PhysicalMemoryCommit = std::function<bool(uint64_t, std::span<const PicaPhysicalMemoryWrite>)>;
-    void SetPicaPhysicalMemoryAccess(PhysicalMemoryRead read, PhysicalMemoryCommit commit) {
+    using PhysicalMemoryCommit = std::function<bool(std::span<const PicaPhysicalMemoryWrite>)>;
+    using PhysicalMemoryDefer = std::function<bool(
+        std::span<const PicaRawCopySpan>, PhysicalMemoryRead)>;
+    using PhysicalMemoryComplete = std::function<bool(uint64_t)>;
+    using PhysicalMemoryBarrier = std::function<bool()>;
+    void SetPicaPhysicalMemoryAccess(PhysicalMemoryRead read, PhysicalMemoryCommit commit,
+                                     PhysicalMemoryDefer defer, PhysicalMemoryComplete complete,
+                                     PhysicalMemoryBarrier barrier) {
         mPhysicalMemoryRead = std::move(read);
         mPhysicalMemoryCommit = std::move(commit);
+        mPhysicalMemoryDefer = std::move(defer);
+        mPhysicalMemoryComplete = std::move(complete);
+        mPhysicalMemoryBarrier = std::move(barrier);
     }
     virtual ~PicaRenderBackend() = default;
 
@@ -264,6 +329,28 @@ class PicaRenderBackend {
 
     virtual bool SubmitPicaDraw(
         const PicaDrawView& draw, std::string* error = nullptr) = 0;
+    // Draws of the published composition sequence can be handed over before
+    // the sequence executes, for backend work that must consume them ahead of
+    // their native order (geometry another pass needs before the draws that
+    // depend on it). The backend selects them from the published metadata.
+    // Preparing never rasterizes, consumes the sequence or replaces the later
+    // ordered submission of the same draw. A backend that does not prepare
+    // keeps the default: no draw is handed over.
+    [[nodiscard]] virtual bool WantsPicaSequenceDrawPreparation(
+        const PicaCompositionDrawReference&) const {
+        return false;
+    }
+    virtual bool PreparePicaSequenceDraw(
+        const PicaDrawView&, std::string* = nullptr) {
+        return true;
+    }
+    // Prepared draws carry their vertex side, and their fragment uniforms and
+    // textures only when they run an alpha test. A backend that reads every
+    // prepared draw's fragment state ahead of native order (a native overlay's
+    // output alpha) asks for it here.
+    [[nodiscard]] virtual bool PicaSequenceDrawPreparationNeedsFragmentState() const {
+        return false;
+    }
     virtual bool SubmitPicaDisplayTransfer(
         const PicaDisplayTransferView& transfer,
         std::string* error = nullptr) = 0;
@@ -272,6 +359,23 @@ class PicaRenderBackend {
         std::string* error = nullptr) = 0;
     virtual bool SubmitPicaMemoryFill(
         const PicaMemoryFillView& fill, std::string* error = nullptr) = 0;
+    // Copy versions a retained plan can still replay. The backend keeps those
+    // GPU producers alive behind a weak completion token plus their retirement
+    // fence and must not destroy a version that is still in the set. Replacing
+    // the set releases the versions that left it; an empty set is a valid
+    // unpin and never an error.
+    virtual bool SetPinnedPicaTextureCopies(
+        std::span<const PicaTextureCopyReference> copies,
+        std::string* error = nullptr) {
+        if (copies.empty()) {
+            return true;
+        }
+        if (error != nullptr) {
+            *error =
+                "rendering backend does not pin native PICA texture copies";
+        }
+        return false;
+    }
     virtual bool CapturePicaTextureCache(
         std::vector<PicaTextureCacheEntrySnapshot>& snapshots,
         std::string* error = nullptr) {
@@ -363,6 +467,9 @@ class PicaRenderBackend {
   protected:
     PhysicalMemoryRead mPhysicalMemoryRead;
     PhysicalMemoryCommit mPhysicalMemoryCommit;
+    PhysicalMemoryDefer mPhysicalMemoryDefer;
+    PhysicalMemoryComplete mPhysicalMemoryComplete;
+    PhysicalMemoryBarrier mPhysicalMemoryBarrier;
 };
 
 } // namespace Fast::Renderer3ds
