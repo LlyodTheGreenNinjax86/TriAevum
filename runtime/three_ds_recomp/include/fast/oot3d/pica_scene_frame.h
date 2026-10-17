@@ -10,6 +10,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -48,6 +49,14 @@ struct PicaSceneDrawRecordDesc {
     ::Fast::Renderer3ds::PicaCompositionDomain CompositionDomain =
         ::Fast::Renderer3ds::PicaCompositionDomain::Unknown;
     ::Fast::Renderer3ds::PicaCompositionAttribution Composition;
+    std::optional<std::array<float, 16>> LightingWorldToView;
+    std::shared_ptr<const ::Fast::Renderer3ds::PicaSceneDirectionalLights> SceneDirectionals;
+    // Point lights the draw's lighting sees: the shared scene snapshot and its
+    // own selected native sources (in shader slot order).
+    std::shared_ptr<const ::Fast::Renderer3ds::PicaScenePointLights> ScenePoints;
+    std::shared_ptr<const ::Fast::Renderer3ds::RoomShadowShellScene> RoomShadows;
+    std::array<::Fast::Renderer3ds::PicaNativeLightSource, 3> NativeLightSources{};
+    ::Fast::Renderer3ds::VirtualShadowCaster ShadowCaster;
     PicaSceneResolvedRasterState Raster;
     PicaSceneRenderTargetState RenderTarget;
 
@@ -83,6 +92,8 @@ struct PicaSceneDrawRecordDesc {
     bool PreviousVertexUniformHistoryAvailable = false;
     uint64_t FragmentUniformOffset = 0;
     uint64_t FragmentUniformSize = 0;
+    uint64_t SurfaceLightingUniformOffset = 0;
+    uint64_t SurfaceLightingUniformSize = 0;
     PicaSceneBufferResource GeometryBuffer;
     std::span<const PicaSceneVertexBufferBinding> VertexBindings;
     bool Indexed = false;
@@ -90,10 +101,14 @@ struct PicaSceneDrawRecordDesc {
     uint32_t VertexOrIndexCount = 0;
     int32_t BaseVertex = 0;
     std::span<const PicaSceneTextureBinding> Textures;
+    // Bound only when the fragment program samples the native lighting LUT.
+    PicaSceneTextureBinding LightingLut;
 
     bool PerspectiveProjection = false;
     bool DirectionalShadowCaster = false;
     ::Fast::Renderer3ds::PicaVertexShaderHookLayout VertexShaderHooks;
+    // Offsets of the canonical fragment program, when its producer published them.
+    ::Fast::Renderer3ds::PicaShaderHookLayout FragmentShaderHooks;
     std::span<const uint8_t> PackedVertexUniforms;
     std::span<const uint8_t> PackedPreviousVertexUniforms;
     std::span<const uint8_t> PackedFragmentUniforms;
@@ -127,6 +142,7 @@ struct PicaSceneFrameStats {
     uint8_t TemporalSampleOrdinal = 0;
     uint32_t SceneDomainDrawCount = 0;
     uint32_t UiDomainDrawCount = 0;
+    uint32_t ScreenDomainDrawCount = 0;
     uint32_t UnknownDomainDrawCount = 0;
     uint32_t OpaqueWorldLayerDrawCount = 0;
     uint32_t TransparentWorldLayerDrawCount = 0;
@@ -164,7 +180,7 @@ struct PicaSceneFrameStats {
 // metadata is retained. Shader sources and layouts are interned across frames.
 class PicaSceneFrame final {
   public:
-    static constexpr uint32_t kSchemaVersion = 9U;
+    static constexpr uint32_t kSchemaVersion = 13U;
 
     PicaSceneFrame();
     ~PicaSceneFrame();
@@ -187,6 +203,12 @@ class PicaSceneFrame final {
     VertexBindings(const PicaSceneDrawRecord& draw) const noexcept;
     [[nodiscard]] bool DirectionalShadowCaster(
         size_t drawIndex) const noexcept;
+    // Frame evidence for the composition policy: did this frame's scene
+    // (perspective world) draws render into that colour target? The renderer
+    // resolves a UI-attributed draw on such a target as screen-space frame
+    // content rather than as a placed UI element.
+    [[nodiscard]] bool HasSceneDrawOnColorTarget(
+        uint32_t colorPhysicalAddress) const noexcept;
     [[nodiscard]] PicaSceneFrameStats Stats() const noexcept;
 
   private:

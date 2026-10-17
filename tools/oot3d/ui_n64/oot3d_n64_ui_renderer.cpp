@@ -96,20 +96,27 @@ BuildQuad(const UiPrimitive& primitive, float canvasWidth, float canvasHeight,
     const float v0 = primitive.uv.y;
     const float u1 = u0 + primitive.uv.width;
     const float v1 = v0 + primitive.uv.height;
+    // Texture coordinates of the top-left, bottom-left, bottom-right and
+    // top-right corners.
+    struct Uv { float u, v; };
+    const std::array<Uv, 4> corners =
+        primitive.uv_quarter_turn
+            ? std::array<Uv, 4>{{{u0, v1}, {u1, v1}, {u1, v0}, {u0, v0}}}
+            : std::array<Uv, 4>{{{u0, v0}, {u0, v1}, {u1, v1}, {u1, v0}}};
     std::vector<Oot3d::Renderer::UiOverlayVertex> vertices;
     vertices.reserve(6U);
-    AppendVertex(vertices, left, top, u0, v0, primitive.color, canvasWidth,
-                 canvasHeight, invertY);
-    AppendVertex(vertices, left, bottom, u0, v1, primitive.color, canvasWidth,
-                 canvasHeight, invertY);
-    AppendVertex(vertices, right, bottom, u1, v1, primitive.color, canvasWidth,
-                 canvasHeight, invertY);
-    AppendVertex(vertices, left, top, u0, v0, primitive.color, canvasWidth,
-                 canvasHeight, invertY);
-    AppendVertex(vertices, right, bottom, u1, v1, primitive.color, canvasWidth,
-                 canvasHeight, invertY);
-    AppendVertex(vertices, right, top, u1, v0, primitive.color, canvasWidth,
-                 canvasHeight, invertY);
+    AppendVertex(vertices, left, top, corners[0].u, corners[0].v, primitive.color,
+                 canvasWidth, canvasHeight, invertY);
+    AppendVertex(vertices, left, bottom, corners[1].u, corners[1].v, primitive.color,
+                 canvasWidth, canvasHeight, invertY);
+    AppendVertex(vertices, right, bottom, corners[2].u, corners[2].v, primitive.color,
+                 canvasWidth, canvasHeight, invertY);
+    AppendVertex(vertices, left, top, corners[0].u, corners[0].v, primitive.color,
+                 canvasWidth, canvasHeight, invertY);
+    AppendVertex(vertices, right, bottom, corners[2].u, corners[2].v, primitive.color,
+                 canvasWidth, canvasHeight, invertY);
+    AppendVertex(vertices, right, top, corners[3].u, corners[3].v, primitive.color,
+                 canvasWidth, canvasHeight, invertY);
     return vertices;
 }
 
@@ -179,6 +186,8 @@ void N64UiFast3dRenderer::Release() noexcept {
     }
     textures_.clear();
     failed_textures_.clear();
+    prepared_keys_.clear();
+    staged_textures_.clear();
 }
 
 void N64UiFast3dRenderer::SetTextureProvider(
@@ -203,7 +212,18 @@ N64UiFast3dRenderer::ResolveTexture(const UiTextureIdentity& identity,
         return nullptr;
     }
 
-    if (texture_provider_ == nullptr) {
+    const auto staged = staged_textures_.find(semanticKey);
+    if (staged == staged_textures_.end()) {
+        ++stats_.missing_texture_resources;
+        if (error != nullptr) {
+            *error = "UI texture was not prepared before rendering";
+        }
+        failed_textures_.insert(semanticKey);
+        return nullptr;
+    }
+    PreparedUiTexture prepared = std::move(staged->second);
+    staged_textures_.erase(staged);
+    if (prepared.status == PreparedUiTexture::Status::MissingProvider) {
         ++stats_.missing_texture_resources;
         if (error != nullptr) {
             *error = "UI texture provider is unavailable";
@@ -211,25 +231,26 @@ N64UiFast3dRenderer::ResolveTexture(const UiTextureIdentity& identity,
         failed_textures_.insert(semanticKey);
         return nullptr;
     }
-    UiTexturePixels pixels;
-    const bool nativeTexture = identity.semantic_name.starts_with("oot3d/");
+    const bool nativeTexture = prepared.native;
     if (nativeTexture) {
         ++stats_.native_texture_resolves;
     }
-    if (!texture_provider_->Resolve(identity, pixels, error) ||
-        pixels.width == 0U || pixels.height == 0U ||
-        pixels.rgba8.size() !=
-            static_cast<std::size_t>(pixels.width) * pixels.height * 4U) {
+    if (prepared.status != PreparedUiTexture::Status::Resolved) {
         if (nativeTexture) {
             ++stats_.native_texture_failures;
         }
         ++stats_.unsupported_texture_resources;
-        if (error != nullptr && error->empty()) {
-            *error = "UI texture payload is invalid";
+        if (error != nullptr) {
+            if (!prepared.error.empty()) {
+                *error = std::move(prepared.error);
+            } else if (error->empty()) {
+                *error = "UI texture payload is invalid";
+            }
         }
         failed_textures_.insert(semanticKey);
         return nullptr;
     }
+    const UiTexturePixels& pixels = prepared.pixels;
 
     ResidentTexture uploaded;
     uploaded.renderer_id = rendering_api_.CreateUiTexture(
@@ -245,11 +266,72 @@ N64UiFast3dRenderer::ResolveTexture(const UiTextureIdentity& identity,
     return &textures_.emplace(semanticKey, uploaded).first->second;
 }
 
+namespace {
+
+bool DrawsPrimitive(const UiPrimitive& primitive) {
+    return primitive.visible && primitive.color.alpha > 0.0F &&
+           primitive.destination.width > 0.0F &&
+           primitive.destination.height > 0.0F;
+}
+
+} // namespace
+
+void N64UiFast3dRenderer::Stage(PreparedUiTextures prepared) {
+    for (auto& texture : prepared) {
+        std::string key = texture.key;
+        staged_textures_.insert_or_assign(std::move(key), std::move(texture));
+    }
+}
+
+PreparedUiTextures N64UiFast3dRenderer::PrepareTextures(
+    std::span<const UiPrimitive> primitives) {
+    PreparedUiTextures prepared;
+    for (const UiPrimitive& primitive : primitives) {
+        if (!DrawsPrimitive(primitive) ||
+            primitive.texture.semantic_name.empty()) {
+            continue;
+        }
+        std::string key = BuildUiTextureCacheKey(primitive.texture);
+        if (!prepared_keys_.insert(key).second) {
+            continue;
+        }
+        PreparedUiTexture texture;
+        texture.key = std::move(key);
+        texture.native = primitive.texture.semantic_name.starts_with("oot3d/");
+        if (texture_provider_ == nullptr) {
+            texture.status = PreparedUiTexture::Status::MissingProvider;
+        } else {
+            auto& pixels = texture.pixels;
+            const bool resolved =
+                texture_provider_->Resolve(primitive.texture, pixels,
+                                           &texture.error) &&
+                pixels.width != 0U && pixels.height != 0U &&
+                pixels.rgba8.size() ==
+                    static_cast<std::size_t>(pixels.width) * pixels.height * 4U;
+            texture.status = resolved ? PreparedUiTexture::Status::Resolved
+                                      : PreparedUiTexture::Status::Invalid;
+        }
+        prepared.push_back(std::move(texture));
+    }
+    return prepared;
+}
+
 bool N64UiFast3dRenderer::Render(std::span<const UiPrimitive> primitives,
                                 std::uint32_t framebufferWidth,
                                 std::uint32_t framebufferHeight,
                                 N64UiCanvasMode canvasMode,
                                 std::string* error) {
+    return Render(primitives, framebufferWidth, framebufferHeight, canvasMode,
+                  PrepareTextures(primitives), error);
+}
+
+bool N64UiFast3dRenderer::Render(std::span<const UiPrimitive> primitives,
+                                std::uint32_t framebufferWidth,
+                                std::uint32_t framebufferHeight,
+                                N64UiCanvasMode canvasMode,
+                                PreparedUiTextures prepared,
+                                std::string* error) {
+    Stage(std::move(prepared));
     ++stats_.frames;
     stats_.primitives_received += primitives.size();
     if (primitives.empty()) {
@@ -285,9 +367,7 @@ bool N64UiFast3dRenderer::Render(std::span<const UiPrimitive> primitives,
 
     bool success = true;
     for (const UiPrimitive* primitive : ordered) {
-        if (!primitive->visible || primitive->color.alpha <= 0.0F ||
-            primitive->destination.width <= 0.0F ||
-            primitive->destination.height <= 0.0F) {
+        if (!DrawsPrimitive(*primitive)) {
             continue;
         }
         const bool textured = !primitive->texture.semantic_name.empty();

@@ -11,7 +11,7 @@ enum class GpuProfileScope : uint8_t {
     NativePica,
     ToonRaster,
     Grass,
-    Cacao,
+    AmbientOcclusion,
     DepthPreparation,
     Reflection,
     MotionVectors,
@@ -21,6 +21,11 @@ enum class GpuProfileScope : uint8_t {
     DisplayTransfer,
     Scanout,
     Overlay,
+    GlobalIllumination,
+    GrassCompaction,
+    GrassBlades,
+    GrassShadows,
+    GrassLighting,
     Count,
 };
 

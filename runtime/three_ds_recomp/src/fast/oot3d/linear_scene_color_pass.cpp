@@ -125,6 +125,7 @@ bool LinearSceneColorPass::Initialize(
         pipeline.shader.stage = nri::StageBits::COMPUTE_SHADER;
         pipeline.shader.bytecode = shader.data();
         pipeline.shader.size = shader.size() * sizeof(uint32_t);
+        pipeline.cache = NriInteropAccess::PipelineCache(interop);
         if (mImpl->Core->CreateComputePipeline(
                 *nriDevice, pipeline, mImpl->Pipeline) !=
             nri::Result::SUCCESS) {
@@ -176,7 +177,7 @@ bool LinearSceneColorPass::Configure(
     return false;
 #else
     if (mImpl->Width != 0U &&
-        vkDeviceWaitIdle(mImpl->Device) != VK_SUCCESS)
+        !mImpl->Interop->CompleteRecordedWork())
         return false;
     InvalidateScreenResources();
     try {
@@ -355,6 +356,14 @@ void LinearSceneColorPass::Shutdown() {
 }
 
 bool LinearSceneColorPass::Available() const { return mImpl->Ready; }
+uint32_t LinearSceneColorPass::Width() const {
+    return mImpl->Width;
+}
+
+uint32_t LinearSceneColorPass::Height() const {
+    return mImpl->Height;
+}
+
 VkImage LinearSceneColorPass::OutputImage() const {
     return mImpl->Output.Image;
 }

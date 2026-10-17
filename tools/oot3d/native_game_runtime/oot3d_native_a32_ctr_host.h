@@ -54,6 +54,11 @@ class NativeA32CtrSvcEventHistory final {
     const std::map<std::string, uint64_t>& IpcNameCounts() const noexcept;
     uint64_t TotalEventCount() const noexcept;
     bool RetainsFullHistory() const noexcept;
+    const NativeA32CtrSvcEvent* LastEvent() const noexcept {
+        if (mRetainFullHistory) return mFullEvents.empty() ? nullptr : &mFullEvents.back();
+        if (mRecentEvents.Size == 0U) return nullptr;
+        return &mRecentEvents.Records[(mRecentEvents.Start + mRecentEvents.Size - 1U) % RecentEventCapacity].Event;
+    }
 
   private:
     struct RecordedEvent {
@@ -131,6 +136,8 @@ struct NativeA32CtrRuntimeProfile {
     uint64_t CommandListBytes = 0;
     uint64_t CommandListReadNanoseconds = 0;
     uint64_t PicaFrontendSubmitNanoseconds = 0;
+    // Process-lifetime diagnostics; never rewound by a guest savestate.
+    uint64_t FsUnservedRequests = 0;
     uint64_t RomFsStreamOpenCalls = 0;
     uint64_t RomFsReadCalls = 0;
     uint64_t RomFsReadBytes = 0;
@@ -302,11 +309,20 @@ class NativeA32CtrHostServices final : public NativeA32HostServices {
     bool NdmSchedulerSuspended() const;
     bool NdmSchedulerRunsInBackground() const;
     NativeA32CtrRuntimeProfile RuntimeProfile() const noexcept;
+    void WriteFsRequestSummary() const;
     nlohmann::json CaptureState() const;
     bool RestoreState(const nlohmann::json& state, NativeA32Process& process,
                       std::string* error = nullptr);
 
   private:
+    NativeA32HostResult HandleSvcImpl(
+        uint32_t immediate, oot3d::recomp::a32::GuestState& state,
+        NativeA32Memory& memory, NativeA32HostContext& context);
+    NativeA32HostResult FailFsRequest(
+        oot3d::recomp::a32::GuestState& state, NativeA32Memory& memory,
+        uint32_t commandBuffer, const std::optional<std::string>& sessionType,
+        NativeA32CtrSvcEvent event, uint32_t result, std::string_view reason,
+        uint64_t offset = 0U, uint64_t length = 0U);
     struct RomFsBackingFile;
 
     struct KernelObject {
@@ -320,6 +336,7 @@ class NativeA32CtrHostServices final : public NativeA32HostServices {
         uint64_t FileOffset = 0;
         uint64_t FileSize = 0;
         uint32_t FileOpenMode = 0;
+        bool FileClosed = false;
         std::shared_ptr<NativeA32CtrFile> FileBackend;
         std::shared_ptr<RomFsBackingFile> RomFsBacking;
         std::optional<uint32_t> MappedAddress;
@@ -404,6 +421,43 @@ class NativeA32CtrHostServices final : public NativeA32HostServices {
     NativeA32HostResult
     HandleControlMemory(oot3d::recomp::a32::GuestState& state,
                         NativeA32Memory& memory, NativeA32CtrSvcEvent event);
+    // SendSyncRequest, one method per service (oot3d_native_a32_ctr_host_*.cpp).
+    NativeA32HostResult HandleNdmRequest(
+        oot3d::recomp::a32::GuestState& state, NativeA32Memory& memory,
+        NativeA32HostContext& context, const std::optional<std::string>& sessionType,
+        uint32_t commandBuffer, NativeA32CtrSvcEvent event);
+    NativeA32HostResult HandleCfgRequest(
+        oot3d::recomp::a32::GuestState& state, NativeA32Memory& memory,
+        NativeA32HostContext& context, const std::optional<std::string>& sessionType,
+        uint32_t commandBuffer, NativeA32CtrSvcEvent event);
+    NativeA32HostResult HandleHidRequest(
+        oot3d::recomp::a32::GuestState& state, NativeA32Memory& memory,
+        NativeA32HostContext& context, const std::optional<std::string>& sessionType,
+        uint32_t commandBuffer, NativeA32CtrSvcEvent event);
+    NativeA32HostResult HandleY2rRequest(
+        oot3d::recomp::a32::GuestState& state, NativeA32Memory& memory,
+        NativeA32HostContext& context, const std::optional<std::string>& sessionType,
+        uint32_t commandBuffer, NativeA32CtrSvcEvent event);
+    NativeA32HostResult HandleDspRequest(
+        oot3d::recomp::a32::GuestState& state, NativeA32Memory& memory,
+        NativeA32HostContext& context, const std::optional<std::string>& sessionType,
+        uint32_t commandBuffer, NativeA32CtrSvcEvent event);
+    NativeA32HostResult HandleRomFsRequest(
+        oot3d::recomp::a32::GuestState& state, NativeA32Memory& memory,
+        NativeA32HostContext& context, const std::optional<std::string>& sessionType,
+        uint32_t commandBuffer, NativeA32CtrSvcEvent event);
+    NativeA32HostResult HandleGspRequest(
+        oot3d::recomp::a32::GuestState& state, NativeA32Memory& memory,
+        NativeA32HostContext& context, const std::optional<std::string>& sessionType,
+        uint32_t commandBuffer, NativeA32CtrSvcEvent event);
+    NativeA32HostResult HandleAptRequest(
+        oot3d::recomp::a32::GuestState& state, NativeA32Memory& memory,
+        NativeA32HostContext& context, const std::optional<std::string>& sessionType,
+        uint32_t commandBuffer, NativeA32CtrSvcEvent event);
+    NativeA32HostResult HandleFsRequest(
+        oot3d::recomp::a32::GuestState& state, NativeA32Memory& memory,
+        NativeA32HostContext& context, const std::optional<std::string>& sessionType,
+        uint32_t commandBuffer, NativeA32CtrSvcEvent event);
     bool WriteHidSample(NativeA32Memory& memory, const NativeA32HidState& state,
                         uint64_t sampleTick);
     bool WriteHidAccelerometerSample(NativeA32Memory& memory,

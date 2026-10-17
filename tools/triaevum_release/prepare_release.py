@@ -21,6 +21,7 @@ try:
     from .qualified_input_coverage import bind as bind_input_coverage
     from .shader_release_layout import bind_renderer_compiler
     from .shader_corpus_layout import bind_shader_corpus
+    from .precomputed_tables import bind_precomputed_tables
     from .forge import load_recipe, DEFAULT_RECIPES
 except ImportError:
     from build_forge_binary import build as build_forge
@@ -35,6 +36,7 @@ except ImportError:
     from qualified_input_coverage import bind as bind_input_coverage
     from shader_release_layout import bind_renderer_compiler
     from shader_corpus_layout import bind_shader_corpus
+    from precomputed_tables import bind_precomputed_tables
     from forge import load_recipe, DEFAULT_RECIPES
 
 
@@ -67,6 +69,27 @@ def clang_header_layout(llvm: Path) -> list[dict]:
     return items
 
 
+def dlss_layout(targets: dict) -> list[dict]:
+    """The DLSS module, NVIDIA's DLSS runtime and NVIDIA's DLSS SDK licence,
+    together or not at all: the module without the runtime cannot offer DLSS,
+    and neither is distributed without the licence."""
+    keys = ("dlss", "dlss_runtime", "dlss_license")
+    present = [key for key in keys if key in targets]
+    if not present:
+        return []
+    if len(present) != len(keys):
+        raise ValueError("The DLSS module, its NVIDIA runtime and licence must be published together")
+    module, runtime, license_text = (Path(targets[key]).resolve() for key in keys)
+    for path in (module, runtime, license_text):
+        if not path.is_file():
+            raise ValueError(f"DLSS release input is missing: {path}")
+    return [
+        {"source": str(module), "path": module.name, "role": "separately_licensed_module"},
+        {"source": str(runtime), "path": runtime.name, "role": "separately_licensed_module"},
+        {"source": str(license_text), "path": "LICENSES/NVIDIA-DLSS-SDK-LICENSE.txt", "role": "license"},
+    ]
+
+
 def prepare(args) -> dict:
     crt_artifacts = visual_cpp_runtime_artifacts(args.vc_redist_dir.resolve())
     build_dir = args.build_dir.resolve()
@@ -86,6 +109,12 @@ def prepare(args) -> dict:
     receipt = query_product(Path(targets["runtime"]), commit)
     if receipt["product"].get("private_title_loaded") is not False:
         raise ValueError("The build directory must contain the public stub, not a title")
+    if receipt["product"]["capabilities"].get("experimental_global_illumination") is not False:
+        raise ValueError("The release runtime must not offer the experimental global illumination "
+                         "(configure with THREE_DS_RECOMP_OFFER_EXPERIMENTAL_GI=OFF)")
+    if receipt["product"]["capabilities"].get("developer_tools") is not False:
+        raise ValueError("The release runtime must not contain the developer tools "
+                         "(configure with TRIAEVUM_DEVELOPER_TOOLS=OFF)")
     source_zip = work / "TriAevum-source.zip"
     create_source_archive(ROOT, source_zip, source_commit=commit)
     forge_exe = build_forge(work / "forge-binary", work / "forge-build",
@@ -103,12 +132,35 @@ def prepare(args) -> dict:
     for item in layout["files"]:
         if item["source"].startswith("build-release/"):
             item["source"] = str(artifacts[Path(item["source"]).name].resolve())
+    # The separately licensed iMMERSE module (MXAO), its own library beside the
+    # runtime; its licences are already in the layout.
+    if "immerse" in targets:
+        layout["files"].append({"source": str(Path(targets["immerse"]).resolve()),
+                                "path": Path(targets["immerse"]).name,
+                                "role": "separately_licensed_module"})
+    # The separately licensed DLSS module, the only binary that links NVIDIA's
+    # NGX SDK, beside NVIDIA's own DLSS runtime and the SDK licence they are
+    # distributed under (runtime/three_ds_recomp/src/fast/dlss/LICENSE.md).
+    layout["files"].extend(dlss_layout(targets))
+    # FidelityFX's FSR runtime (MIT), which NRI loads by name beside the
+    # runtime, on demand: FSR is offered only when it loads, so an older
+    # Vulkan loader that lacks its imports only withdraws FSR.
+    if "fidelityfx_runtime" in targets:
+        layout["files"].append({"source": str(Path(targets["fidelityfx_runtime"]).resolve()),
+                                "path": Path(targets["fidelityfx_runtime"]).name,
+                                "role": "optional_vulkan_runtime"})
+    # The release's default scene environment profiles (read-only; the user's
+    # own profiles in the data directory take precedence).
+    for profile in sorted((ROOT / "runtime/triaevum_resources/environments").glob("*.environment.json")):
+        layout["files"].append({"source": str(profile.resolve()),
+                                "path": f"resources/environments/{profile.name}",
+                                "role": "default_environment_profile"})
     layout_path = work / "release-layout.json"
     layout["files"].extend(title_layout(
         runtime=Path(targets["runtime"]), native_module=artifacts["oot3d_game_module.dll"],
         plugin_manifest=args.title_build, generated_manifest=args.title_sources,
         build_source=args.title_build_source, recipe=load_recipe(DEFAULT_RECIPES, args.recipe),
-        work=work / "precompiled"))
+        work=work / "precompiled", profile_data=args.title_profile))
     catalog_path = work / "precompiled/precompiled-titles.json"
     definitions = load_json_object(DEFAULT_RECIPES)
     catalog, definitions = add_verified_variants(load_json_object(catalog_path), definitions, definitions)
@@ -126,6 +178,12 @@ def prepare(args) -> dict:
     catalog, corpus_files = bind_shader_corpus(catalog, args.shader_pack,
         args.pipeline_manifest, args.pipeline_helper)
     layout["files"].extend(corpus_files)
+    # The release's own interior-sun and scene-light results for the supported
+    # rooms, keyed to their content (precomputed_tables).
+    if args.precomputed is not None:
+        catalog, table_files = bind_precomputed_tables(catalog, args.precomputed / "interior-sun.masks",
+                                                       args.precomputed / "scene-lights.json")
+        layout["files"].extend(table_files)
     atomic_write_json(catalog_path, catalog)
     atomic_write_json(layout_path, layout)
     result = package_release(layout_path, args.output, source_root=ROOT,
@@ -151,11 +209,16 @@ def main() -> int:
     parser.add_argument("--title-build", type=Path, required=True, help="Verified whole-aot-plugin.json")
     parser.add_argument("--title-sources", type=Path, required=True, help="Corresponding generated C++ manifest")
     parser.add_argument("--title-build-source", type=Path, required=True, help="Source ZIP used to build the title")
+    parser.add_argument("--title-profile", type=Path,
+                        help="Profile the title was built with (build-title --profile-data); required for a "
+                             "profile-guided title, shipped with its translated source")
     parser.add_argument("--recipe", default="oot3d-eur-project-baseline-16a6b0aa")
     parser.add_argument("--shader-pack", type=Path, required=True,
                         help="Publisher input: bundled portable corpus, never a user choice")
     parser.add_argument("--pipeline-manifest", type=Path, action="append", required=True)
     parser.add_argument("--pipeline-helper", type=Path, required=True)
+    parser.add_argument("--precomputed", type=Path,
+                        help="Publisher directory from precomputed_tables (interior-sun.masks, scene-lights.json)")
     args = parser.parse_args()
     print(json.dumps(prepare(args), indent=2))
     return 0

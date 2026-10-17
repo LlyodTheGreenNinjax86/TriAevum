@@ -6,6 +6,8 @@
 #include <cmath>
 #include <cstdio>
 #include <limits>
+#include <mutex>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <type_traits>
@@ -16,6 +18,16 @@ namespace Fast::Oot3d {
 namespace {
 
 using Json = nlohmann::json;
+
+std::mutex& TitleGrassRuleMutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+
+std::optional<Json>& TitleGrassRules() {
+    static std::optional<Json> rules;
+    return rules;
+}
 
 template <typename Enum>
 using EnumNames = std::initializer_list<std::pair<Enum, std::string_view>>;
@@ -71,13 +83,45 @@ constexpr EnumNames<FrameRateMode> kFrameRateNames{
     {FrameRateMode::Uncapped, "Uncapped"},
     {FrameRateMode::Interpolated2x, "Fixed60"},
 };
+constexpr EnumNames<PointShadowMode> kPointShadowNames{
+    {PointShadowMode::Off, "Off"},
+    {PointShadowMode::CubeMaps, "CubeMaps"},
+};
 constexpr EnumNames<DirectionalShadowMode> kDirectionalShadowNames{
     {DirectionalShadowMode::Off, "Off"},
-    {DirectionalShadowMode::SingleCascade, "SingleCascade"},
+    {DirectionalShadowMode::VirtualShadowMaps, "VirtualShadowMaps"},
+};
+constexpr EnumNames<GlobalIlluminationMode> kGlobalIlluminationNames{
+    {GlobalIlluminationMode::Off, "Off"},
+    {GlobalIlluminationMode::BrixelizerGi, "BrixelizerGI"},
+    {GlobalIlluminationMode::ScreenSpace, "ScreenSpaceGI"},
+};
+constexpr EnumNames<GlobalIlluminationResolution> kGlobalIlluminationResolutionNames{
+    {GlobalIlluminationResolution::Half, "Half"},
+    {GlobalIlluminationResolution::Quarter, "Quarter"},
 };
 constexpr EnumNames<AmbientOcclusionMode> kAoNames{
     {AmbientOcclusionMode::Off, "Off"},
+    {AmbientOcclusionMode::Gtao, "GTAO"},
     {AmbientOcclusionMode::Cacao, "CACAO"},
+    {AmbientOcclusionMode::Mxao, "MXAO"},
+};
+constexpr EnumNames<MxaoEstimator> kMxaoMethodNames{
+    {MxaoEstimator::GroundTruth, "GroundTruth"},
+    {MxaoEstimator::SolidAngle, "SolidAngle"},
+    {MxaoEstimator::VisibilityBitmask, "VisibilityBitmask"},
+    {MxaoEstimator::VisibilityBitmaskSolidAngle, "VisibilityBitmaskSolidAngle"},
+};
+constexpr EnumNames<MxaoNormalSource> kMxaoNormalNames{
+    {MxaoNormalSource::Depth, "Depth"},
+    {MxaoNormalSource::Renderer, "Renderer"},
+    {MxaoNormalSource::Geometry, "Geometry"},
+};
+constexpr EnumNames<AoTextureRelief> kAoReliefNames{
+    {AoTextureRelief::Off, "Off"},
+    {AoTextureRelief::Subtle, "Subtle"},
+    {AoTextureRelief::Medium, "Medium"},
+    {AoTextureRelief::Strong, "Strong"},
 };
 constexpr EnumNames<ReflectionMode> kReflectionNames{
     {ReflectionMode::Off, "Off"},
@@ -89,19 +133,25 @@ constexpr EnumNames<ToonMode> kToonNames{
     {ToonMode::PostProcessPreview, "PostProcessPreview"},
     {ToonMode::PicaMaterial, "PicaMaterial"},
 };
-constexpr EnumNames<GrassQuality> kGrassQualityNames{
-    {GrassQuality::Off, "Off"},
-    {GrassQuality::Low, "Low"},
-    {GrassQuality::Medium, "Medium"},
-    {GrassQuality::High, "High"},
-    {GrassQuality::Custom, "Custom"},
+constexpr EnumNames<SurfaceLightingMode> kSurfaceLightingNames{
+    {SurfaceLightingMode::Native, "Native"},
+    {SurfaceLightingMode::PerPixel, "PerPixel"},
+    {SurfaceLightingMode::PerPixelPbr, "PerPixelPBR"},
+    {SurfaceLightingMode::NativePbr, "NativePBR"},
 };
+constexpr EnumNames<GrassQuality> kGrassQualityNames{
+    { GrassQuality::Off, "Off" },   { GrassQuality::Low, "Low" },       { GrassQuality::Medium, "Medium" },
+    { GrassQuality::High, "High" }, { GrassQuality::Custom, "Custom" },
+};
+constexpr EnumNames<GrassMaskMode> kGrassMaskModeNames{ { GrassMaskMode::Automatic, "Automatic" },
+                                                        { GrassMaskMode::Custom, "Custom" },
+                                                        { GrassMaskMode::Off, "Off" } };
 constexpr EnumNames<GrassSampleChannel> kGrassChannelNames{
-    {GrassSampleChannel::Red, "Red"},
-    {GrassSampleChannel::Green, "Green"},
-    {GrassSampleChannel::Blue, "Blue"},
-    {GrassSampleChannel::Alpha, "Alpha"},
-    {GrassSampleChannel::Luminance, "Luminance"},
+    { GrassSampleChannel::Red, "Red" },
+    { GrassSampleChannel::Green, "Green" },
+    { GrassSampleChannel::Blue, "Blue" },
+    { GrassSampleChannel::Alpha, "Alpha" },
+    { GrassSampleChannel::Luminance, "Luminance" },
 };
 constexpr EnumNames<GrassWrapOverride> kGrassWrapNames{
     {GrassWrapOverride::Material, "Material"},
@@ -120,6 +170,11 @@ constexpr EnumNames<UpscalerProvider> kUpscalerProviderNames{
     {UpscalerProvider::Fsr, "FSR"},
     {UpscalerProvider::Xess, "XeSS"},
     {UpscalerProvider::Dlss, "DLSS"},
+};
+constexpr EnumNames<DlssModel> kDlssModelNames{
+    {DlssModel::Default, "Default"},
+    {DlssModel::Transformer, "Transformer"},
+    {DlssModel::Cnn, "CNN"},
 };
 constexpr EnumNames<UpscalerQuality> kUpscalerQualityNames{
     {UpscalerQuality::Native, "Native"},
@@ -341,6 +396,12 @@ Json SerializeGrassRule(const GrassPlacementRule& rule) {
         {"OutputWhite", rule.OutputWhite},
         {"MaximumSlopeDegrees", rule.MaximumSlopeDegrees},
         {"NormalOffset", rule.NormalOffset},
+        {"ActiveRects", [&rule] {
+             Json rects = Json::array();
+             for (const auto& rect : rule.ActiveRects)
+                 rects.push_back({rect.MinU, rect.MinV, rect.MaxU, rect.MaxV});
+             return rects;
+         }()},
     };
 }
 
@@ -370,88 +431,93 @@ Json SerializeInteractiveGrassSettings(
         rules.push_back(SerializeGrassRule(rule));
     }
     return {
-        {"Quality", EnumName(grass.Quality, kGrassQualityNames)},
-        {"Budget",
-         {
-             {"MaxInstancesPerRoom", grass.MaxInstancesPerRoom},
-             {"DrawDistance", grass.DrawDistance},
-         }},
-        {"Performance",
-         {
-             {"FrustumCulling", grass.FrustumCulling},
-             {"CullingClusterSize", grass.CullingClusterSize},
-             {"LodStartFraction", grass.LodStartFraction},
-             {"LodReferenceDistance", grass.LodReferenceDistance},
-             {"LodEndFraction", grass.LodEndFraction},
-             {"SegmentLodStartDistance", grass.SegmentLodStartDistance},
-             {"SegmentLodEndDistance", grass.SegmentLodEndDistance},
-             {"FarDensity", grass.FarDensity},
-             {"FarBladeSegments", grass.FarBladeSegments},
-             {"FarTuftsEnabled", grass.FarTuftsEnabled},
-             {"MidrangeClustersEnabled", grass.MidrangeClustersEnabled},
-             {"MidrangeAdaptiveEnabled", grass.MidrangeAdaptiveEnabled},
-             {"MidrangeAdaptiveCapacity", grass.MidrangeAdaptiveCapacity},
-             {"MidrangeClusterCellExtent", grass.MidrangeClusterCellExtent},
-             {"MidrangeFarBladeFraction", grass.MidrangeFarBladeFraction},
-             {"FarTuftBladeCount", grass.FarTuftBladeCount},
-             {"DrawFadeFraction", grass.DrawFadeFraction},
-             {"DensityFadeFraction", grass.DensityFadeFraction},
-             {"TuftTransitionFraction", grass.TuftTransitionFraction},
-             {"FarTuftDensity", grass.FarTuftDensity},
-             {"FarTuftSpread", grass.FarTuftSpread},
-             {"SegmentLodSoftness", grass.SegmentLodSoftness},
-         }},
-        {"Generation",
-         SerializeGrassGeneration(grass.Generation)},
-        {"Appearance",
-         {
-             {"RootColor", grass.Appearance.RootColor},
-             {"TipColor", grass.Appearance.TipColor},
-             {"TextureColorInfluence",
-              grass.Appearance.TextureColorInfluence},
-             {"TextureRootBrightness",
-              grass.Appearance.TextureRootBrightness},
-             {"TextureTipBrightness",
-              grass.Appearance.TextureTipBrightness},
-             {"HeightScale", grass.Appearance.HeightScale},
-             {"BladeCurvature", grass.Appearance.BladeCurvature},
-             {"BladeDroop", grass.Appearance.BladeDroop},
-             {"ShapeVariation", grass.Appearance.ShapeVariation},
-             {"BladeTwistDegrees", grass.Appearance.BladeTwistDegrees},
-             {"BladeSegments", grass.Appearance.BladeSegments},
-             {"ReceiveLighting", grass.Appearance.ReceiveLighting},
-             {"ToonRimEnabled", grass.Appearance.ToonRimEnabled},
-             {"ToonRimFadeStart", grass.Appearance.ToonRimFadeStart},
-             {"ToonRimFadeEnd", grass.Appearance.ToonRimFadeEnd},
-             {"ReceiveFog", grass.Appearance.ReceiveFog},
-         }},
-        {"Wind",
-         {
-             {"DirectionDegrees", grass.WindDirectionDegrees},
-             {"Strength", grass.WindStrength},
-             {"Speed", grass.WindSpeed},
-             {"SpatialScale", grass.WindSpatialScale},
-             {"GustStrength", grass.WindGustStrength},
-             {"GustFrequency", grass.WindGustFrequency},
-             {"Turbulence", grass.WindTurbulence},
-             {"Randomness", grass.WindRandomness},
-         }},
-        {"LinkInteraction",
-         {
-             {"CollisionPush", grass.CollisionPush},
-             {"VelocityResponse", grass.CollisionVelocityResponse},
-             {"ColliderRadiusMultiplier",
-              grass.ColliderRadiusMultiplier},
-             {"ColliderHeightMultiplier",
-              grass.ColliderHeightMultiplier},
-             {"RecoverySeconds", grass.RecoverySeconds},
-             {"Damping", grass.InteractionDamping},
-             {"MaximumBend", grass.MaximumBend},
-             {"FieldRadius", grass.InteractionFieldRadius},
-             {"FieldResolution", grass.InteractionFieldResolution},
-             {"VerticalMargin", grass.InteractionVerticalMargin},
-         }},
-        {"Sources", std::move(rules)},
+        { "Quality", EnumName(grass.Quality, kGrassQualityNames) },
+        { "Budget",
+          {
+              { "MaxInstancesPerRoom", grass.MaxInstancesPerRoom },
+              { "DrawDistance", grass.DrawDistance },
+          } },
+        { "Performance",
+          {
+              { "FrustumCulling", grass.FrustumCulling },
+              { "CullingClusterSize", grass.CullingClusterSize },
+              { "LodStartFraction", grass.LodStartFraction },
+              { "LodReferenceDistance", grass.LodReferenceDistance },
+              { "LodEndFraction", grass.LodEndFraction },
+              { "SegmentLodStartDistance", grass.SegmentLodStartDistance },
+              { "SegmentLodEndDistance", grass.SegmentLodEndDistance },
+              { "FarDensity", grass.FarDensity },
+              { "FarBladeSegments", grass.FarBladeSegments },
+              { "FarTuftsEnabled", grass.FarTuftsEnabled },
+              { "MidrangeClustersEnabled", grass.MidrangeClustersEnabled },
+              { "MidrangeAdaptiveEnabled", grass.MidrangeAdaptiveEnabled },
+              { "MidrangeAdaptiveCapacity", grass.MidrangeAdaptiveCapacity },
+              { "MidrangeClusterCellExtent", grass.MidrangeClusterCellExtent },
+              { "MidrangeFarBladeFraction", grass.MidrangeFarBladeFraction },
+              { "FarTuftBladeCount", grass.FarTuftBladeCount },
+              { "DrawFadeFraction", grass.DrawFadeFraction },
+              { "DensityFadeFraction", grass.DensityFadeFraction },
+              { "TuftTransitionFraction", grass.TuftTransitionFraction },
+              { "FarTuftDensity", grass.FarTuftDensity },
+              { "FarTuftSpread", grass.FarTuftSpread },
+              { "SegmentLodSoftness", grass.SegmentLodSoftness },
+          } },
+        { "Generation", SerializeGrassGeneration(grass.Generation) },
+        { "Appearance",
+          {
+              { "RootColor", grass.Appearance.RootColor },
+              { "TipColor", grass.Appearance.TipColor },
+              { "TextureColorInfluence", grass.Appearance.TextureColorInfluence },
+              { "TextureRootBrightness", grass.Appearance.TextureRootBrightness },
+              { "TextureTipBrightness", grass.Appearance.TextureTipBrightness },
+              { "HeightScale", grass.Appearance.HeightScale },
+              { "BladeCurvature", grass.Appearance.BladeCurvature },
+              { "BladeDroop", grass.Appearance.BladeDroop },
+              { "ShapeVariation", grass.Appearance.ShapeVariation },
+              { "BladeTwistDegrees", grass.Appearance.BladeTwistDegrees },
+              { "BladeSegments", grass.Appearance.BladeSegments },
+              { "ReceiveLighting", grass.Appearance.ReceiveLighting },
+              { "ToonRimEnabled", grass.Appearance.ToonRimEnabled },
+              { "ToonRimFadeStart", grass.Appearance.ToonRimFadeStart },
+              { "ToonRimFadeEnd", grass.Appearance.ToonRimFadeEnd },
+              { "ReceiveFog", grass.Appearance.ReceiveFog },
+          } },
+        { "Wind",
+          {
+              { "DirectionDegrees", grass.WindDirectionDegrees },
+              { "Strength", grass.WindStrength },
+              { "Speed", grass.WindSpeed },
+              { "SpatialScale", grass.WindSpatialScale },
+              { "GustStrength", grass.WindGustStrength },
+              { "GustFrequency", grass.WindGustFrequency },
+              { "Turbulence", grass.WindTurbulence },
+              { "Randomness", grass.WindRandomness },
+          } },
+        { "LinkInteraction",
+          {
+              { "CollisionPush", grass.CollisionPush },
+              { "VelocityResponse", grass.CollisionVelocityResponse },
+              { "ColliderRadiusMultiplier", grass.ColliderRadiusMultiplier },
+              { "ColliderHeightMultiplier", grass.ColliderHeightMultiplier },
+              { "RecoverySeconds", grass.RecoverySeconds },
+              { "Damping", grass.InteractionDamping },
+              { "MaximumBend", grass.MaximumBend },
+              { "FieldRadius", grass.InteractionFieldRadius },
+              { "FieldResolution", grass.InteractionFieldResolution },
+              { "VerticalMargin", grass.InteractionVerticalMargin },
+          } },
+        { "Sources", std::move(rules) },
+        { "Masks",
+          [&grass] {
+              Json masks = Json::array();
+              for (const auto& mask : grass.Masks) {
+                  auto entry = SerializeGrassRule(mask.Coverage);
+                  entry["Mode"] = EnumName(mask.Mode, kGrassMaskModeNames);
+                  entry["Strength"] = mask.Strength;
+                  masks.push_back(std::move(entry));
+              }
+              return masks;
+          }() },
     };
 }
 
@@ -522,15 +588,11 @@ void DeserializeGrassGeneration(
     }
 }
 
-GrassPlacementRule DeserializeGrassRule(
-    const Json& document, size_t index,
-    std::string_view settingsPath, std::string_view collectionName,
-    uint32_t schemaVersion, GraphicsSettingsLoadResult& result) {
-    GrassPlacementRule rule;
+GrassPlacementRule DeserializeGrassRule(const Json& document, size_t index, std::string_view settingsPath,
+                                        std::string_view collectionName, uint32_t schemaVersion,
+                                        GraphicsSettingsLoadResult& result, GrassPlacementRule rule = {}) {
     const std::string prefix =
-        std::string(settingsPath) + "." +
-        std::string(collectionName) + "[" +
-        std::to_string(index) + "]";
+        std::string(settingsPath) + "." + std::string(collectionName) + "[" + std::to_string(index) + "]";
     ReadScalar(document, "RuleId", rule.RuleId,
                prefix + ".RuleId", result);
     if (const Json* target =
@@ -579,6 +641,22 @@ GrassPlacementRule DeserializeGrassRule(
                prefix + ".MaximumSlopeDegrees", result);
     ReadScalar(document, "NormalOffset", rule.NormalOffset,
                prefix + ".NormalOffset", result);
+    // Optional: absent means the whole mask applies (earlier files).
+    if (const Json* rects = FindMember(document, "ActiveRects"); rects != nullptr) {
+        bool valid = rects->is_array();
+        for (size_t i = 0; valid && i < rects->size(); ++i) {
+            const auto& entry = (*rects)[i];
+            valid = entry.is_array() && entry.size() == 4U &&
+                    std::all_of(entry.begin(), entry.end(), [](const Json& value) { return value.is_number(); });
+            if (valid)
+                rule.ActiveRects.push_back({entry[0].get<float>(), entry[1].get<float>(), entry[2].get<float>(),
+                                            entry[3].get<float>()});
+        }
+        if (!valid) {
+            rule.ActiveRects.clear();
+            Correct(result, prefix + ".ActiveRects", "invalid active rectangles removed");
+        }
+    }
     return rule;
 }
 
@@ -656,6 +734,34 @@ void DeserializeInteractiveGrassSettings(
         readOptional("FarTuftDensity", value.FarTuftDensity);
         readOptional("FarTuftSpread", value.FarTuftSpread);
         readOptional("SegmentLodSoftness", value.SegmentLodSoftness);
+    }
+    // Optional: old configurations use native alpha for every overlay.
+    value.Masks.clear();
+    if (const Json* masks = FindMember(document, "Masks"); masks != nullptr) {
+        if (!masks->is_array())
+            Correct(result, path + ".Masks", "invalid mask array ignored");
+        else
+            for (size_t index = 0; index < std::min<size_t>(masks->size(), 256U); ++index) {
+                const auto& entry = (*masks)[index];
+                const auto prefix = path + ".Masks[" + std::to_string(index) + "]";
+                if (!entry.is_object()) {
+                    Correct(result, prefix, "non-object mask rule ignored");
+                    continue;
+                }
+                GrassMaskRule mask;
+                auto defaults = SerializeGrassRule(mask.Coverage);
+                defaults.merge_patch(entry);
+                mask.Coverage =
+                    DeserializeGrassRule(defaults, index, settingsPath, "Masks", 11U, result, mask.Coverage);
+                if (FindMember(entry, "Mode"))
+                    ReadEnum(entry, "Mode", mask.Mode, kGrassMaskModeNames, prefix + ".Mode", result);
+                if (FindMember(entry, "Strength"))
+                    ReadScalar(entry, "Strength", mask.Strength, prefix + ".Strength", result);
+                NormalizeGrassMaskRule(mask);
+                value.Masks.push_back(std::move(mask));
+            }
+        if (masks->is_array() && masks->size() > 256U)
+            Correct(result, path + ".Masks", "mask rules truncated to 256 entries");
     }
     const std::string_view sourceCollection =
         schemaVersion >= 10U ? "Sources" : "Rules";
@@ -877,8 +983,7 @@ GraphicsCapabilities PermissiveCapabilities() {
     GraphicsCapabilities capabilities;
     for (uint8_t value =
              static_cast<uint8_t>(GraphicsCapability::NriInterop);
-         value <= static_cast<uint8_t>(
-                      GraphicsCapability::ExclusiveFullscreen);
+         value <= static_cast<uint8_t>(kLastGraphicsCapability);
          ++value) {
         capabilities.Set(
             static_cast<GraphicsCapability>(value), true);
@@ -1132,6 +1237,273 @@ GraphicsSettingsLoadResult MigrateLegacy(
 
 } // namespace
 
+std::string_view EnhancedPresetDocument() noexcept {
+    // Captured 2026-10-06 from the Kokiri play configuration.
+    return R"json({
+  "AA": {
+    "Mode": "Off",
+    "MsaaSamples": 1,
+    "TAA": {
+      "ClampExpansion": 0.05000000074505806,
+      "HistoryWeight": 0.8999999761581421,
+      "Sharpness": 0.10000000149011612
+    },
+    "Upscaler": {
+      "DlssModel": "Transformer",
+      "Provider": "DLSS",
+      "Quality": "UltraPerformance",
+      "Sharpness": 0.3499999940395355
+    }
+  },
+  "Camera": {
+    "ExtendedDrawDistance": false,
+    "FovMultiplier": 1.100000023841858
+  },
+  "Effects": {
+    "AO": {
+      "BlurPassCount": 2,
+      "DetailRadius": 0.05000000074505806,
+      "DetailStrength": 0.5,
+      "FadeOutFrom": 0.0,
+      "FadeOutTo": 3000.0,
+      "HorizonAngleThreshold": 0.05999999865889549,
+      "Mode": "MXAO",
+      "Mxao": {
+        "FadeDistance": 0.35899999737739563,
+        "Filter": 2,
+        "IncreaseRadiusWithDistance": true,
+        "Method": "SolidAngle",
+        "Normals": "Geometry",
+        "OriginalFade": false,
+        "Quality": 0,
+        "ScreenRadius": 2.5,
+        "ShadingRate": 1,
+        "Temporal": true
+      },
+      "Quality": 1,
+      "Radius": 1.5399999618530273,
+      "ShadowClamp": 0.9800000190734863,
+      "ShadowPower": 1.5,
+      "Sharpness": 0.9800000190734863,
+      "Strength": 1.0,
+      "TextureRelief": "Off"
+    },
+    "DirectionalShadows": {
+      "DepthBiasConstant": 1.25,
+      "DepthBiasSlope": 1.75,
+      "MaximumDistance": 6550.0,
+      "Mode": "VirtualShadowMaps",
+      "ContactShadows": {
+        "Blur": 1.0,
+        "Enabled": false,
+        "HalfResolution": true,
+        "Length": 1,
+        "Opacity": 1.0,
+        "SurfaceThickness": 0.009999999776482582
+      },
+      "NormalBias": 1.0,
+      "PcfRadius": 2,
+      "Resolution": 2048,
+      "Strength": 1.0
+    },
+    "GlobalIllumination": {
+      "DiffuseIntensity": 0.05999999865889549,
+      "DynamicLights": 0.3499999940395355,
+      "KeyLight": 1.600000023841858,
+      "Mode": "Off",
+      "Resolution": "Half",
+      "SceneLight": 0.0,
+      "ScreenSpace": {
+        "FilterLevels": 2,
+        "HighlightClamp": 0.0,
+        "RadialCandidates": 20,
+        "Radius": 150.0,
+        "Sections": 1,
+        "Sectors": 64,
+        "Temporal": true,
+        "Thickness": 30.0,
+        "Validation": false,
+        "WorkScale": "Quarter"
+      },
+      "SkyLight": 0.20000000298023224,
+      "Specular": false,
+      "SpecularIntensity": 0.0
+    },
+    "PointShadows": {
+      "MaxLights": 4,
+      "Mode": "CubeMaps",
+      "Range": 1.0,
+      "Resolution": 512,
+      "Strength": 1.0
+    },
+    "Reflections": {
+      "DebugView": 0,
+      "EdgeFade": 0.07999999821186066,
+      "MaxDistance": 1500.0,
+      "MaxSteps": 40,
+      "Mode": "Off",
+      "RoughnessBias": 0.0,
+      "Strength": 0.6499999761581421,
+      "Thickness": 8.0
+    },
+    "SurfaceLighting": "PerPixelPBR",
+    "Toon": {
+      "BandSoftness": 0.2280000001192093,
+      "CustomLightBands": false,
+      "LightBandLevels": [
+        0.0,
+        0.3333333432674408,
+        0.6666666865348816,
+        1.0,
+        1.0,
+        1.0
+      ],
+      "LightBandThresholds": [
+        0.1666666716337204,
+        0.5,
+        0.8333333134651184,
+        1.0,
+        1.0
+      ],
+      "LightBands": 4,
+      "Mode": "Off",
+      "OutlineDepthSensitivity": 1.0,
+      "OutlineEnabled": false,
+      "OutlineNormalSensitivity": 1.0,
+      "OutlineOpacity": 0.8500000238418579,
+      "OutlineSoftness": 1.0,
+      "OutlineTint": [
+        0.029999999329447746,
+        0.03999999910593033,
+        0.05999999865889549
+      ],
+      "OutlineWidth": 1.25,
+      "RimStrength": 0.3400000035762787,
+      "RimTint": [
+        1.0,
+        0.9300000071525574,
+        0.7200000286102295
+      ],
+      "RimWidth": 3.1700000762939453,
+      "Saturation": 1.090000033378601,
+      "ShadowStrength": 1.0,
+      "ShadowTint": [
+        0.47999998927116394,
+        0.5600000023841858,
+        0.7200000286102295
+      ]
+    }
+  },
+  "FrameRate": {
+    "Mode": "Interpolated2x"
+  },
+  "Grass": {
+    "Appearance": {
+      "BladeCurvature": 0.6399999856948853,
+      "BladeDroop": 0.3499999940395355,
+      "BladeSegments": 5,
+      "BladeTwistDegrees": 141.0,
+      "HeightScale": 1.149999976158142,
+      "ReceiveFog": true,
+      "ReceiveLighting": true,
+      "RootColor": [
+        0.09882351756095886,
+        0.1899999976158142,
+        0.03500000014901161
+      ],
+      "ShapeVariation": 0.3799999952316284,
+      "TextureColorInfluence": 0.2199999988079071,
+      "TextureRootBrightness": 2.869999885559082,
+      "TextureTipBrightness": 4.0,
+      "TipColor": [
+        0.4200000464916229,
+        0.7200000286102295,
+        0.12000001966953278
+      ],
+      "ToonRimEnabled": true,
+      "ToonRimFadeEnd": 800.0,
+      "ToonRimFadeStart": 200.0
+    },
+    "Budget": {
+      "DrawDistance": 50000.0,
+      "MaxInstancesPerRoom": 500000
+    },
+    "Generation": {
+      "BladeHeightMax": 12.510000228881836,
+      "BladeHeightMin": 7.679999828338623,
+      "BladeWidthMax": 1.940000057220459,
+      "BladeWidthMin": 1.7999999523162842,
+      "ClusterCoverage": 0.6499999761581421,
+      "ClusterScale": 300.0,
+      "ClusterStrength": 0.0,
+      "IndividualRandomness": 0.0,
+      "InstancesPerSquareMeter": 1048.800048828125,
+      "MinimumSpacing": 0.6000000238418579,
+      "Seed": 1
+    },
+    "LinkInteraction": {
+      "ColliderHeightMultiplier": 1.690000057220459,
+      "ColliderRadiusMultiplier": 1.190000057220459,
+      "CollisionPush": 1.659999966621399,
+      "Damping": 1.4600000381469727,
+      "FieldRadius": 600.0,
+      "FieldResolution": 256,
+      "MaximumBend": 0.8500000238418579,
+      "RecoverySeconds": 1.0,
+      "VelocityResponse": 0.8700000047683716,
+      "VerticalMargin": 69.0
+    },
+    "Performance": {
+      "CullingClusterSize": 25.0,
+      "DensityFadeFraction": 1.0,
+      "DrawFadeFraction": 0.15000000596046448,
+      "FarBladeSegments": 1,
+      "FarDensity": 1.0,
+      "FarTuftBladeCount": 4,
+      "FarTuftDensity": 2.0,
+      "FarTuftSpread": 1.0,
+      "FarTuftsEnabled": true,
+      "FrustumCulling": true,
+      "LodEndFraction": 0.3199999928474426,
+      "LodReferenceDistance": 2282.0,
+      "LodStartFraction": 0.3199999928474426,
+      "MidrangeAdaptiveCapacity": 128,
+      "MidrangeAdaptiveEnabled": false,
+      "MidrangeClusterCellExtent": 22.0,
+      "MidrangeClustersEnabled": false,
+      "MidrangeFarBladeFraction": 0.25,
+      "SegmentLodEndDistance": 1000.0,
+      "SegmentLodSoftness": 0.75,
+      "SegmentLodStartDistance": 501.0,
+      "TuftTransitionFraction": 0.47999998927116394
+    },
+    "Quality": "Custom",
+    "Wind": {
+      "DirectionDegrees": 0.0,
+      "GustFrequency": 0.3499999940395355,
+      "GustStrength": 0.3499999940395355,
+      "Randomness": 0.4399999976158142,
+      "SpatialScale": 1.0,
+      "Speed": 2.8399999141693115,
+      "Strength": 0.5600000023841858,
+      "Turbulence": 0.41999998688697815
+    }
+  },
+  "Preset": "Enhanced",
+  "RenderScale": 1.0,
+  "SchemaVersion": 15
+})json";
+}
+
+const GraphicsSettings& EnhancedPresetSettings() {
+    static const GraphicsSettings settings = [] {
+        auto loaded = DeserializeGraphicsSettings(nlohmann::json::parse(EnhancedPresetDocument()));
+        loaded.Value.Preset = GraphicsPreset::Enhanced;
+        return loaded.Value;
+    }();
+    return settings;
+}
+
 nlohmann::json
 SerializeGraphicsSettings(const GraphicsSettings& settings) {
     Json reflectionRules = Json::array();
@@ -1178,13 +1550,16 @@ SerializeGraphicsSettings(const GraphicsSettings& settings) {
                    EnumName(settings.UpscalerMode,
                             kUpscalerQualityNames)},
                   {"Sharpness", settings.UpscalerSharpness},
+                  {"DlssModel", EnumName(settings.UpscalerDlssModel, kDlssModelNames)},
               }},
          }},
         {"FrameRate",
          {{"Mode", EnumName(settings.FrameRate,
                             kFrameRateNames)}}},
         {"Presentation", {{"VSync", settings.VSync}}},
-        {"Camera", {{"FovMultiplier", settings.FovMultiplier}}},
+        {"Camera",
+         {{"FovMultiplier", settings.FovMultiplier},
+          {"ExtendedDrawDistance", settings.ExtendedDrawDistance}}},
         {"TexturePacks",
          {
              {"Azahar",
@@ -1207,6 +1582,7 @@ SerializeGraphicsSettings(const GraphicsSettings& settings) {
              settings.GrassSavedPreset)},
         {"Effects",
          {
+             {"SurfaceLighting", EnumName(effects.SurfaceLighting, kSurfaceLightingNames)},
              {"DirectionalShadows",
               {
                   {"Mode",
@@ -1215,14 +1591,55 @@ SerializeGraphicsSettings(const GraphicsSettings& settings) {
                   {"Resolution", directionalShadows.Resolution},
                   {"MaximumDistance",
                    directionalShadows.MaximumDistance},
-                  {"DepthPadding", directionalShadows.DepthPadding},
                   {"DepthBiasConstant",
                    directionalShadows.DepthBiasConstant},
                   {"DepthBiasSlope",
                    directionalShadows.DepthBiasSlope},
                   {"Strength", directionalShadows.Strength},
                   {"PcfRadius", directionalShadows.PcfRadius},
-                  {"Stabilize", directionalShadows.Stabilize},
+                  {"NormalBias", directionalShadows.NormalBias},
+                  {"ContactShadows",
+                   {{"Enabled", directionalShadows.ContactShadows.Enabled},
+                    {"Length", directionalShadows.ContactShadows.Length},
+                    {"SurfaceThickness", directionalShadows.ContactShadows.SurfaceThickness},
+                    {"Opacity", directionalShadows.ContactShadows.Opacity},
+                    {"Blur", directionalShadows.ContactShadows.Blur},
+                    {"HalfResolution", directionalShadows.ContactShadows.HalfResolution}}},
+              }},
+             {"PointShadows",
+              {
+                  {"Mode", EnumName(effects.PointShadows.Mode, kPointShadowNames)},
+                  {"Resolution", effects.PointShadows.Resolution},
+                  {"MaxLights", effects.PointShadows.MaxLights},
+                  {"Range", effects.PointShadows.Range},
+                  {"Strength", effects.PointShadows.Strength},
+              }},
+             {"GlobalIllumination",
+              {
+                  {"Mode", EnumName(effects.GlobalIllumination.Mode, kGlobalIlluminationNames)},
+                  {"Resolution",
+                   EnumName(effects.GlobalIllumination.Resolution, kGlobalIlluminationResolutionNames)},
+                  {"DiffuseIntensity", effects.GlobalIllumination.DiffuseIntensity},
+                  {"Specular", effects.GlobalIllumination.Specular},
+                  {"SpecularIntensity", effects.GlobalIllumination.SpecularIntensity},
+                  {"SceneLight", effects.GlobalIllumination.SceneLight},
+                  {"KeyLight", effects.GlobalIllumination.KeyLight},
+                  {"DynamicLights", effects.GlobalIllumination.DynamicLights},
+                  {"SkyLight", effects.GlobalIllumination.SkyLight},
+                  {"ScreenSpace",
+                   {
+                       {"Sections", effects.GlobalIllumination.ScreenSpace.Sections},
+                       {"RadialCandidates", effects.GlobalIllumination.ScreenSpace.RadialCandidates},
+                       {"Sectors", effects.GlobalIllumination.ScreenSpace.Sectors},
+                       {"Radius", effects.GlobalIllumination.ScreenSpace.Radius},
+                       {"Thickness", effects.GlobalIllumination.ScreenSpace.Thickness},
+                       {"Temporal", effects.GlobalIllumination.ScreenSpace.Temporal},
+                       {"FilterLevels", effects.GlobalIllumination.ScreenSpace.FilterLevels},
+                       {"Validation", effects.GlobalIllumination.ScreenSpace.Validation},
+                       {"WorkScale", EnumName(effects.GlobalIllumination.ScreenSpace.WorkScale,
+                                              kGlobalIlluminationResolutionNames)},
+                       {"HighlightClamp", effects.GlobalIllumination.ScreenSpace.HighlightClamp},
+                   }},
               }},
              {"AO",
               {
@@ -1231,17 +1648,31 @@ SerializeGraphicsSettings(const GraphicsSettings& settings) {
                             kAoNames)},
                   {"Quality", effects.AoQuality},
                   {"Radius", effects.AoRadius},
+                  {"DetailRadius", effects.AoDetailRadius},
                   {"Strength", effects.AoStrength},
                   {"ShadowPower", effects.AoShadowPower},
                   {"ShadowClamp", effects.AoShadowClamp},
-                  {"HorizonAngleThreshold",
-                   effects.AoHorizonAngleThreshold},
+                  {"HorizonAngleThreshold", effects.AoHorizonAngleThreshold},
+                  {"BlurPassCount", effects.AoBlurPassCount},
                   {"FadeOutFrom", effects.AoFadeOutFrom},
                   {"FadeOutTo", effects.AoFadeOutTo},
-                  {"BlurPassCount", effects.AoBlurPassCount},
                   {"Sharpness", effects.AoSharpness},
                   {"DetailStrength",
                    effects.AoDetailStrength},
+                  {"Mxao",
+                   {
+                       {"Method", EnumName(effects.MxaoMethod, kMxaoMethodNames)},
+                       {"Quality", effects.MxaoQuality},
+                       {"Filter", effects.MxaoFilter},
+                       {"Temporal", effects.MxaoTemporal},
+                       {"Normals", EnumName(effects.MxaoNormals, kMxaoNormalNames)},
+                       {"ShadingRate", effects.MxaoShadingRate},
+                       {"IncreaseRadiusWithDistance", effects.MxaoRadiusGrowsWithDistance},
+                       {"ScreenRadius", effects.MxaoScreenRadius},
+                       {"OriginalFade", effects.MxaoOriginalFade},
+                       {"FadeDistance", effects.MxaoFadeDistance},
+                   }},
+                  {"TextureRelief", EnumName(effects.AoRelief, kAoReliefNames)},
               }},
              {"Reflections",
               {
@@ -1258,6 +1689,7 @@ SerializeGraphicsSettings(const GraphicsSettings& settings) {
                    effects.ReflectionRoughnessBias},
                   {"DebugView",
                    effects.ReflectionDebugView},
+                  {"Water", effects.WaterReflections},
                   {"Materials", std::move(reflectionRules)},
               }},
              {"Toon",
@@ -1389,6 +1821,12 @@ GraphicsSettingsLoadResult DeserializeGraphicsSettings(
             ReadScalar(*upscaler, "Sharpness",
                        result.Value.UpscalerSharpness,
                        "Graphics.AA.Upscaler.Sharpness", result);
+            // Added without a schema change: absent, the runtime's default.
+            if (FindMember(*upscaler, "DlssModel") != nullptr)
+                ReadEnum(*upscaler, "DlssModel", result.Value.UpscalerDlssModel, kDlssModelNames,
+                         "Graphics.AA.Upscaler.DlssModel", result);
+            else
+                result.NeedsRewrite = true;
         }
     }
     if (const Json* frameRate =
@@ -1410,6 +1848,11 @@ GraphicsSettingsLoadResult DeserializeGraphicsSettings(
         ReadScalar(*camera, "FovMultiplier",
                    result.Value.FovMultiplier,
                    "Graphics.Camera.FovMultiplier", result);
+        // Optional: documents from before keep the native ranges.
+        if (FindMember(*camera, "ExtendedDrawDistance") != nullptr)
+            ReadScalar(*camera, "ExtendedDrawDistance",
+                       result.Value.ExtendedDrawDistance,
+                       "Graphics.Camera.ExtendedDrawDistance", result);
     }
     if (version >= 8U) {
         if (const Json* texturePacks =
@@ -1481,21 +1924,54 @@ GraphicsSettingsLoadResult DeserializeGraphicsSettings(
                 "Graphics.GrassSavedPreset", version, result);
         }
     }
+    // Schema 15: the title's shipped source and mask rules replace the
+    // configuration's own, once; everything else about the grass is kept.
+    if (version < 15U) {
+        std::optional<Json> rules;
+        {
+            std::scoped_lock lock(TitleGrassRuleMutex());
+            rules = TitleGrassRules();
+        }
+        if (rules.has_value()) {
+            const auto replace = [&](InteractiveGrassSettings& grass, const char* path) {
+                auto document = SerializeInteractiveGrassSettings(grass);
+                document["Sources"] = rules->value("Sources", Json::array());
+                document["Masks"] = rules->value("Masks", Json::array());
+                DeserializeInteractiveGrassSettings(document, grass, path,
+                                                    kGraphicsSettingsSchemaVersion, result);
+            };
+            replace(result.Value.Grass, "Graphics.Grass");
+            replace(result.Value.GrassSavedPreset, "Graphics.GrassSavedPreset");
+            result.NeedsRewrite = true;
+            result.Issues.push_back({"Graphics.Grass.Sources",
+                                     "grass source and mask rules replaced by the title's defaults", true});
+        }
+    }
 
     if (const Json* effects =
             RequireObject(document, "Effects",
                           "Graphics.Effects", result)) {
         auto& value = result.Value.Effects;
+        if (FindMember(*effects, "SurfaceLighting")) {
+            ReadEnum(*effects, "SurfaceLighting", value.SurfaceLighting,
+                     kSurfaceLightingNames, "Graphics.Effects.SurfaceLighting", result);
+        } else {
+            value.SurfaceLighting = SurfaceLightingMode::Native;
+        }
         if (version >= 3U) {
             if (const Json* shadows =
                     RequireObject(*effects, "DirectionalShadows",
                                   "Graphics.Effects.DirectionalShadows",
                                   result)) {
                 auto& settings = value.DirectionalShadows;
-                ReadEnum(*shadows, "Mode", settings.Mode,
-                         kDirectionalShadowNames,
-                         "Graphics.Effects.DirectionalShadows.Mode",
-                         result);
+                const auto* mode = FindMember(*shadows, "Mode");
+                const bool legacyMode = mode != nullptr && mode->is_string() && *mode == "SingleCascade";
+                if (legacyMode) {
+                    settings.Mode = DirectionalShadowMode::VirtualShadowMaps;
+                } else {
+                    ReadEnum(*shadows, "Mode", settings.Mode, kDirectionalShadowNames,
+                             "Graphics.Effects.DirectionalShadows.Mode", result);
+                }
                 ReadScalar(
                     *shadows, "Resolution", settings.Resolution,
                     "Graphics.Effects.DirectionalShadows.Resolution",
@@ -1504,10 +1980,6 @@ GraphicsSettingsLoadResult DeserializeGraphicsSettings(
                     *shadows, "MaximumDistance",
                     settings.MaximumDistance,
                     "Graphics.Effects.DirectionalShadows.MaximumDistance",
-                    result);
-                ReadScalar(
-                    *shadows, "DepthPadding", settings.DepthPadding,
-                    "Graphics.Effects.DirectionalShadows.DepthPadding",
                     result);
                 ReadScalar(
                     *shadows, "DepthBiasConstant",
@@ -1527,24 +1999,135 @@ GraphicsSettingsLoadResult DeserializeGraphicsSettings(
                     *shadows, "PcfRadius", settings.PcfRadius,
                     "Graphics.Effects.DirectionalShadows.PcfRadius",
                     result);
-                ReadScalar(
-                    *shadows, "Stabilize", settings.Stabilize,
-                    "Graphics.Effects.DirectionalShadows.Stabilize",
-                    result);
+                if (FindMember(*shadows, "NormalBias") != nullptr)
+                    ReadScalar(*shadows, "NormalBias", settings.NormalBias,
+                               "Graphics.Effects.DirectionalShadows.NormalBias", result);
+                // Optional: documents from before keep the defaults (off).
+                if (const Json* contact = FindMember(*shadows, "ContactShadows"); contact != nullptr) {
+                    const std::string contactPath = "Graphics.Effects.DirectionalShadows.ContactShadows.";
+                    auto& value = settings.ContactShadows;
+                    if (!contact->is_object()) {
+                        Correct(result, contactPath + "*", "non-object value restored from defaults");
+                    } else {
+                        ReadScalar(*contact, "Enabled", value.Enabled, contactPath + "Enabled", result);
+                        ReadScalar(*contact, "Length", value.Length, contactPath + "Length", result);
+                        ReadScalar(*contact, "SurfaceThickness", value.SurfaceThickness,
+                                   contactPath + "SurfaceThickness", result);
+                        ReadScalar(*contact, "Opacity", value.Opacity, contactPath + "Opacity", result);
+                        ReadScalar(*contact, "Blur", value.Blur, contactPath + "Blur", result);
+                        ReadScalar(*contact, "HalfResolution", value.HalfResolution,
+                                   contactPath + "HalfResolution", result);
+                    }
+                }
+                if (version < 12U || legacyMode) {
+                    // The old distance sized a camera-fitted map; it is not a
+                    // virtual-map coverage limit. Preserve strength/filter/bias.
+                    settings.MaximumDistance = DirectionalShadowSettings{}.MaximumDistance;
+                    settings.Resolution = std::max(settings.Resolution, 2048U);
+                    result.NeedsRewrite = true;
+                }
             }
         } else {
             value.DirectionalShadows = {};
+        }
+        // Added without a schema change: an absent object keeps the default
+        // (Off) and is written on the next save.
+        if (const Json* points = FindMember(*effects, "PointShadows"); points != nullptr && points->is_object()) {
+            auto& settings = value.PointShadows;
+            ReadEnum(*points, "Mode", settings.Mode, kPointShadowNames,
+                     "Graphics.Effects.PointShadows.Mode", result);
+            ReadScalar(*points, "Resolution", settings.Resolution,
+                       "Graphics.Effects.PointShadows.Resolution", result);
+            ReadScalar(*points, "MaxLights", settings.MaxLights,
+                       "Graphics.Effects.PointShadows.MaxLights", result);
+            ReadScalar(*points, "Range", settings.Range,
+                       "Graphics.Effects.PointShadows.Range", result);
+            ReadScalar(*points, "Strength", settings.Strength,
+                       "Graphics.Effects.PointShadows.Strength", result);
+        }
+        if (const Json* gi = FindMember(*effects, "GlobalIllumination"); gi != nullptr && gi->is_object()) {
+            auto& settings = value.GlobalIllumination;
+            ReadEnum(*gi, "Mode", settings.Mode, kGlobalIlluminationNames,
+                     "Graphics.Effects.GlobalIllumination.Mode", result);
+            ReadEnum(*gi, "Resolution", settings.Resolution, kGlobalIlluminationResolutionNames,
+                     "Graphics.Effects.GlobalIllumination.Resolution", result);
+            ReadScalar(*gi, "DiffuseIntensity", settings.DiffuseIntensity,
+                       "Graphics.Effects.GlobalIllumination.DiffuseIntensity", result);
+            // Specular GI arrived after the object: absent fields keep the
+            // defaults (off) and are written on the next save.
+            if (FindMember(*gi, "Specular") != nullptr)
+                ReadScalar(*gi, "Specular", settings.Specular,
+                           "Graphics.Effects.GlobalIllumination.Specular", result);
+            else
+                result.NeedsRewrite = true;
+            if (FindMember(*gi, "SpecularIntensity") != nullptr)
+                ReadScalar(*gi, "SpecularIntensity", settings.SpecularIntensity,
+                           "Graphics.Effects.GlobalIllumination.SpecularIntensity", result);
+            else
+                result.NeedsRewrite = true;
+            // Source gains arrived later: absent fields keep defaults.
+            for (const auto& [name, field] :
+                 {std::pair{"SceneLight", &settings.SceneLight}, std::pair{"KeyLight", &settings.KeyLight},
+                  std::pair{"DynamicLights", &settings.DynamicLights},
+                  std::pair{"SkyLight", &settings.SkyLight}}) {
+                if (FindMember(*gi, name) != nullptr)
+                    ReadScalar(*gi, name, *field,
+                               std::string("Graphics.Effects.GlobalIllumination.") + name, result);
+                else
+                    result.NeedsRewrite = true;
+            }
+            // Screen-space GI arrived later: an absent object or field keeps
+            // the defaults and is written on the next save.
+            if (const Json* ss = FindMember(*gi, "ScreenSpace"); ss != nullptr && ss->is_object()) {
+                auto& screen = settings.ScreenSpace;
+                const auto read = [&](const char* name, auto& field) {
+                    if (FindMember(*ss, name) != nullptr)
+                        ReadScalar(*ss, name, field,
+                                   std::string("Graphics.Effects.GlobalIllumination.ScreenSpace.") + name, result);
+                    else
+                        result.NeedsRewrite = true;
+                };
+                read("Sections", screen.Sections);
+                read("RadialCandidates", screen.RadialCandidates);
+                read("Sectors", screen.Sectors);
+                read("Radius", screen.Radius);
+                read("Thickness", screen.Thickness);
+                read("Temporal", screen.Temporal);
+                read("FilterLevels", screen.FilterLevels);
+                read("Validation", screen.Validation);
+                read("HighlightClamp", screen.HighlightClamp);
+                if (FindMember(*ss, "WorkScale") != nullptr)
+                    ReadEnum(*ss, "WorkScale", screen.WorkScale, kGlobalIlluminationResolutionNames,
+                             "Graphics.Effects.GlobalIllumination.ScreenSpace.WorkScale", result);
+                else
+                    result.NeedsRewrite = true;
+            } else {
+                result.NeedsRewrite = true;
+            }
+            // Controls of the retired reference composition are dropped on
+            // the next save.
+            for (const char* retired :
+                 {"ReferenceRadius", "Additive", "BounceStrength", "OcclusionStrength"})
+                if (FindMember(*gi, retired) != nullptr) result.NeedsRewrite = true;
+        } else {
+            value.GlobalIllumination = {};
+            result.NeedsRewrite = true;
         }
         if (const Json* ao =
                 RequireObject(*effects, "AO",
                               "Graphics.Effects.AO", result)) {
             ReadEnum(*ao, "Mode", value.AmbientOcclusion,
-                     kAoNames, "Graphics.Effects.AO.Mode",
-                     result);
+                     kAoNames, "Graphics.Effects.AO.Mode", result);
             ReadScalar(*ao, "Quality", value.AoQuality,
                        "Graphics.Effects.AO.Quality", result);
             ReadScalar(*ao, "Radius", value.AoRadius,
                        "Graphics.Effects.AO.Radius", result);
+            if (version < 13U) {
+                value.AoDetailRadius = value.AoRadius * 0.25F;
+            } else {
+                ReadScalar(*ao, "DetailRadius", value.AoDetailRadius,
+                           "Graphics.Effects.AO.DetailRadius", result);
+            }
             ReadScalar(*ao, "Strength", value.AoStrength,
                        "Graphics.Effects.AO.Strength", result);
             ReadScalar(*ao, "ShadowPower",
@@ -1553,24 +2136,62 @@ GraphicsSettingsLoadResult DeserializeGraphicsSettings(
             ReadScalar(*ao, "ShadowClamp",
                        value.AoShadowClamp,
                        "Graphics.Effects.AO.ShadowClamp", result);
-            ReadScalar(*ao, "HorizonAngleThreshold",
-                       value.AoHorizonAngleThreshold,
-                       "Graphics.Effects.AO.HorizonAngleThreshold",
-                       result);
+            ReadScalar(*ao, "HorizonAngleThreshold", value.AoHorizonAngleThreshold,
+                       "Graphics.Effects.AO.HorizonAngleThreshold", result);
+            ReadScalar(*ao, "BlurPassCount", value.AoBlurPassCount,
+                       "Graphics.Effects.AO.BlurPassCount", result);
             ReadScalar(*ao, "FadeOutFrom",
                        value.AoFadeOutFrom,
                        "Graphics.Effects.AO.FadeOutFrom", result);
             ReadScalar(*ao, "FadeOutTo", value.AoFadeOutTo,
                        "Graphics.Effects.AO.FadeOutTo", result);
-            ReadScalar(*ao, "BlurPassCount",
-                       value.AoBlurPassCount,
-                       "Graphics.Effects.AO.BlurPassCount", result);
             ReadScalar(*ao, "Sharpness", value.AoSharpness,
                        "Graphics.Effects.AO.Sharpness", result);
             ReadScalar(*ao, "DetailStrength",
                        value.AoDetailStrength,
                        "Graphics.Effects.AO.DetailStrength",
                        result);
+            // Added without a schema change: an absent object keeps the
+            // defaults and is written on the next save.
+            if (const Json* mxao = FindMember(*ao, "Mxao"); mxao != nullptr && mxao->is_object()) {
+                ReadEnum(*mxao, "Method", value.MxaoMethod, kMxaoMethodNames,
+                         "Graphics.Effects.AO.Mxao.Method", result);
+                ReadScalar(*mxao, "Quality", value.MxaoQuality,
+                           "Graphics.Effects.AO.Mxao.Quality", result);
+                ReadScalar(*mxao, "Filter", value.MxaoFilter,
+                           "Graphics.Effects.AO.Mxao.Filter", result);
+                if (FindMember(*mxao, "Temporal") != nullptr)
+                    ReadScalar(*mxao, "Temporal", value.MxaoTemporal,
+                               "Graphics.Effects.AO.Mxao.Temporal", result);
+                else
+                    result.NeedsRewrite = true;
+                // The original's remaining options; absent ones keep their
+                // defaults and are written on the next save.
+                if (FindMember(*mxao, "Normals") != nullptr)
+                    ReadEnum(*mxao, "Normals", value.MxaoNormals, kMxaoNormalNames,
+                             "Graphics.Effects.AO.Mxao.Normals", result);
+                else
+                    result.NeedsRewrite = true;
+                const auto readOptional = [&](const char* name, auto& field, const char* path) {
+                    if (FindMember(*mxao, name) != nullptr)
+                        ReadScalar(*mxao, name, field, path, result);
+                    else
+                        result.NeedsRewrite = true;
+                };
+                readOptional("ShadingRate", value.MxaoShadingRate, "Graphics.Effects.AO.Mxao.ShadingRate");
+                readOptional("IncreaseRadiusWithDistance", value.MxaoRadiusGrowsWithDistance,
+                             "Graphics.Effects.AO.Mxao.IncreaseRadiusWithDistance");
+                readOptional("ScreenRadius", value.MxaoScreenRadius, "Graphics.Effects.AO.Mxao.ScreenRadius");
+                readOptional("OriginalFade", value.MxaoOriginalFade, "Graphics.Effects.AO.Mxao.OriginalFade");
+                readOptional("FadeDistance", value.MxaoFadeDistance, "Graphics.Effects.AO.Mxao.FadeDistance");
+            } else {
+                result.NeedsRewrite = true;
+            }
+            if (FindMember(*ao, "TextureRelief") != nullptr)
+                ReadEnum(*ao, "TextureRelief", value.AoRelief, kAoReliefNames,
+                         "Graphics.Effects.AO.TextureRelief", result);
+            else
+                result.NeedsRewrite = true;
         }
         if (const Json* reflections =
                 RequireObject(*effects, "Reflections",
@@ -1606,6 +2227,10 @@ GraphicsSettingsLoadResult DeserializeGraphicsSettings(
             ReadScalar(*reflections, "DebugView",
                        value.ReflectionDebugView,
                        "Graphics.Effects.Reflections.DebugView",
+                       result);
+            ReadScalar(*reflections, "Water",
+                       value.WaterReflections,
+                       "Graphics.Effects.Reflections.Water",
                        result);
             if (const Json* materials =
                     FindMember(*reflections, "Materials");
@@ -1727,6 +2352,16 @@ GraphicsSettingsLoadResult LoadGraphicsSettingsConfig(
                                            std::move(fallback));
     }
     return MigrateLegacy(configRoot, std::move(fallback));
+}
+
+void InstallTitleGrassRuleDefaults(const nlohmann::json& rules) {
+    std::scoped_lock lock(TitleGrassRuleMutex());
+    TitleGrassRules() = rules;
+}
+
+void ClearTitleGrassRuleDefaults() {
+    std::scoped_lock lock(TitleGrassRuleMutex());
+    TitleGrassRules().reset();
 }
 
 bool ShouldPersistGraphicsSettings(

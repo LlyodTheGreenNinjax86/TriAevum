@@ -1,11 +1,13 @@
-# TriAevum
+# TriAevum — Echoes of Time
 
 A native PC AOT recompilation of *The Legend of Zelda: Ocarina of Time 3D*,
 with a modern NRI/Vulkan renderer, single-screen UI and customizable graphics.
+*Echoes of Time* is TriAevum's Ocarina of Time 3D project; executables, data
+folders and package names keep the TriAevum name.
 
 ## Credit Where It Belongs
 
-Before the shaders, settings and excessive grass: **TriAevum would not exist in
+Before the shaders, settings and excessive grass: **Echoes of Time would not exist in
 its current form without [TopScreen](https://gamebanana.com/mods/695893),
 developed by rlgcarrot**. Its single-screen experience is reimplemented here for
 our runtime, but the vision, care and tremendous work behind it deserve a
@@ -22,7 +24,7 @@ Grezzo**, who created the original game. [Full credits and licenses](THIRD_PARTY
 
 ## About
 
-TriAevum is an AOT recomp in the same general spirit as the Xbox 360 recomp
+Echoes of Time is an AOT recomp in the same general spirit as the Xbox 360 recomp
 projects. I just ended up spending most of my time on the renderer instead of,
 you know, actually playing the game. The goal is to push the visuals further
 without completely losing the original look.
@@ -135,7 +137,8 @@ Original contributions are licensed under **GPL-3.0-or-later**. Third-party
 components retain their own licenses and notices:
 [license scope](LICENSE_SCOPE.md) and [third-party notices](THIRD_PARTY_NOTICES.md).
 See the [release and build contract](docs/TRIAEVUM_PRECOMPILED_RELEASE.md) for
-source availability and developer packaging.
+source availability and developer packaging, and the [source map](docs/TRIAEVUM_SOURCE_MAP.md)
+for where the main components live.
 
 TriAevum is independent and is not affiliated with or endorsed by Nintendo.
 

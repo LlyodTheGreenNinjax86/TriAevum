@@ -28,6 +28,10 @@ struct TitleSceneViewSubmission {
     std::array<float, 3> Eye{};
     std::array<float, 3> At{};
     bool CameraAvailable = true;
+    // Identifies the world whose coordinates the camera and the scene draws
+    // use (0 unknown). A change means a different world: world-space caches
+    // (the scene distance field, GI) start over. Title-owned identity.
+    uint64_t WorldIdentity = 0;
 };
 
 // Optional renderer hooks owned by the OOT3D title adapter. Other Nintendo
@@ -47,6 +51,12 @@ class TitleRenderBackend {
         }
         return false;
     }
+    // Display settings (window mode, size, position, and the confirmation
+    // timeout that may roll them back) are window operations, which belong to
+    // the thread that owns the window. A host that begins some frames on
+    // another thread holds them there; the next frame begun on the owning
+    // thread applies them.
+    virtual void SetPresentationSettingsHeld(bool) {}
     virtual bool PublishSceneView(const TitleSceneViewSubmission&) {
         return false;
     }

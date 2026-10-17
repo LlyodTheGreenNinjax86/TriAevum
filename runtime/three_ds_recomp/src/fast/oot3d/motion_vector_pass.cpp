@@ -138,6 +138,7 @@ bool MotionVectorPass::Initialize(VkPhysicalDevice physicalDevice,
         pipelineDesc.shader.stage = nri::StageBits::COMPUTE_SHADER;
         pipelineDesc.shader.bytecode = shader.data();
         pipelineDesc.shader.size = shader.size() * sizeof(uint32_t);
+        pipelineDesc.cache = NriInteropAccess::PipelineCache(interop);
         if (mImpl->Core->CreateComputePipeline(
                 *nriDevice, pipelineDesc, mImpl->Pipeline) !=
             nri::Result::SUCCESS)
@@ -253,7 +254,7 @@ bool MotionVectorPass::Configure(
     (void)depthFormat; (void)materialGuideFormat; (void)rigidMotionGuideFormat;
     return false;
 #else
-    if (mImpl->Width != 0 && vkDeviceWaitIdle(mImpl->Device) != VK_SUCCESS)
+    if (mImpl->Width != 0 && !mImpl->Interop->CompleteRecordedWork())
         return false;
     InvalidateScreenResources();
     try {

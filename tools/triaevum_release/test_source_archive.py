@@ -126,13 +126,6 @@ class SourceArchiveTests(unittest.TestCase):
                 policy,
             )
         )
-        root_cmake = (REPO_ROOT / "CMakeLists.txt").read_text(encoding="utf-8")
-        renderer = (
-            REPO_ROOT
-            / "runtime/three_ds_recomp/src/oot3d/Oot3dNativeFast3dRenderer.cpp"
-        ).read_text(encoding="utf-8")
-        self.assertNotIn("z_fog_material_scalar.c", root_cmake)
-        self.assertNotIn("fog_material_scalar.h", renderer)
 
     def test_ui_contract_is_public_and_has_no_private_build_dependency(self) -> None:
         policy = json.loads(DEFAULT_POLICY.read_text(encoding="utf-8"))
@@ -147,7 +140,9 @@ class SourceArchiveTests(unittest.TestCase):
                 self.assertTrue(source_path_allowed(relative, policy))
         self.assertEqual(list(source_contract_errors(
             files, lambda path: (REPO_ROOT / path).read_bytes(), policy)), [])
-        root_cmake = (REPO_ROOT / "CMakeLists.txt").read_text()
+        # The root and the area files it includes describe the build.
+        build_files = [REPO_ROOT / "CMakeLists.txt", *sorted((REPO_ROOT / "CMake/oot3d").glob("*.cmake"))]
+        root_cmake = "\n".join(path.read_text() for path in build_files)
         self.assertIn("add_subdirectory(tools/oot3d/ui_contract", root_cmake)
         self.assertNotIn("OOT3D_NATIVE_UI_EVIDENCE_ROOT", root_cmake)
         self.assertNotIn("add_library(oot3d_native_ui_contract INTERFACE)", root_cmake)

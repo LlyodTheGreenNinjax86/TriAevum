@@ -9,6 +9,7 @@
 #include <shaderc/shaderc.hpp>
 
 #include <algorithm>
+#include <cstdio>
 #include <array>
 #include <cctype>
 #include <fstream>
@@ -153,20 +154,34 @@ void CachedPassShaderCompiler::Configure(std::filesystem::path directory) {
 
 std::span<const uint32_t> FindBuiltinPassShaderSpirv(std::string_view source,
     SpirvStage stage, const ShaderDefines& defines, uint32_t vulkanMinor) {
-    return FindPassShaderArtifact(kBuiltinPassArtifacts, source, stage, defines, vulkanMinor);
+    return FindPassShaderArtifact(BuiltinPassArtifacts(), source, stage, defines, vulkanMinor);
 }
 
 bool CachedPassShaderCompiler::Enabled() const {
     return !mDirectory.empty() && !ShadercCompilerContract().empty();
 }
 
+void CachedPassShaderCompiler::AddArtifacts(std::span<const PassShaderArtifact> artifacts) {
+    if (artifacts.empty()) return;
+    for (const auto& [data, size] : mArtifacts)
+        if (data == artifacts.data()) return;
+    mArtifacts.emplace_back(artifacts.data(), artifacts.size());
+}
+
 std::vector<uint32_t> CachedPassShaderCompiler::Resolve(
     std::string_view source, SpirvStage stage, const char* name, const ShaderDefines& defines) {
-    const auto artifact = FindBuiltinPassShaderSpirv(source, stage, defines);
+    auto artifact = FindBuiltinPassShaderSpirv(source, stage, defines);
+    for (const auto& [data, size] : mArtifacts) {
+        if (!artifact.empty()) break;
+        artifact = FindPassShaderArtifact(std::span(data, size), source, stage, defines);
+    }
     if (!artifact.empty()) {
         ++mBuiltinArtifactHits;
         return {artifact.begin(), artifact.end()};
     }
+    // A fixed pass absent from the built-in catalogue (resolved once per pipeline).
+    std::fprintf(stderr, "TRIAEVUM_PASS_ARTIFACT_MISS name=%s stage=%d defines=%zu\n",
+                 name != nullptr ? name : "", static_cast<int>(stage), defines.size());
     std::string variant = "/pass-vulkan1.2/performance/main/v1";
     for (const auto& [key, value] : defines)
         variant += "/" + std::to_string(key.size()) + ":" + key +

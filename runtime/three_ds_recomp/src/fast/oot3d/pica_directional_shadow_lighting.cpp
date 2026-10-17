@@ -1,6 +1,7 @@
 #include "fast/oot3d/pica_directional_shadow_lighting.h"
 
 #include "fast/oot3d/pica_directional_shadow_semantics.h"
+#include "fast/renderer3ds/virtual_shadow_receiver_shader.h"
 
 #include <algorithm>
 #include <string_view>
@@ -11,8 +12,7 @@ namespace {
 uint64_t LightingVariantKey(uint64_t original, bool fragmentPrimary) {
     constexpr uint64_t kOffset = 1469598103934665603ULL;
     constexpr uint64_t kPrime = 1099511628211ULL;
-    constexpr std::string_view kSalt =
-        "OOT3D_PICA_DIRECTIONAL_SHADOW_LIGHTING_V2";
+    constexpr std::string_view kSalt = "OOT3D_PICA_VIRTUAL_SHADOW_LIGHTING_V10";
     uint64_t hash = kOffset;
     for (unsigned shift = 0U; shift < 64U; shift += 8U) {
         hash ^= static_cast<uint8_t>(original >> shift);
@@ -27,99 +27,94 @@ uint64_t LightingVariantKey(uint64_t original, bool fragmentPrimary) {
 }
 
 std::string LightingDeclarations() {
-    return R"glsl(layout(set=0,binding=10) uniform sampler2D oot3d_directional_shadow_map;
-layout(set=0,binding=12,std140) uniform Oot3dDirectionalShadowReceiver {
-    mat4 view_to_shadow_texture;
-    vec4 shadow_state;
-    vec4 shadowed_direct_fraction;
-    uvec4 extent;
-} oot3d_directional_shadow;
-float oot3d_directional_shadow_texel(
-    ivec2 location, ivec2 map_extent, float receiver_depth) {
-    float blocker = texelFetch(
-        oot3d_directional_shadow_map,
-        clamp(location, ivec2(0), map_extent - ivec2(1)), 0).r;
-    return receiver_depth > blocker ? 1.0 : 0.0;
+    return std::string(Renderer3ds::VirtualShadowReceiverShader()) + R"glsl(
+// Contact shadows of the shadow light (screen space, this sample), with the
+// light's shadow strength as the map's (Godot's light shadow opacity).
+layout(set=0,binding=29) uniform sampler2D pica_contact_shadow;
+float oot3d_contact_shadow_visibility(vec3 position) {
+    if (pica_vsm.receiver.y < 0.5) return 1.0;
+    vec4 clip = pica_vsm.contact_projection * vec4(position, 1.0);
+    if (clip.w <= 0.0) return 1.0;
+    vec2 uv = clip.xy / clip.w * 0.5 + 0.5;
+    if (any(lessThan(uv, vec2(0.0))) || any(greaterThan(uv, vec2(1.0)))) return 1.0;
+    float contact = textureLod(pica_contact_shadow, uv, 0.0).r;
+    return max(0.0, 1.0 - (1.0 - contact) * clamp(pica_vsm.shadow_state.x, 0.0, 4.0));
 }
-float oot3d_directional_shadow_axis_weight(
-    int offset, int radius, float fraction) {
-    if (offset == -radius) {
-        return 1.0 - fraction;
+// The lighting asks once per shadowed term of each matched light; the
+// visibility of a fragment is looked up once. A smooth-shaded receiver passes
+// its vertex normal (view space) for the normal bias, others zero. As Godot,
+// the contact shadows join the map by min().
+// The filter gets no receiver-plane depth slope: the slope of a flat triangle
+// is constant across it and breaks at its edges, so on a smooth-shaded
+// low-poly receiver the shadows showed its facets. The depth and normal
+// biases cover the filter's footprint instead.
+bool oot3d_directional_shadow_ready = false;
+vec3 oot3d_directional_shadow_value = vec3(1.0);
+vec3 oot3d_directional_shadow_visibility(vec3 normal) {
+    if ((pica_vsm.extent.w & 1u) == 0u) return vec3(1.0);
+    if (!oot3d_directional_shadow_ready) {
+        oot3d_directional_shadow_value =
+            vec3(min(pica_vsm_visibility(-pica_view, vec3(0.0), vec3(0.0), normal),
+                     oot3d_contact_shadow_visibility(-pica_view)));
+        oot3d_directional_shadow_ready = true;
     }
-    if (offset == radius + 1) {
-        return fraction;
-    }
-    return 1.0;
-}
-vec3 oot3d_directional_shadow_visibility() {
-    uint flags = oot3d_directional_shadow.extent.w;
-    if ((flags & 1u) == 0u ||
-        oot3d_directional_shadow.extent.x == 0u ||
-        oot3d_directional_shadow.extent.y == 0u) {
-        return vec3(1.0);
-    }
-    vec4 shadow_h =
-        oot3d_directional_shadow.view_to_shadow_texture *
-        vec4(-pica_view, 1.0);
-    if (abs(shadow_h.w) <= 1.0e-7) {
-        return vec3(1.0);
-    }
-    vec3 shadow = shadow_h.xyz / shadow_h.w;
-    if (any(lessThan(shadow, vec3(0.0))) ||
-        any(greaterThan(shadow, vec3(1.0)))) {
-        return vec3(1.0);
-    }
-    ivec2 map_extent = textureSize(oot3d_directional_shadow_map, 0);
-    vec2 texel_position =
-        shadow.xy * vec2(map_extent) - vec2(0.5);
-    ivec2 texel_base = ivec2(floor(texel_position));
-    vec2 texel_fraction = fract(texel_position);
-    int radius = int(min(oot3d_directional_shadow.extent.z, 2u));
-    float weighted_occlusion = 0.0;
-    float weight_sum = 0.0;
-    float receiver_depth = shadow.z -
-        max(oot3d_directional_shadow.shadow_state.w, 0.0);
-    // Combine the bilinear footprints of the (2r+1)^2 box taps. Shared
-    // texels collapse to one weighted comparison, so radius 1 needs 16
-    // fetches instead of 36 while coverage remains continuous in UV.
-    for (int y = -2; y <= 3; ++y) {
-        if (y < -radius || y > radius + 1) {
-            continue;
-        }
-        float weight_y = oot3d_directional_shadow_axis_weight(
-            y, radius, texel_fraction.y);
-        for (int x = -2; x <= 3; ++x) {
-            if (x < -radius || x > radius + 1) {
-                continue;
-            }
-            float weight_x = oot3d_directional_shadow_axis_weight(
-                x, radius, texel_fraction.x);
-            float weight = weight_x * weight_y;
-            weighted_occlusion += weight *
-                oot3d_directional_shadow_texel(
-                    texel_base + ivec2(x, y), map_extent,
-                    receiver_depth);
-            weight_sum += weight;
-        }
-    }
-    float coverage = weight_sum > 0.0
-        ? weighted_occlusion / weight_sum : 0.0;
-    float strength = clamp(
-        oot3d_directional_shadow.shadow_state.x, 0.0, 1.0);
-    vec3 direct_fraction = clamp(
-        oot3d_directional_shadow.shadowed_direct_fraction.rgb,
-        vec3(0.0), vec3(1.0));
-    return vec3(1.0) - coverage * strength * direct_fraction;
+    return oot3d_directional_shadow_value;
 }
 )glsl";
 }
 
 } // namespace
 
+std::string PicaDirectionalShadowLightingDeclarations() { return LightingDeclarations(); }
+
+PicaDirectionalShadowReceiverUniforms PackPicaDirectionalShadowReceiverUniforms(
+    const DirectionalShadowMatrix& viewToWorld, const PicaDirectionalShadowHistoryState& history) noexcept {
+    PicaDirectionalShadowReceiverUniforms uniforms;
+    PackPicaDirectionalShadowReceiverUniforms(viewToWorld, history, uniforms);
+    return uniforms;
+}
+
+void PackPicaDirectionalShadowReceiverUniforms(const DirectionalShadowMatrix& viewToWorld,
+                                               const PicaDirectionalShadowHistoryState& history,
+                                               PicaDirectionalShadowReceiverUniforms& uniforms) noexcept {
+    const auto& layout = history.Virtual;
+    const bool dissolving = history.Dissolving();
+    const uint32_t regions = std::max<uint32_t>(history.AtlasRegions, 1U);
+    uniforms.ShadowState = { std::clamp(history.Strength, 0.0F, 4.0F),
+                             1.0F / float(layout.AtlasResolution * regions), layout.MaximumDistance,
+                             std::max(history.DepthBias, 0.0F) };
+    uniforms.Receiver = { std::clamp(history.NormalBias, 0.0F, 10.0F), history.ContactShadows ? 1.0F : 0.0F, 0.0F,
+                          0.0F };
+    uniforms.ContactProjection = history.ContactShadows
+        ? MultiplyDirectionalShadowMatrices(history.WorldToContactClip, viewToWorld) : DirectionalShadowMatrix{};
+    uniforms.Extent = { layout.AtlasResolution, layout.AtlasResolution, std::min<uint32_t>(history.PcfRadius, 2U),
+                        kPicaDirectionalShadowBoundFlag | (dissolving ? kPicaDirectionalShadowDissolveFlag : 0U) };
+    uniforms.Dissolve = { dissolving ? std::clamp(history.NewerWeight, 0.0F, 1.0F) : 1.0F,
+                          1.0F / float(layout.AtlasResolution), float(history.Region * layout.AtlasResolution),
+                          dissolving ? float(history.Older->Region * layout.AtlasResolution) : 0.0F };
+    const auto pack = [&](PicaDirectionalShadowReceiverLayout& destination,
+                          const Renderer3ds::VirtualShadowLayout& source,
+                          const std::array<uint32_t, Renderer3ds::kVirtualShadowTableEntries>& table) {
+        destination.ViewToLight = MultiplyDirectionalShadowMatrices(source.WorldToLight, viewToWorld);
+        destination.CameraLight = { source.CameraLight[0], source.CameraLight[1], source.CameraLight[2],
+                                    float(source.LevelCount) };
+        for (size_t level = 0; level < source.LevelCount; ++level) {
+            const auto& grid = source.Levels[level];
+            destination.Levels[level] = { float(grid.OriginX), float(grid.OriginY), grid.PageWorldSize, 0 };
+        }
+        for (size_t level = source.LevelCount; level < destination.Levels.size(); ++level)
+            destination.Levels[level] = {};
+        destination.PageTable = table;
+    };
+    pack(uniforms.Layouts[0], layout, history.PageTable);
+    if (dissolving)
+        pack(uniforms.Layouts[1], history.Older->Virtual, history.Older->PageTable);
+}
+
+
 PicaDirectionalShadowLightingInstrumentation
-BuildPicaDirectionalShadowLightingInstrumentation(
-    uint64_t originalFragmentKey, bool enabled,
-    const ::Oot3d::Renderer::PicaShaderHookLayout& hooks) {
+BuildPicaDirectionalShadowLightingInstrumentation(uint64_t originalFragmentKey, bool enabled,
+                                                  const ::Oot3d::Renderer::PicaShaderHookLayout& hooks) {
     using ::Oot3d::Renderer::PicaShaderHook;
     using ::Oot3d::Renderer::PicaShaderSemantic;
 
@@ -129,80 +124,42 @@ BuildPicaDirectionalShadowLightingInstrumentation(
         return result;
     }
     if (!hooks.Valid() || !hooks.Supports(PicaShaderHook::PicaLighting)) {
-        result.Eligibility =
-            PicaDirectionalShadowLightingEligibility::UnsupportedShader;
+        result.Eligibility = PicaDirectionalShadowLightingEligibility::UnsupportedShader;
         return result;
     }
 
     const bool fragmentPrimary =
-        hooks.Has(PicaShaderSemantic::MaterialLightingPoint) &&
-        hooks.Has(PicaShaderSemantic::SecondaryFragmentColor);
-    const bool vertexPrimary =
-        hooks.Has(PicaShaderSemantic::VertexLightingPoint) &&
-        hooks.Has(PicaShaderSemantic::PrimaryColorInput) &&
-        hooks.Has(PicaShaderSemantic::PrimaryColorConsumed);
+        hooks.Has(PicaShaderSemantic::MaterialLightingPoint) && hooks.Has(PicaShaderSemantic::SecondaryFragmentColor);
+    const bool vertexPrimary = hooks.Has(PicaShaderSemantic::VertexLightingPoint) &&
+                               hooks.Has(PicaShaderSemantic::PrimaryColorInput) &&
+                               hooks.Has(PicaShaderSemantic::PrimaryColorConsumed);
     if (!fragmentPrimary && !vertexPrimary) {
-        result.Eligibility =
-            PicaDirectionalShadowLightingEligibility::UnsupportedShader;
+        result.Eligibility = PicaDirectionalShadowLightingEligibility::UnsupportedShader;
         return result;
     }
 
     result.Declarations = LightingDeclarations();
-    result.Body = fragmentPrimary
-        ? "\n    primary_fragment_color.rgb *= "
-          "oot3d_directional_shadow_visibility(); // OOT3D shadow lighting\n"
-        : "\n    rounded_primary_color.rgb *= "
-          "oot3d_directional_shadow_visibility(); // OOT3D shadow lighting\n";
-    result.FragmentKey = LightingVariantKey(
-        originalFragmentKey, fragmentPrimary);
-    result.Eligibility = fragmentPrimary
-        ? PicaDirectionalShadowLightingEligibility::FragmentPrimary
-        : PicaDirectionalShadowLightingEligibility::VertexPrimary;
+    result.FragmentKey = LightingVariantKey(originalFragmentKey, fragmentPrimary);
+    result.Eligibility = fragmentPrimary ? PicaDirectionalShadowLightingEligibility::FragmentPrimary
+                                         : PicaDirectionalShadowLightingEligibility::VertexPrimary;
     return result;
 }
 
 PicaDirectionalShadowReceiverBinding
-BuildPicaDirectionalShadowReceiverBinding(
-    const DirectionalShadowMatrix& currentViewToWorld,
-    const PicaNativeLightingState& nativeLighting,
-    bool skinnedGeometry,
-    const PicaDirectionalShadowHistoryState& history) noexcept {
-    PicaDirectionalShadowReceiverBinding result{};
-    if (!history.Valid()) {
+BuildPicaSurfaceShadowReceiverBinding(const DirectionalShadowMatrix& currentViewToWorld,
+                                      std::span<const PicaSurfaceShadowLight> lights,
+                                      const PicaDirectionalShadowHistoryState& history) noexcept {
+    PicaDirectionalShadowReceiverBinding result;
+    if (!history.Valid())
         return result;
-    }
-    const auto receiverLight = ResolvePicaDirectionalShadowReceiverLight(
-        nativeLighting, currentViewToWorld,
-        history.WorldLightDirectionTowardSource);
-    result.Classification = receiverLight.Classification;
-    if (skinnedGeometry ||
-        (receiverLight.Classification !=
-             PicaDirectionalShadowReceiverClass::AmbientOnly &&
-         receiverLight.Classification !=
-             PicaDirectionalShadowReceiverClass::LightingDisabled)) {
+    const uint16_t mask =
+        ResolvePicaSurfaceDirectionalShadowMask(lights, currentViewToWorld, history.WorldLightDirectionTowardSource);
+    result.Classification = mask != 0U ? PicaDirectionalShadowReceiverClass::DirectMatched
+                                       : PicaDirectionalShadowReceiverClass::DirectUnmatched;
+    if (mask == 0U)
         return result;
-    }
-    result.Contribution =
-        PicaDirectionalShadowReceiverContribution::BakedRigidMaterial;
-    auto& uniforms = result.Uniforms;
-    uniforms.ViewToShadowTexture = MultiplyDirectionalShadowMatrices(
-        history.WorldToShadowTexture, currentViewToWorld);
-    uniforms.ShadowState = {
-        std::clamp(history.Strength, 0.0F, 1.0F),
-        1.0F / static_cast<float>(history.Resolution),
-        0.0F,
-        std::max(history.DepthBias, 0.0F),
-    };
-    // Baked/ambient-only rigid materials carry no separable native direct
-    // term. Their whole pre-TEV primary contribution is the receiver term
-    // for the optional enhanced shadow map.
-    uniforms.ShadowedDirectFraction = {1.0F, 1.0F, 1.0F, 0.0F};
-    uniforms.Extent = {
-        history.Resolution,
-        history.Resolution,
-        std::min<uint32_t>(history.PcfRadius, 2U),
-        1U,
-    };
+    PackPicaDirectionalShadowReceiverUniforms(currentViewToWorld, history, result.Uniforms);
+    result.Uniforms.Receiver[3] = static_cast<float>(mask);
     return result;
 }
 

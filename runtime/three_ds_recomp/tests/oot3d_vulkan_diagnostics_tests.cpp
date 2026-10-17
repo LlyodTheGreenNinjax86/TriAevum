@@ -351,7 +351,11 @@ TEST(Oot3dVulkanDiagnostics, WritesBoundedAuthenticFrameTrace) {
         true, 11U, 12U);
     diagnostics.RecordNriPicaDisplayCopy(true, 4U);
     diagnostics.RecordNriPicaMemoryFillClear(true, true, 2U);
-    diagnostics.RecordNriDirectionalShadow(37U, true);
+    diagnostics.RecordNriDirectionalShadow(37U, true, 5U);
+    diagnostics.RecordNriPointShadowMap(true, 6U, 4U, 2U, 31U, 3U);
+    diagnostics.RecordNriPointShadowMap(false, 1U, 9U, 9U, 9U, 9U);
+    diagnostics.RecordNriPointShadowReceiver(true);
+    diagnostics.RecordNriPointShadowReceiver(false);
     diagnostics.RecordNriDirectionalShadowAttempt(41U, 19U, 7U);
     diagnostics.RecordNriDirectionalShadowLightSelection(
         19U, 3U, 97.5F, 0.25F, 0.75F, -0.5F);
@@ -366,12 +370,21 @@ TEST(Oot3dVulkanDiagnostics, WritesBoundedAuthenticFrameTrace) {
         true, true, true);
     diagnostics.RecordNriDirectionalShadowSchedule(
         false, false, true);
+    diagnostics.RecordNriDirectionalShadowPreparation(true, false);
+    diagnostics.RecordNriDirectionalShadowPreparation(true, true);
+    diagnostics.RecordNriDirectionalShadowPreparation(false, false);
+    diagnostics.RecordNriDirectionalShadowPreparedAlpha(true);
+    diagnostics.RecordNriDirectionalShadowPreparedAlpha(true);
+    diagnostics.RecordNriDirectionalShadowPreparedAlpha(false);
+    diagnostics.RecordNriDirectionalShadowPreparedReuse();
+    diagnostics.RecordNriDirectionalShadowPreparedMap(true);
+    diagnostics.RecordNriDirectionalShadowPreparedMap(false);
     diagnostics.RecordSceneCompositePass(true, true, true);
     diagnostics.RecordSmaa1x(true, true, true, true, true);
-    diagnostics.RecordCacaoPass(true, true);
-    diagnostics.RecordCacaoAmbientGuideDraw(true);
-    diagnostics.RecordCacaoAmbientGuideDraw(false);
-    diagnostics.RecordCacaoAmbientComposite();
+    diagnostics.RecordAmbientOcclusionPass(true, true);
+    diagnostics.RecordAmbientOcclusionAmbientGuideDraw(true);
+    diagnostics.RecordAmbientOcclusionAmbientGuideDraw(false);
+    diagnostics.RecordAmbientOcclusionAmbientComposite();
     diagnostics.RecordToonDraw(true);
     Fast::Oot3d::RendererValidationSnapshot validation;
     validation.VulkanEnabled = true;
@@ -407,7 +420,7 @@ TEST(Oot3dVulkanDiagnostics, WritesBoundedAuthenticFrameTrace) {
     timings.FrameMilliseconds = 4.5;
     timings.NativePicaMilliseconds = 2.25;
     timings.ToonRasterMilliseconds = 1.5;
-    timings.CacaoMilliseconds = 0.75;
+    timings.AmbientOcclusionMilliseconds = 0.75;
     timings.DepthPreparationMilliseconds = 0.25;
     timings.ReflectionMilliseconds = 0.5;
     timings.AntiAliasingMilliseconds = 0.125;
@@ -757,6 +770,26 @@ TEST(Oot3dVulkanDiagnostics, WritesBoundedAuthenticFrameTrace) {
         frame.at("nri_directional_shadow_schedule_duplicate_count"), 1U);
     EXPECT_EQ(
         frame.at("nri_directional_shadow_schedule_surface_end_count"), 2U);
+    EXPECT_EQ(frame.at("nri_directional_shadow_prepared_draw_count"), 3U);
+    EXPECT_EQ(frame.at("nri_directional_shadow_prepared_caster_count"), 2U);
+    EXPECT_EQ(frame.at("nri_directional_shadow_prepared_transient_count"), 1U);
+    EXPECT_EQ(frame.at("nri_directional_shadow_prepared_reuse_count"), 1U);
+    EXPECT_EQ(frame.at("nri_directional_shadow_prepared_map_count"), 2U);
+    EXPECT_EQ(
+        frame.at("nri_directional_shadow_prepared_map_before_opaque_count"),
+        1U);
+    EXPECT_EQ(frame.at("nri_directional_shadow_prepared_alpha_caster_count"), 2U);
+    EXPECT_EQ(frame.at("nri_directional_shadow_prepared_alpha_rejected_count"), 1U);
+    EXPECT_EQ(frame.at("nri_directional_shadow_alpha_caster_draw_count"), 5U);
+    EXPECT_EQ(frame.at("nri_point_shadow_map_attempt_count"), 2U);
+    EXPECT_EQ(frame.at("nri_point_shadow_map_count"), 1U);
+    EXPECT_EQ(frame.at("nri_point_shadow_candidate_light_count"), 7U);
+    EXPECT_EQ(frame.at("nri_point_shadow_light_count"), 4U);
+    EXPECT_EQ(frame.at("nri_point_shadow_rendered_light_count"), 2U);
+    EXPECT_EQ(frame.at("nri_point_shadow_caster_draw_count"), 31U);
+    EXPECT_EQ(frame.at("nri_point_shadow_alpha_caster_draw_count"), 3U);
+    EXPECT_EQ(frame.at("nri_point_shadow_receiver_draw_count"), 2U);
+    EXPECT_EQ(frame.at("nri_point_shadow_receiver_bound_draw_count"), 1U);
     EXPECT_EQ(
         frame.at("nri_directional_shadow_receiver_eligible_draw_count"),
         2U);
@@ -959,12 +992,12 @@ TEST(Oot3dVulkanDiagnostics, WritesBoundedAuthenticFrameTrace) {
     EXPECT_TRUE(frame.at("scene_composite_output_nri_owned").get<bool>());
     EXPECT_TRUE(frame.at("scene_composite_compute_nri_owned").get<bool>());
     EXPECT_TRUE(frame.at("scene_composite_barriers_nri_owned").get<bool>());
-    EXPECT_TRUE(frame.at("cacao_output_nri_owned").get<bool>());
-    EXPECT_EQ(frame.at("cacao_normal_guide_pass_count"), 1U);
-    EXPECT_EQ(frame.at("cacao_ambient_guide_draw_count"), 2U);
-    EXPECT_EQ(frame.at("cacao_ambient_rgb_guide_draw_count"), 1U);
-    EXPECT_EQ(frame.at("cacao_ambient_fallback_guide_draw_count"), 1U);
-    EXPECT_EQ(frame.at("cacao_ambient_composite_count"), 1U);
+    EXPECT_TRUE(frame.at("ambient_occlusion_output_nri_owned").get<bool>());
+    EXPECT_EQ(frame.at("ambient_occlusion_normal_guide_pass_count"), 1U);
+    EXPECT_EQ(frame.at("ambient_occlusion_ambient_guide_draw_count"), 2U);
+    EXPECT_EQ(frame.at("ambient_occlusion_ambient_rgb_guide_draw_count"), 1U);
+    EXPECT_EQ(frame.at("ambient_occlusion_ambient_fallback_guide_draw_count"), 1U);
+    EXPECT_EQ(frame.at("ambient_occlusion_ambient_composite_count"), 1U);
     EXPECT_EQ(frame.at("toon_draw_count"), 1U);
     EXPECT_EQ(frame.at("pica_material_toon_draw_count"), 1U);
     EXPECT_TRUE(frame.at("vulkan_validation_enabled").get<bool>());
@@ -1145,7 +1178,7 @@ TEST(Oot3dVulkanDiagnostics, WritesBoundedAuthenticFrameTrace) {
     EXPECT_EQ(frame.at("last_depth_physical_address"), 0x4000U);
     EXPECT_DOUBLE_EQ(frame.at("gpu").at("frame_ms"), 4.5);
     EXPECT_DOUBLE_EQ(frame.at("gpu").at("toon_raster_ms"), 1.5);
-    EXPECT_DOUBLE_EQ(frame.at("gpu").at("cacao_ms"), 0.75);
+    EXPECT_DOUBLE_EQ(frame.at("gpu").at("ambient_occlusion_ms"), 0.75);
     EXPECT_DOUBLE_EQ(
         frame.at("gpu").at("depth_preparation_ms"), 0.25);
     EXPECT_DOUBLE_EQ(frame.at("gpu").at("reflection_ms"), 0.5);

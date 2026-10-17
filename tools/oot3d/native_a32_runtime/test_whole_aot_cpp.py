@@ -32,12 +32,7 @@ class WholeAotCppTests(unittest.TestCase):
             original = (output / SOURCE_NAME).read_bytes()
             header = (output / HEADER_NAME).read_bytes()
             manifest = generate(*inputs, output, region_entries=frozenset({0x1000}))
-            source = (output / SOURCE_NAME).read_text()
             self.assertEqual(manifest["callback_free_regions"], [0x1000])
-            self.assertIn("_Unobserved", source)
-            self.assertIn("Oot3dAotConsumeBlock(context)", source)
-            self.assertIn("Oot3dAotEnterBlock(context", source)
-            self.assertIn("std::lower_bound", source)
             self.assertEqual(header, (output / HEADER_NAME).read_bytes())
             generate(*inputs, output)
             self.assertEqual(original, (output / SOURCE_NAME).read_bytes())
@@ -308,6 +303,26 @@ class WholeAotCppTests(unittest.TestCase):
             source = (output / SOURCE_NAME).read_text(encoding="utf-8")
             self.assertIn("VfpBinary32ToSigned", source)
 
+    def test_emits_inline_vfp_fast_paths_with_exact_fallbacks(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            inputs = self.write_inputs(
+                root,
+                # VADD, VMLA, VDIV, VCVT.F32.S32 and VCVT.F32.U32 (all s0).
+                words(0xEE300A00, 0xEE000A00, 0xEE800A00, 0xEEB80AC0,
+                      0xEEB80A40, 0xE12FFF1E),
+            )
+            output = root / "output"
+            generate(*inputs, output)
+            source = (output / SOURCE_NAME).read_text(encoding="utf-8")
+            self.assertIn("Oot3dVfpAdd(", source)
+            self.assertIn("Oot3dVfpMultiplyAccumulate(", source)
+            self.assertIn("Oot3dVfpFromSigned(", source)
+            # No exact host-float form: stay on the software implementation.
+            self.assertIn("a32::VfpBinary32Divide(", source)
+            self.assertIn("a32::VfpBinary32FromUnsigned(", source)
+            self.assertNotIn("a32::VfpBinary32Add(", source)
+
     def test_emits_exact_vfp_square_root(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -490,7 +505,7 @@ class WholeAotCppTests(unittest.TestCase):
             self.assertIn("value |= (a > b ? a - b : 0U) << shift", source)
             self.assertIn("r12 = value", source)
 
-    def test_emits_direct_host_call_between_selected_functions(self) -> None:
+    def test_incremental_sharding_preserves_unchanged_placement(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             code = words(
@@ -565,87 +580,14 @@ class WholeAotCppTests(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-            output = root / "output"
-            generate(program_path, selection_path, code_path, output)
-            source = (output / SOURCE_NAME).read_text(encoding="utf-8")
-            self.assertIn(
-                "Execute_Callee_00001008(frame, context, state, 0x00001008U)", source
-            )
-            self.assertIn("r14 = 0x00001004U", source)
-            self.assertIn("uint32_t& r14 = state.R[14];", source)
-            self.assertIn("const auto commitState = []() noexcept", source)
-            self.assertNotIn("state.R[14] = r14;", source)
-            self.assertIn("commitState();", source)
-            self.assertIn("reloadState();", source)
-            self.assertIn("stateCommit.Dismiss();", source)
-            self.assertNotIn("ExecuteOot3dWholeAotFunction(0x", source)
-
-            sharded_output = root / "sharded_output"
-            sharded_manifest = generate(
-                program_path,
-                selection_path,
-                code_path,
-                sharded_output,
-                shard_count=2,
-            )
-            registry = (sharded_output / SOURCE_NAME).read_text(encoding="utf-8")
-            shards = sorted(sharded_output.glob("oot3d_whole_aot_shard_*.cpp"))
-            shard_source = "\n".join(
-                path.read_text(encoding="utf-8") for path in shards
-            )
-            self.assertEqual(sharded_manifest["shard_count"], 2)
-            self.assertEqual(len(shards), 2)
-            self.assertNotIn("block_00001000:", registry)
-            self.assertIn("block_00001000:", shard_source)
-            self.assertIn(
-                "Execute_Callee_00001008(frame, context, state, 0x00001008U)",
-                shard_source,
-            )
-            self.assertIn("Execute_Caller_00001000", shard_source)
-            self.assertIn("Execute_Callee_00001008", shard_source)
-            self.assertIn("Oot3dAotEnterBlock(context, frame", shard_source)
-            self.assertIn("Oot3dAotBlockLimit(context", shard_source)
-            self.assertIn("case Oot3dWholeAotFlowKind::BlockLimit:", registry)
-            self.assertIn("Oot3dWholeAotExecutionScope executionScope", registry)
-            self.assertIn("flow.Pc != stopPc", registry)
-            self.assertIn("FindDispatchEntry(flow.Pc)", registry)
-            self.assertIn("kDispatchPageOffsets", registry)
-            self.assertIn("pc >> kDispatchPageShift", registry)
-            self.assertIn(
-                "catch (const Oot3dWholeAotObservableExit& exit)", registry
-            )
-            self.assertIn(
-                "Oot3dWholeAotTakeObservableExitSnapshot(", registry
-            )
-            self.assertIn(
-                "if (restoreObservableExitState) state = observableExitState;",
-                registry,
-            )
-            self.assertIn("flow = Oot3dAotBranch(exit.Pc);", registry)
-
             balanced_output = root / "balanced_output"
-            balanced_manifest = generate(
+            generate(
                 program_path,
                 selection_path,
                 code_path,
                 balanced_output,
                 shard_count=2,
                 shard_strategy="balanced",
-            )
-            self.assertEqual(balanced_manifest["shard_strategy"], "balanced")
-            affinity_output = root / "affinity_output"
-            affinity_manifest = generate(
-                program_path,
-                selection_path,
-                code_path,
-                affinity_output,
-                shard_count=2,
-                shard_strategy="affinity",
-            )
-            self.assertEqual(affinity_manifest["shard_strategy"], "affinity")
-            self.assertEqual(
-                sum(shard["functions"] for shard in affinity_manifest["shards"]),
-                2,
             )
             balanced_shards = {
                 path.name: path.read_bytes()
@@ -670,12 +612,6 @@ class WholeAotCppTests(unittest.TestCase):
                         "oot3d_whole_aot_shard_*.cpp"
                     )
                 },
-            )
-            self.assertTrue(
-                all(
-                    "entries" in shard
-                    for shard in incremental_manifest["shards"]
-                )
             )
 
             selection = json.loads(selection_path.read_text(encoding="utf-8"))

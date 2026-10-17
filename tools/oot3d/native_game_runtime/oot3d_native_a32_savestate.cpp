@@ -5,6 +5,7 @@
 #include "oot3d_native_a32_process.h"
 #include "oot3d_native_pica_frontend.h"
 #include "oot3d_native_pica_submission.h"
+#include "fast/renderer3ds/pica_guest_extent_snapshot.h"
 
 #include <array>
 #include <algorithm>
@@ -22,6 +23,7 @@
 #include <vector>
 
 #include <nlohmann/json.hpp>
+#include <zstd.h>
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
@@ -73,8 +75,13 @@ TopScreenPauseProjectionState DecodeProjection(const nlohmann::json& encoded) {
 
 constexpr std::array<uint8_t, 8> kStateMagic{
     'O', 'O', 'T', '3', 'D', 'S', 'V', 0};
-constexpr uint32_t kStateContainerVersion = 1U;
+// Version 1 stores the msgpack document as is. Version 2 stores it as one
+// Zstandard frame; the size and checksum describe the stored bytes and the
+// last header word holds the document size.
+constexpr uint32_t kUncompressedStateContainerVersion = 1U;
+constexpr uint32_t kStateContainerVersion = 2U;
 constexpr uint32_t kStateHeaderSize = 40U;
+constexpr int kStateCompressionLevel = 3;
 constexpr uint64_t kMaximumStatePayloadBytes = 1ULL << 30U;
 constexpr uint64_t kMaximumPicaVisualReplayStateBytes = 256ULL << 20U;
 constexpr size_t kMaximumPicaTextureCacheEntryCount = 4096U;
@@ -91,26 +98,85 @@ using PicaTextureSnapshotIdentity =
 
 std::optional<uint64_t> PicaDecodedMipChainBytes(
     uint32_t width, uint32_t height, uint32_t levels) {
-    if (width == 0U || height == 0U || levels == 0U) {
+    if (width == 0U || height == 0U || levels == 0U || levels > 32U) {
         return std::nullopt;
     }
     uint64_t bytes = 0U;
     for (uint32_t level = 0U; level < levels; ++level) {
-        const uint64_t levelBytes =
+        const uint64_t pixels =
             static_cast<uint64_t>(std::max(1U, width >> level)) *
-            std::max(1U, height >> level) * 4U;
-        if (bytes > std::numeric_limits<uint64_t>::max() - levelBytes) {
+            std::max(1U, height >> level);
+        if (pixels > (std::numeric_limits<uint64_t>::max() - bytes) / 4U) {
             return std::nullopt;
         }
-        bytes += levelBytes;
+        bytes += pixels * 4U;
     }
     return bytes;
+}
+
+bool ValidCopyProducer(const Oot3d::Renderer::PicaTextureCacheEntrySnapshot& texture) {
+    if (!texture.HasCopyProducer) return true;
+    const auto& producer = texture.CopyProducer;
+    if (producer.CompletionId == 0U || producer.SourceWidth == 0U ||
+        producer.SourceHeight == 0U || producer.SourceWidth > UINT16_MAX ||
+        producer.SourceHeight > UINT16_MAX || producer.SourceNativeFormat > 4U ||
+        producer.Spans.empty() || producer.Spans.size() > 4096U ||
+        producer.ColorEncoding > 2U || texture.MipLevels != 1U ||
+        texture.ImageFormat != Oot3d::Renderer::PicaTextureSnapshotFormat::Rgba8) {
+        return false;
+    }
+    const uint32_t bytesPerPixel = producer.SourceNativeFormat == 0U ? 4U :
+                                  producer.SourceNativeFormat == 1U ? 3U : 2U;
+    const uint64_t sourceEnd = uint64_t{producer.SourcePhysicalAddress} +
+        uint64_t{producer.SourceWidth} * producer.SourceHeight * bytesPerPixel;
+    if (sourceEnd > (uint64_t{1} << 32U)) return false;
+    uint64_t previousDestinationEnd = 0U;
+    for (const auto& span : producer.Spans) {
+        const uint64_t destinationEnd = uint64_t{span.DestinationAddress} + span.ByteCount;
+        if (span.ByteCount == 0U || span.SourceAddress < producer.SourcePhysicalAddress ||
+            uint64_t{span.SourceAddress} + span.ByteCount > sourceEnd ||
+            span.DestinationAddress < previousDestinationEnd ||
+            destinationEnd > (uint64_t{1} << 32U)) {
+            return false;
+        }
+        previousDestinationEnd = destinationEnd;
+    }
+    return true;
 }
 
 void SetError(std::string* error, const std::string& message) {
     if (error != nullptr) {
         *error = message;
     }
+}
+
+bool IsGuestExtentPicaColorTarget(
+    const Oot3d::Renderer::PicaRenderTargetColorSnapshot& target) {
+    return target.RenderScalePermille ==
+           Fast::Renderer3ds::kPicaGuestExtentRenderScalePermille;
+}
+
+// A target saved at the guest extent carries no enhancement guides or shadow
+// mask (they belong to the restoring renderer's settings); a legacy target
+// saved at a renderer's internal extent carries all of them.
+bool PicaColorTargetGuidesValid(
+    const Oot3d::Renderer::PicaRenderTargetColorSnapshot& target) {
+    if (IsGuestExtentPicaColorTarget(target)) {
+        return target.ImageWidth == target.FramebufferWidth &&
+               target.ImageHeight == target.FramebufferHeight &&
+               target.NormalGuideRgba8.empty() &&
+               target.MaterialGuideRgba8.empty() &&
+               target.RigidMotionGuideRgba16FloatLe.empty() &&
+               target.AmbientGuideRgba8.empty() &&
+               target.ShadowR32UintLe.empty();
+    }
+    const uint64_t pixels =
+        static_cast<uint64_t>(target.ImageWidth) * target.ImageHeight;
+    return target.NormalGuideRgba8.size() == pixels * 4U &&
+           target.MaterialGuideRgba8.size() == pixels * 4U &&
+           target.RigidMotionGuideRgba16FloatLe.size() == pixels * 8U &&
+           target.AmbientGuideRgba8.size() == pixels * 4U &&
+           target.ShadowR32UintLe.size() == pixels * 4U;
 }
 
 template <typename T>
@@ -238,6 +304,7 @@ bool SaveNativeA32State(
         nlohmann::json encodedPicaTextureCache = nlohmann::json::array();
         uint64_t picaTextureCacheBytes = 0U;
         std::set<PicaTextureSnapshotIdentity> picaTextureCacheIdentities;
+        std::set<std::tuple<uint64_t, uint64_t, uint64_t>> producerIdentities;
         if (runtime.PicaTextureCache.size() >
             kMaximumPicaTextureCacheEntryCount) {
             SetError(error,
@@ -251,7 +318,10 @@ bool SaveNativeA32State(
             const uint8_t imageFormat =
                 static_cast<uint8_t>(texture.ImageFormat);
             picaTextureCacheBytes += texture.PixelBytes.size();
-            if (texture.SourceWidth == 0U || texture.SourceHeight == 0U ||
+            // A GPU copy version carries its source identity in CopyProducer and
+            // leaves the ordinary cache key fields zero.
+            if ((!texture.HasCopyProducer &&
+                 (texture.SourceWidth == 0U || texture.SourceHeight == 0U)) ||
                 texture.ImageWidth == 0U || texture.ImageHeight == 0U ||
                 texture.MipLevels == 0U || !expectedBytes.has_value() ||
                 imageFormat > static_cast<uint8_t>(
@@ -267,8 +337,14 @@ bool SaveNativeA32State(
                              PicaTextureSnapshotFormat::R32Uint &&
                  texture.MipLevels != 1U) ||
                 *expectedBytes != texture.PixelBytes.size() ||
+                !ValidCopyProducer(texture) ||
                 picaTextureCacheBytes > kMaximumPicaTextureCacheBytes ||
-                !picaTextureCacheIdentities
+                (texture.HasCopyProducer
+                     ? !producerIdentities.emplace(
+                           texture.CopyProducer.RenderTargetNamespace,
+                           texture.CopyProducer.CompletionId,
+                           texture.CopyProducer.AfterDrawSubmissionId).second
+                     : !picaTextureCacheIdentities
                      .insert({texture.ContentHash,
                               texture.ReplacementGeneration,
                               texture.PhysicalAddress,
@@ -285,7 +361,7 @@ bool SaveNativeA32State(
                               texture.MinMipLevel,
                               texture.MaxMipLevel,
                               texture.CustomReplacement})
-                     .second) {
+                     .second)) {
                 SetError(error,
                          "savestate native PICA cached texture is invalid: address=" +
                          std::to_string(texture.PhysicalAddress) +
@@ -296,6 +372,13 @@ bool SaveNativeA32State(
                          " total_bytes=" + std::to_string(picaTextureCacheBytes) +
                          " entries=" + std::to_string(picaTextureCacheIdentities.size()));
                 return false;
+            }
+            nlohmann::json encodedCopySpans = nlohmann::json::array();
+            for (const auto& span : texture.CopyProducer.Spans) {
+                encodedCopySpans.push_back(
+                    {{"source_address", span.SourceAddress},
+                     {"destination_address", span.DestinationAddress},
+                     {"byte_count", span.ByteCount}});
             }
             encodedPicaTextureCache.push_back(
                 {{"content_hash", texture.ContentHash},
@@ -325,6 +408,26 @@ bool SaveNativeA32State(
                   texture.CustomReplacementPending},
                  {"custom_replacement_ready",
                   texture.CustomReplacementReady},
+                 {"has_copy_producer", texture.HasCopyProducer},
+                 {"copy_producer_namespace",
+                  texture.CopyProducer.RenderTargetNamespace},
+                 {"copy_producer_completion_id",
+                  texture.CopyProducer.CompletionId},
+                 {"copy_producer_after_draw_submission_id",
+                  texture.CopyProducer.AfterDrawSubmissionId},
+                 {"copy_producer_source_physical_address",
+                  texture.CopyProducer.SourcePhysicalAddress},
+                 {"copy_producer_source_width",
+                  texture.CopyProducer.SourceWidth},
+                 {"copy_producer_source_height",
+                  texture.CopyProducer.SourceHeight},
+                 {"copy_producer_source_native_format",
+                  texture.CopyProducer.SourceNativeFormat},
+                 {"copy_producer_spans", std::move(encodedCopySpans)},
+                 {"copy_producer_color_encoding",
+                  texture.CopyProducer.ColorEncoding},
+                 {"copy_producer_scene_effects_resolved",
+                  texture.CopyProducer.SceneEffectsResolved},
                  {"pixel_bytes",
                   nlohmann::json::binary(texture.PixelBytes)}});
         }
@@ -345,7 +448,6 @@ bool SaveNativeA32State(
             const uint64_t expectedPixels =
                 static_cast<uint64_t>(target.ImageWidth) *
                 target.ImageHeight;
-            const uint64_t expectedMotionBytes = expectedPixels * 8U;
             std::vector<uint8_t> encodedDepth;
             encodedDepth.reserve(target.DepthValues.size() *
                                  sizeof(float));
@@ -369,39 +471,46 @@ bool SaveNativeA32State(
                 target.AmbientGuideRgba8.size() +
                 target.ShadowR32UintLe.size() + encodedDepth.size() +
                 target.StencilValues.size();
-            if (target.ColorPhysicalAddress == 0U ||
-                target.FramebufferWidth == 0U ||
-                target.FramebufferHeight == 0U ||
-                target.ImageWidth == 0U || target.ImageHeight == 0U ||
-                target.SampleCount != 1U ||
-                expectedBytes != target.ColorRgba8.size() ||
-                expectedBytes != target.NormalGuideRgba8.size() ||
-                expectedBytes != target.MaterialGuideRgba8.size() ||
-                expectedMotionBytes !=
-                    target.RigidMotionGuideRgba16FloatLe.size() ||
-                expectedBytes != target.AmbientGuideRgba8.size() ||
-                expectedBytes != target.ShadowR32UintLe.size() ||
-                expectedPixels != target.DepthValues.size() ||
-                (!target.StencilValues.empty() &&
-                 expectedPixels != target.StencilValues.size()) ||
-                !validDepthValues ||
-                picaColorTargetBytes > kMaximumPicaColorTargetBytes ||
-                !picaColorTargetIdentities
-                     .insert({target.RenderTargetNamespace,
-                              target.ColorPhysicalAddress,
-                              target.DepthPhysicalAddress,
-                              target.FramebufferWidth,
-                              target.FramebufferHeight,
-                              target.FramebufferColorFormat,
-                              target.FramebufferDepthFormat,
-                              target.RenderScalePermille})
-                     .second) {
+            const char* invalidReason =
+                target.ColorPhysicalAddress == 0U ? "address"
+                : target.FramebufferWidth == 0U ||
+                        target.FramebufferHeight == 0U ||
+                        target.ImageWidth == 0U || target.ImageHeight == 0U
+                    ? "extent"
+                : target.SampleCount != 1U ? "samples"
+                : expectedBytes != target.ColorRgba8.size() ? "color"
+                : !PicaColorTargetGuidesValid(target) ? "guides"
+                : expectedPixels != target.DepthValues.size() ? "depth"
+                : !target.StencilValues.empty() &&
+                        expectedPixels != target.StencilValues.size()
+                    ? "stencil"
+                : !validDepthValues ? "depth range"
+                : picaColorTargetBytes > kMaximumPicaColorTargetBytes
+                    ? "total bytes"
+                : !picaColorTargetIdentities
+                       .insert({target.RenderTargetNamespace,
+                                target.ColorPhysicalAddress,
+                                target.DepthPhysicalAddress,
+                                target.FramebufferWidth,
+                                target.FramebufferHeight,
+                                target.FramebufferColorFormat,
+                                target.FramebufferDepthFormat,
+                                target.RenderScalePermille})
+                       .second
+                    ? "duplicate identity"
+                    : nullptr;
+            if (invalidReason != nullptr) {
                 SetError(error,
-                         "savestate native PICA color target is invalid");
+                         std::string(
+                             "savestate native PICA color target is "
+                             "invalid (") +
+                             invalidReason + ", " +
+                             std::to_string(target.ImageWidth) + "x" +
+                             std::to_string(target.ImageHeight) + ")");
                 return false;
             }
-            encodedPicaColorTargets.push_back(
-                {{"render_target_namespace",
+            nlohmann::json encodedTarget{
+                {"render_target_namespace",
                   target.RenderTargetNamespace},
                  {"color_physical_address",
                   target.ColorPhysicalAddress},
@@ -419,23 +528,30 @@ bool SaveNativeA32State(
                  {"image_height", target.ImageHeight},
                  {"sample_count", target.SampleCount},
                  {"w_buffering", target.WBuffering},
+                 {"scene_effects_resolved", target.SceneEffectsResolved},
                  {"color_rgba8",
                   nlohmann::json::binary(target.ColorRgba8)},
-                 {"normal_guide_rgba8",
-                  nlohmann::json::binary(target.NormalGuideRgba8)},
-                 {"material_guide_rgba8",
-                  nlohmann::json::binary(target.MaterialGuideRgba8)},
-                 {"rigid_motion_guide_rgba16_float_le",
-                  nlohmann::json::binary(
-                      target.RigidMotionGuideRgba16FloatLe)},
-                 {"ambient_guide_rgba8",
-                  nlohmann::json::binary(target.AmbientGuideRgba8)},
-                 {"shadow_r32_uint_le",
-                  nlohmann::json::binary(target.ShadowR32UintLe)},
                  {"depth_float32_le",
                   nlohmann::json::binary(encodedDepth)},
                  {"stencil_u8",
-                  nlohmann::json::binary(target.StencilValues)}});
+                  nlohmann::json::binary(target.StencilValues)}};
+            // Guest-extent targets carry no guides; the field set itself
+            // says so to the loader.
+            if (!IsGuestExtentPicaColorTarget(target)) {
+                encodedTarget.update(
+                    {{"normal_guide_rgba8",
+                      nlohmann::json::binary(target.NormalGuideRgba8)},
+                     {"material_guide_rgba8",
+                      nlohmann::json::binary(target.MaterialGuideRgba8)},
+                     {"rigid_motion_guide_rgba16_float_le",
+                      nlohmann::json::binary(
+                          target.RigidMotionGuideRgba16FloatLe)},
+                     {"ambient_guide_rgba8",
+                      nlohmann::json::binary(target.AmbientGuideRgba8)},
+                     {"shadow_r32_uint_le",
+                      nlohmann::json::binary(target.ShadowR32UintLe)}});
+            }
+            encodedPicaColorTargets.push_back(std::move(encodedTarget));
         }
         const auto& presentation = runtime.PicaPresentationState;
         if (presentation.DisplayImages.size() >
@@ -486,6 +602,7 @@ bool SaveNativeA32State(
                  {"image_width", image.ImageWidth},
                  {"image_height", image.ImageHeight},
                  {"initialized", image.Initialized},
+                 {"scene_effects_resolved", image.SceneEffectsResolved},
                  {"color_rgba8",
                   nlohmann::json::binary(image.ColorRgba8)},
                  {"has_depth_target", image.HasDepthTarget},
@@ -651,6 +768,54 @@ bool SaveNativeA32State(
             {"pica_submission", submissionQueue.CaptureState()},
             {"dsp_hle", dspHle.CaptureState()},
         };
+        if (runtime.HostSettingsAvailable) {
+            auto settings = nlohmann::json::parse(
+                runtime.HostSettingsJson, nullptr, false);
+            if (!settings.is_object()) {
+                SetError(error, "savestate host settings are invalid");
+                return false;
+            }
+            document["host_settings"] = std::move(settings);
+        }
+        if (runtime.PicaGuestFramebuffersAvailable) {
+            nlohmann::json targets = nlohmann::json::array();
+            for (const auto& target : runtime.PicaGuestFramebuffers) {
+                targets.push_back({
+                    {"render_target_namespace", target.RenderTargetNamespace},
+                    {"color_physical_address", target.ColorPhysicalAddress},
+                    {"depth_physical_address", target.DepthPhysicalAddress},
+                    {"framebuffer_width", target.FramebufferWidth},
+                    {"framebuffer_height", target.FramebufferHeight},
+                    {"framebuffer_color_format", target.FramebufferColorFormat},
+                    {"framebuffer_depth_format", target.FramebufferDepthFormat},
+                    {"w_buffering", target.WBuffering},
+                    {"scene_effects_resolved", target.SceneEffectsResolved},
+                });
+            }
+            document.at("runtime")["native_pica_guest_framebuffers"] = {
+                {"available", true}, {"targets", std::move(targets)}};
+        }
+        // The target pixels belong to emulated memory (VRAM), as on hardware:
+        // patched into this document's copy, never into the live process.
+        for (const auto& overlay : runtime.GuestMemoryOverlays) {
+            bool patched = false;
+            for (auto& region : document.at("process").at("memory").at("regions")) {
+                const uint64_t base = region.at("base_address").get<uint64_t>();
+                auto& bytes = region.at("bytes").get_binary();
+                if (overlay.VirtualAddress < base ||
+                    overlay.VirtualAddress - base + overlay.Bytes.size() > bytes.size()) {
+                    continue;
+                }
+                std::copy(overlay.Bytes.begin(), overlay.Bytes.end(),
+                          bytes.begin() + static_cast<std::ptrdiff_t>(overlay.VirtualAddress - base));
+                patched = true;
+                break;
+            }
+            if (!patched) {
+                SetError(error, "savestate framebuffer lies outside emulated memory");
+                return false;
+            }
+        }
         const double captureSeconds = SecondsSince(captureStarted);
         const auto encodeStarted = std::chrono::steady_clock::now();
         auto& memoryWriteGeneration =
@@ -661,13 +826,24 @@ bool SaveNativeA32State(
         const uint64_t semanticFingerprint = Fnv1a64(
             nlohmann::json::to_msgpack(document));
         memoryWriteGeneration = savedMemoryWriteGeneration;
-        const std::vector<uint8_t> payload =
+        const std::vector<uint8_t> documentBytes =
             nlohmann::json::to_msgpack(document);
-        const double encodeSeconds = SecondsSince(encodeStarted);
-        if (payload.empty() || payload.size() > kMaximumStatePayloadBytes) {
+        if (documentBytes.empty() ||
+            documentBytes.size() > kMaximumStatePayloadBytes) {
             SetError(error, "savestate payload exceeds the supported size");
             return false;
         }
+        std::vector<uint8_t> payload(ZSTD_compressBound(documentBytes.size()));
+        const size_t compressedSize = ZSTD_compress(
+            payload.data(), payload.size(), documentBytes.data(),
+            documentBytes.size(), kStateCompressionLevel);
+        if (ZSTD_isError(compressedSize) != 0U) {
+            SetError(error, std::string("savestate compression failed: ") +
+                                ZSTD_getErrorName(compressedSize));
+            return false;
+        }
+        payload.resize(compressedSize);
+        const double encodeSeconds = SecondsSince(encodeStarted);
 
         std::vector<uint8_t> header;
         header.reserve(kStateHeaderSize);
@@ -676,7 +852,7 @@ bool SaveNativeA32State(
         AppendLittleEndian(header, kStateHeaderSize);
         AppendLittleEndian(header, static_cast<uint64_t>(payload.size()));
         AppendLittleEndian(header, Fnv1a64(payload));
-        AppendLittleEndian(header, uint64_t{0});
+        AppendLittleEndian(header, static_cast<uint64_t>(documentBytes.size()));
         if (header.size() != kStateHeaderSize) {
             SetError(error, "internal savestate header size mismatch");
             return false;
@@ -718,7 +894,7 @@ bool SaveNativeA32State(
             return false;
         }
         if (result != nullptr) {
-            result->PayloadBytes = payload.size();
+            result->PayloadBytes = documentBytes.size();
             result->FileBytes = header.size() + payload.size();
             result->SemanticFingerprint = semanticFingerprint;
             result->CaptureSeconds = captureSeconds;
@@ -734,25 +910,13 @@ bool SaveNativeA32State(
     }
 }
 
-bool LoadNativeA32State(
-    const std::filesystem::path& path,
-    const NativeA32SavestateCompatibility& compatibility,
-    NativeA32SavestateRuntimeState& runtime,
-    NativeA32Process& process,
-    NativeA32CtrHostServices& host,
-    Oot3dNativePicaFrontend& picaFrontend,
-    Oot3dNativePicaSubmissionQueue& submissionQueue,
-    NativeA32DspHle& dspHle,
-    NativeA32SavestateIoResult* result,
-    std::string* error) {
+bool ReadNativeA32StateDocument(const std::filesystem::path& path,
+                                nlohmann::json& document,
+                                NativeA32SavestateIoResult* result,
+                                std::string* error) {
     try {
         if (result != nullptr) {
             *result = {};
-        }
-        if (!submissionQueue.IsQuiescent()) {
-            SetError(error,
-                     "savestate load requires a quiescent native PICA boundary");
-            return false;
         }
         const auto ioStarted = std::chrono::steady_clock::now();
         std::ifstream input(path, std::ios::binary | std::ios::ate);
@@ -782,14 +946,19 @@ bool LoadNativeA32State(
         uint32_t headerSize = 0;
         uint64_t payloadSize = 0;
         uint64_t payloadChecksum = 0;
+        uint64_t documentSize = 0;
         if (!ReadLittleEndian(file, 8U, version) ||
             !ReadLittleEndian(file, 12U, headerSize) ||
             !ReadLittleEndian(file, 16U, payloadSize) ||
             !ReadLittleEndian(file, 24U, payloadChecksum) ||
-            version != kStateContainerVersion ||
+            !ReadLittleEndian(file, 32U, documentSize) ||
+            (version != kStateContainerVersion &&
+             version != kUncompressedStateContainerVersion) ||
             headerSize != kStateHeaderSize || payloadSize == 0U ||
             payloadSize > kMaximumStatePayloadBytes ||
-            payloadSize != file.size() - headerSize) {
+            payloadSize != file.size() - headerSize ||
+            (version == kStateContainerVersion &&
+             (documentSize == 0U || documentSize > kMaximumStatePayloadBytes))) {
             SetError(error, "savestate container header is invalid");
             return false;
         }
@@ -800,15 +969,73 @@ bool LoadNativeA32State(
         }
         const double ioSeconds = SecondsSince(ioStarted);
         const auto decodeStarted = std::chrono::steady_clock::now();
-        const auto document = nlohmann::json::from_msgpack(payload);
+        std::vector<uint8_t> decompressed;
+        std::span<const uint8_t> documentBytes = payload;
+        if (version == kStateContainerVersion) {
+            if (ZSTD_getFrameContentSize(payload.data(), payload.size()) !=
+                documentSize) {
+                SetError(error, "savestate compressed payload size does not match");
+                return false;
+            }
+            decompressed.resize(static_cast<size_t>(documentSize));
+            const size_t decompressedSize = ZSTD_decompress(
+                decompressed.data(), decompressed.size(), payload.data(),
+                payload.size());
+            if (ZSTD_isError(decompressedSize) != 0U ||
+                decompressedSize != documentSize) {
+                SetError(error, "savestate payload could not be decompressed");
+                return false;
+            }
+            documentBytes = decompressed;
+        }
+        document = nlohmann::json::from_msgpack(documentBytes);
         if (!document.is_object() ||
             document.value("format", std::string{}) !=
-                "oot3d_native_a32_savestate_v1" ||
+                "oot3d_native_a32_savestate_v1") {
+            SetError(error, "savestate document format is not supported");
+            return false;
+        }
+        if (result != nullptr) {
+            result->FileBytes = file.size();
+            result->PayloadBytes = documentBytes.size();
+            result->IoSeconds = ioSeconds;
+            result->DecodeSeconds = SecondsSince(decodeStarted);
+        }
+        return true;
+    } catch (const std::exception& exception) {
+        SetError(error, std::string("savestate read failed: ") +
+                            exception.what());
+        return false;
+    }
+}
+
+bool LoadNativeA32State(
+    const std::filesystem::path& path,
+    const NativeA32SavestateCompatibility& compatibility,
+    NativeA32SavestateRuntimeState& runtime,
+    NativeA32Process& process,
+    NativeA32CtrHostServices& host,
+    Oot3dNativePicaFrontend& picaFrontend,
+    Oot3dNativePicaSubmissionQueue& submissionQueue,
+    NativeA32DspHle& dspHle,
+    NativeA32SavestateIoResult* result,
+    std::string* error) {
+    try {
+        if (result != nullptr) {
+            *result = {};
+        }
+        if (!submissionQueue.IsQuiescent()) {
+            SetError(error,
+                     "savestate load requires a quiescent native PICA boundary");
+            return false;
+        }
+        nlohmann::json document;
+        NativeA32SavestateIoResult readResult;
+        if (!ReadNativeA32StateDocument(path, document, &readResult, error) ||
             !CompatibilityMatches(document.at("compatibility"),
                                   compatibility, error)) {
             return false;
         }
-        const double decodeSeconds = SecondsSince(decodeStarted);
         NativeA32SavestateRuntimeState restoredRuntime;
         const auto& encodedRuntime = document.at("runtime");
         restoredRuntime.FrameCount =
@@ -819,6 +1046,15 @@ bool LoadNativeA32State(
             encodedRuntime.at("next_vblank_tick").get<uint64_t>();
         restoredRuntime.ProcessRunKind =
             encodedRuntime.at("process_run_kind").get<uint32_t>();
+        if (const auto settings = document.find("host_settings");
+            settings != document.end()) {
+            if (!settings->is_object()) {
+                SetError(error, "savestate host settings are invalid");
+                return false;
+            }
+            restoredRuntime.HostSettingsAvailable = true;
+            restoredRuntime.HostSettingsJson = settings->dump();
+        }
         const auto encodedGameplayClock =
             encodedRuntime.find("gameplay_clock");
         if (encodedGameplayClock != encodedRuntime.end()) {
@@ -834,6 +1070,21 @@ bool LoadNativeA32State(
             }
             restoredRuntime.GameplayTiming =
                 static_cast<GameplayTimingMode>(timingMode);
+            const auto simulatesAt60 = [](GameplayTimingMode mode) {
+                return mode == GameplayTimingMode::Enhanced60;
+            };
+            if (restoredRuntime.GameplayClockAvailable &&
+                compatibility.GameplayTiming.has_value() &&
+                simulatesAt60(restoredRuntime.GameplayTiming) !=
+                    simulatesAt60(*compatibility.GameplayTiming)) {
+                SetError(error,
+                         simulatesAt60(restoredRuntime.GameplayTiming)
+                             ? "this state was saved with 60 Hz gameplay; "
+                               "start the game with that timing to load it"
+                             : "this state was saved with 30 Hz gameplay; "
+                               "start the game with that timing to load it");
+                return false;
+            }
             restoredRuntime.GameplayClock.SimulationTick =
                 encodedGameplayClock->value("simulation_tick", 0ULL);
             restoredRuntime.GameplayClock.PreviousLogicalFrame =
@@ -961,6 +1212,7 @@ bool LoadNativeA32State(
             }
             uint64_t totalBytes = 0U;
             std::set<PicaTextureSnapshotIdentity> identities;
+            std::set<std::tuple<uint64_t, uint64_t, uint64_t>> producerIdentities;
             for (const auto& encoded : entries) {
                 Oot3d::Renderer::PicaTextureCacheEntrySnapshot texture;
                 texture.ContentHash =
@@ -1012,6 +1264,59 @@ bool LoadNativeA32State(
                     "custom_replacement_pending").get<bool>();
                 texture.CustomReplacementReady = encoded.at(
                     "custom_replacement_ready").get<bool>();
+                texture.HasCopyProducer =
+                    encoded.value("has_copy_producer", false);
+                if (texture.HasCopyProducer) {
+                    texture.CopyProducer.RenderTargetNamespace =
+                        encoded.at("copy_producer_namespace").get<uint64_t>();
+                    texture.CopyProducer.CompletionId =
+                        encoded.at("copy_producer_completion_id")
+                            .get<uint64_t>();
+                    texture.CopyProducer.AfterDrawSubmissionId =
+                        encoded.at("copy_producer_after_draw_submission_id")
+                            .get<uint64_t>();
+                    texture.CopyProducer.SourcePhysicalAddress =
+                        encoded.at("copy_producer_source_physical_address")
+                            .get<uint32_t>();
+                    texture.CopyProducer.SourceWidth =
+                        encoded.at("copy_producer_source_width")
+                            .get<uint32_t>();
+                    texture.CopyProducer.SourceHeight =
+                        encoded.at("copy_producer_source_height")
+                            .get<uint32_t>();
+                    texture.CopyProducer.SourceNativeFormat =
+                        encoded.at("copy_producer_source_native_format")
+                            .get<uint8_t>();
+                    texture.CopyProducer.ColorEncoding =
+                        encoded.at("copy_producer_color_encoding")
+                            .get<uint8_t>();
+                    texture.CopyProducer.SceneEffectsResolved =
+                        encoded.at("copy_producer_scene_effects_resolved")
+                            .get<bool>();
+                    const auto& spans = encoded.at("copy_producer_spans");
+                    if (!spans.is_array() || spans.empty() ||
+                        spans.size() > 4096U) {
+                        SetError(error,
+                                 "savestate native PICA copy producer spans are invalid");
+                        return false;
+                    }
+                    for (const auto& encodedSpan : spans) {
+                        Fast::Renderer3ds::PicaRawCopySpan span;
+                        span.SourceAddress =
+                            encodedSpan.at("source_address").get<uint32_t>();
+                        span.DestinationAddress =
+                            encodedSpan.at("destination_address")
+                                .get<uint32_t>();
+                        span.ByteCount =
+                            encodedSpan.at("byte_count").get<uint32_t>();
+                        if (span.ByteCount == 0U) {
+                            SetError(error,
+                                     "savestate native PICA copy producer span is invalid");
+                            return false;
+                        }
+                        texture.CopyProducer.Spans.push_back(span);
+                    }
+                }
                 const auto& pixels = encoded.at("pixel_bytes");
                 if (!pixels.is_binary()) {
                     SetError(error,
@@ -1024,8 +1329,11 @@ bool LoadNativeA32State(
                     texture.ImageWidth, texture.ImageHeight,
                     texture.MipLevels);
                 totalBytes += texture.PixelBytes.size();
-                if (texture.SourceWidth == 0U ||
-                    texture.SourceHeight == 0U ||
+                // A GPU copy version carries its source identity in CopyProducer
+                // and leaves the ordinary cache key fields zero.
+                if ((!texture.HasCopyProducer &&
+                     (texture.SourceWidth == 0U ||
+                      texture.SourceHeight == 0U)) ||
                     texture.ImageWidth == 0U ||
                     texture.ImageHeight == 0U ||
                     texture.MipLevels == 0U ||
@@ -1043,8 +1351,14 @@ bool LoadNativeA32State(
                                  PicaTextureSnapshotFormat::R32Uint &&
                      texture.MipLevels != 1U) ||
                     *expectedBytes != texture.PixelBytes.size() ||
+                    !ValidCopyProducer(texture) ||
                     totalBytes > kMaximumPicaTextureCacheBytes ||
-                    !identities
+                    (texture.HasCopyProducer
+                         ? !producerIdentities.emplace(
+                               texture.CopyProducer.RenderTargetNamespace,
+                               texture.CopyProducer.CompletionId,
+                               texture.CopyProducer.AfterDrawSubmissionId).second
+                         : !identities
                          .insert({texture.ContentHash,
                                   texture.ReplacementGeneration,
                                   texture.PhysicalAddress,
@@ -1061,7 +1375,7 @@ bool LoadNativeA32State(
                                   texture.MinMipLevel,
                                   texture.MaxMipLevel,
                                   texture.CustomReplacement})
-                         .second) {
+                         .second)) {
                     SetError(error,
                              "savestate native PICA cached texture is invalid");
                     return false;
@@ -1069,6 +1383,38 @@ bool LoadNativeA32State(
                 restoredRuntime.PicaTextureCache.push_back(
                     std::move(texture));
             }
+        }
+        if (const auto framebuffers = encodedRuntime.find("native_pica_guest_framebuffers");
+            framebuffers != encodedRuntime.end() && framebuffers->value("available", false)) {
+            const auto& targets = framebuffers->at("targets");
+            if (!targets.is_array() || targets.size() > kMaximumPicaColorTargetCount) {
+                SetError(error, "savestate guest framebuffer list is invalid");
+                return false;
+            }
+            for (const auto& encoded : targets) {
+                Oot3d::Renderer::PicaRenderTargetColorSnapshot target;
+                target.RenderTargetNamespace = encoded.at("render_target_namespace").get<uint64_t>();
+                target.ColorPhysicalAddress = encoded.at("color_physical_address").get<uint32_t>();
+                target.DepthPhysicalAddress = encoded.at("depth_physical_address").get<uint32_t>();
+                target.FramebufferWidth = encoded.at("framebuffer_width").get<uint16_t>();
+                target.FramebufferHeight = encoded.at("framebuffer_height").get<uint16_t>();
+                target.FramebufferColorFormat = encoded.at("framebuffer_color_format").get<uint8_t>();
+                target.FramebufferDepthFormat = encoded.at("framebuffer_depth_format").get<uint8_t>();
+                target.WBuffering = encoded.value("w_buffering", false);
+                target.SceneEffectsResolved = encoded.value("scene_effects_resolved", false);
+                // Pixels are decoded from the restored memory by the session.
+                target.RenderScalePermille = 0U;
+                target.ImageWidth = target.FramebufferWidth;
+                target.ImageHeight = target.FramebufferHeight;
+                if (target.ColorPhysicalAddress == 0U || target.FramebufferWidth == 0U ||
+                    target.FramebufferHeight == 0U || target.FramebufferWidth % 8U != 0U ||
+                    target.FramebufferHeight % 8U != 0U || target.FramebufferColorFormat > 4U) {
+                    SetError(error, "savestate guest framebuffer is invalid");
+                    return false;
+                }
+                restoredRuntime.PicaGuestFramebuffers.push_back(std::move(target));
+            }
+            restoredRuntime.PicaGuestFramebuffersAvailable = true;
         }
         const auto encodedPicaColorTargets =
             encodedRuntime.find("native_pica_color_targets");
@@ -1111,6 +1457,8 @@ bool LoadNativeA32State(
                 target.SampleCount =
                     encoded.at("sample_count").get<uint8_t>();
                 target.WBuffering = encoded.value("w_buffering", false);
+                target.SceneEffectsResolved =
+                    encoded.value("scene_effects_resolved", false);
                 const auto& color = encoded.at("color_rgba8");
                 if (!color.is_binary()) {
                     SetError(error,
@@ -1137,7 +1485,11 @@ bool LoadNativeA32State(
                     [&](const char* name) {
                         return encoded.contains(name);
                     });
-                if (guideFieldCount == 0U) {
+                if (guideFieldCount == 0U &&
+                    IsGuestExtentPicaColorTarget(target)) {
+                    // Saved at the guest extent: guides start neutral in the
+                    // restoring renderer.
+                } else if (guideFieldCount == 0U) {
                     target.NormalGuideRgba8.resize(
                         static_cast<size_t>(expectedBytes));
                     target.MaterialGuideRgba8.assign(
@@ -1256,12 +1608,7 @@ bool LoadNativeA32State(
                     target.ImageWidth == 0U || target.ImageHeight == 0U ||
                     target.SampleCount != 1U ||
                     expectedBytes != target.ColorRgba8.size() ||
-                    expectedBytes != target.NormalGuideRgba8.size() ||
-                    expectedBytes != target.MaterialGuideRgba8.size() ||
-                    expectedMotionBytes !=
-                        target.RigidMotionGuideRgba16FloatLe.size() ||
-                    expectedBytes != target.AmbientGuideRgba8.size() ||
-                    expectedBytes != target.ShadowR32UintLe.size() ||
+                    !PicaColorTargetGuidesValid(target) ||
                     !validDepthValues ||
                     (!target.StencilValues.empty() &&
                      target.StencilValues.size() != expectedPixels) ||
@@ -1325,6 +1672,8 @@ bool LoadNativeA32State(
                     encoded.at("image_height").get<uint32_t>();
                 image.Initialized =
                     encoded.at("initialized").get<bool>();
+                image.SceneEffectsResolved =
+                    encoded.value("scene_effects_resolved", false);
                 const auto& color = encoded.at("color_rgba8");
                 if (!color.is_binary()) {
                     SetError(error,
@@ -1489,10 +1838,10 @@ bool LoadNativeA32State(
         }
         runtime = restoredRuntime;
         if (result != nullptr) {
-            result->PayloadBytes = payloadSize;
-            result->FileBytes = file.size();
-            result->IoSeconds = ioSeconds;
-            result->DecodeSeconds = decodeSeconds;
+            result->PayloadBytes = readResult.PayloadBytes;
+            result->FileBytes = readResult.FileBytes;
+            result->IoSeconds = readResult.IoSeconds;
+            result->DecodeSeconds = readResult.DecodeSeconds;
             result->RestoreSeconds = SecondsSince(restoreStarted);
         }
         return true;

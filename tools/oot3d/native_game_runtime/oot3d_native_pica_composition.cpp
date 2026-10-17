@@ -13,11 +13,17 @@ namespace {
 
 constexpr uint32_t kPicaCommandListCursorAddress = 0x0054CC4CU;
 constexpr uint32_t kMeshPacketByteCountOffset = 0x10U;
+// Proven ABI: oot3d_typed_actor_lifecycle.cpp reads actor r0 at destroy
+// entry and actor r4 at the UpdateAll init-callback dispatch.
+constexpr uint32_t kTemporalActorDestroy = 0x002D644CU;
+constexpr uint32_t kTemporalActorInit = 0x004615D8U;
 // Exact UI draw owners from ui_native_workflow_closure. The enclosing
 // DrawViewPass also executes scene callbacks and must NOT be classified UI.
 constexpr std::array kUiViews{
     std::pair{0x0042B9F4U, 0x003004E0U},
     std::pair{0x0041EC50U, 0x00419830U},
+    // TopScreen System overlay inside the completed gameplay view.
+    std::pair{0x0041EC50U, 0x0030055CU},
     std::pair{0x0041F308U, 0x0041983CU},
     std::pair{0x00425930U, 0x0041EB14U},
     // Orthographic renderer-local backdrop (single model at GraphRenderer+743C).
@@ -105,7 +111,7 @@ constexpr std::array kAtmosphereScopes{
 
 constexpr auto BuildCompositionHookPcs() {
     constexpr size_t count =
-        2U + kUiViews.size() * 2U + kCmbReturnPcs.size() +
+        8U + kUiViews.size() * 2U + kCmbReturnPcs.size() +
         (kObjectKankyoReturnPcs.size() + kSceneRendererReturnPcs.size() +
          kGameplayFadeReturnPcs.size() +
          kRandomizedOverlayReturnPcs.size() +
@@ -115,7 +121,8 @@ constexpr auto BuildCompositionHookPcs() {
          kNormalizedColorReturnPcs.size() +
          kGameplayAtmosphereQueueReturnPcs.size() +
          kKankyoEffectPrimitiveReturnPcs.size()) +
-        kAtmosphereScopes.size() + 1U + kPrimitivePacketReturnPcs.size();
+        kAtmosphereScopes.size() + 1U + kPrimitivePacketReturnPcs.size() +
+        kNativeA32LightingHookPcs.size();
     std::array<uint32_t, count> hooks{};
     size_t cursor = 0;
     for (const auto& [entry, returnPc] : kUiViews) {
@@ -124,6 +131,12 @@ constexpr auto BuildCompositionHookPcs() {
     }
     hooks[cursor++] = kOot3dCmbRendererSubmitDrawHandleEntry;
     hooks[cursor++] = kOot3dMeshCommandPacketSubmitEntry;
+    hooks[cursor++] = kOot3dGameplayDrawEntry;
+    hooks[cursor++] = kOot3dModelQueueSubmitEntry;
+    hooks[cursor++] = kOot3dModelQueueSetSlotEntry;
+    hooks[cursor++] = kOot3dActorDrawEntry;
+    hooks[cursor++] = kTemporalActorDestroy;
+    hooks[cursor++] = kTemporalActorInit;
     for (const auto pc : kCmbReturnPcs) {
         hooks[cursor++] = pc;
     }
@@ -135,6 +148,9 @@ constexpr auto BuildCompositionHookPcs() {
     }
     hooks[cursor++] = kOot3dPicaPrimitivePacketBuilderEntry;
     for (const auto pc : kPrimitivePacketReturnPcs) {
+        hooks[cursor++] = pc;
+    }
+    for (const auto pc : kNativeA32LightingHookPcs) {
         hooks[cursor++] = pc;
     }
     return hooks;
@@ -194,7 +210,11 @@ uint32_t AtmosphereNativeValue(
         return selector;
     }
     if (sourcePc == kOot3dSceneRendererSubmitConfiguredModelPassEntry) {
-        return (state.r[2] & 0xFFFFU) | ((state.r[3] & 0xFFFFU) << 16U);
+        // The sky model selector. r3 is the sky blend, which the game steps
+        // every few frames as the sky colour changes: a draw parameter, not an
+        // identity. Keeping it here made the same sky a new draw at each step,
+        // so visual interpolation could not match it and the sky stuttered.
+        return state.r[2] & 0xFFFFU;
     }
     return 0U;
 }
@@ -238,7 +258,7 @@ bool Oot3dNativePicaCompositionTracker::RecordPendingSpan(
             continue;
         }
         if (SameAttribution(span.Attribution, it->Attribution) &&
-            (overlaps || adjacent)) {
+            span.LightBinding == it->LightBinding && (overlaps || adjacent)) {
             span.BeginAddress = std::min(span.BeginAddress, it->BeginAddress);
             span.EndAddress = std::max(span.EndAddress, it->EndAddress);
             it = mPendingSpans.erase(it);
@@ -262,6 +282,76 @@ bool Oot3dNativePicaCompositionTracker::RecordPendingSpan(
 void Oot3dNativePicaCompositionTracker::ObserveBlockEntry(
     uint32_t pc, const oot3d::recomp::a32::GuestState& state,
     oot3d::recomp::a32::MemoryBus& memory) {
+    mLighting.ObserveBlockEntry(pc, state, memory);
+    if (pc == kTemporalActorDestroy || pc == kTemporalActorInit)
+        mActorLifetimes.erase(pc == kTemporalActorDestroy ? state.r[0] : state.r[4]);
+    // Actor_Draw(play, actor) invokes actor+140 and resumes at 002D6314.
+    // Tag the producer's queue slots; rigid actor meshes are not static world.
+    if (pc == kOot3dActorDrawEntry) {
+        uint16_t actorId = 0;
+        uint64_t identity = 0;
+        if (memory.Read16(state.r[1], &actorId))
+            identity = (uint64_t{actorId} << 32U) | state.r[1];
+        else
+            ++mStats.ReadFailures;
+        if (identity != 0 && !mActorLifetimes.contains(state.r[1])) {
+            if (++mNextTemporalLifetime == 0) ++mNextTemporalLifetime;
+            mActorLifetimes.emplace(state.r[1], mNextTemporalLifetime);
+        }
+        mActorDrawStack.push_back(identity);
+    } else if (pc == kOot3dActorDrawCallbackReturn && !mActorDrawStack.empty()) {
+        mActorDrawStack.pop_back();
+    }
+    if (pc == kOot3dGameplayDrawEntry) {
+        mProjectedShadowRenderers.clear();
+        mQueuedComposition.clear();
+        mActorDrawStack.clear();
+        mLighting.CaptureSceneLights(state.r[0], memory);
+    } else if (pc == kOot3dModelQueueSubmitEntry &&
+               (state.r[14] == 0x001D04DCU || state.r[14] == 0x0033E684U ||
+                state.r[14] == 0x0033EA3CU)) {
+        // Exact BL continuations in ActorShadow_SubmitFootModel,
+        // ActorShadow_DrawFeet's floor-aligned helper and ActorShadow_Draw.
+        // Observe after their model allocation/selection.
+        // Player_DrawFeetShadow (00297E04) delegates to ActorShadow_DrawFeet
+        // (001D04F4), whose floor-aligned models queue from helper 0033E450.
+        // The queue consumer (002FAD2C) draws model+14/+18 CMB renderers;
+        // model+10 is a resource, not a renderer or a lighting context.
+        if (state.r[0] <= std::numeric_limits<uint32_t>::max() - 0x18U) {
+            for (uint32_t offset : {0x14U, 0x18U}) {
+                uint32_t renderer = 0;
+                if (memory.Read32(state.r[0] + offset, &renderer) && renderer != 0) {
+                    const auto at = std::lower_bound(
+                        mProjectedShadowRenderers.begin(), mProjectedShadowRenderers.end(), renderer);
+                    if (at == mProjectedShadowRenderers.end() || *at != renderer)
+                        mProjectedShadowRenderers.insert(at, renderer);
+                }
+            }
+        }
+    }
+    if (pc == kOot3dModelQueueSetSlotEntry) {
+        // 0031487C stores model r2 in the exact eight-byte queue slot r1.
+        // Keep the producer's ownership on that slot, not on the model: the
+        // same model may also be submitted by an unrelated world/UI owner.
+        const auto at = std::lower_bound(mQueuedComposition.begin(), mQueuedComposition.end(), state.r[1],
+            [](const QueuedComposition& entry, uint32_t address) { return entry.SlotAddress < address; });
+        if ((mActiveAtmosphereScope || !mActorDrawStack.empty()) && !mActiveUiScope && state.r[2] != 0) {
+            auto attribution = mActiveAtmosphereScope
+                ? AttributionForAtmosphere(mActiveAtmosphereScope->SourcePc, mActiveAtmosphereScope->NativeValue)
+                : Oot3dPicaCompositionAttribution{};
+            attribution.NativeActorGeometry = !mActorDrawStack.empty();
+            attribution.NativeActorIdentity = mActorDrawStack.empty() ? 0 : mActorDrawStack.back();
+            attribution.TemporalIdentity.Lifetime = ActorTemporalLifetime(attribution.NativeActorIdentity);
+            attribution.IsolatedLighting = IsTitleLogoActor(attribution.NativeActorIdentity);
+            if (at != mQueuedComposition.end() && at->SlotAddress == state.r[1])
+                at->Attribution = attribution;
+            else
+                mQueuedComposition.insert(at, {state.r[1], attribution});
+        } else if (at != mQueuedComposition.end() && at->SlotAddress == state.r[1]) {
+            mQueuedComposition.erase(at);
+        }
+        return;
+    }
     const auto ui = std::find(kUiViews.begin(), kUiViews.end(), std::pair{pc, state.r[14]});
     if (ui != kUiViews.end() && !mActiveUiScope) {
         ActiveAtmosphereScope scope{};
@@ -362,6 +452,7 @@ void Oot3dNativePicaCompositionTracker::ObserveBlockEntry(
     if (mActiveCmbReturnPc.has_value() && pc == *mActiveCmbReturnPc) {
         mActiveCmbPass.reset();
         mActiveCmbReturnPc.reset();
+        mActiveCmbRenderer = 0;
         ++mStats.CmbPassExits;
         return;
     }
@@ -371,6 +462,7 @@ void Oot3dNativePicaCompositionTracker::ObserveBlockEntry(
         if (pass > 1U || !Contains(kCmbReturnPcs, state.r[14])) {
             mActiveCmbPass.reset();
             mActiveCmbReturnPc.reset();
+            mActiveCmbRenderer = 0;
             if (pass > 1U) {
                 ++mStats.InvalidCmbPassEntries;
             } else {
@@ -380,6 +472,34 @@ void Oot3dNativePicaCompositionTracker::ObserveBlockEntry(
         }
         mActiveCmbPass = static_cast<uint8_t>(pass);
         mActiveCmbReturnPc = state.r[14];
+        mActiveCmbRenderer = state.r[0];
+        mActiveCmbAttribution = AttributionForCmbPass(static_cast<uint8_t>(pass));
+        mActiveCmbAttribution.NativeActorGeometry = !mActorDrawStack.empty() && !mActiveUiScope;
+        mActiveCmbAttribution.NativeActorIdentity =
+            mActiveCmbAttribution.NativeActorGeometry ? mActorDrawStack.back() : 0;
+        mActiveCmbAttribution.TemporalIdentity.Lifetime =
+            ActorTemporalLifetime(mActiveCmbAttribution.NativeActorIdentity);
+        mActiveCmbAttribution.IsolatedLighting =
+            mActiveCmbAttribution.NativeActorGeometry &&
+            IsTitleLogoActor(mActiveCmbAttribution.NativeActorIdentity);
+        // The model-array consumers 002FAD2C, 002FAE10 and 003FE374 keep
+        // the array in r8 and its current index in r4 at these CMB calls.
+        // 002FEA30 uses a different layout and is deliberately excluded.
+        if (state.r[14] != 0x002FEA68U && state.r[14] != 0x002FEA74U) {
+            const uint64_t slot = uint64_t{state.r[8]} + uint64_t{state.r[4]} * 8U;
+            const auto at = std::lower_bound(mQueuedComposition.begin(), mQueuedComposition.end(), slot,
+                [](const QueuedComposition& entry, uint64_t address) { return entry.SlotAddress < address; });
+            if (at != mQueuedComposition.end() && at->SlotAddress == slot) {
+                if (at->Attribution.Layer != Oot3dPicaCompositionLayer::Unknown)
+                    mActiveCmbAttribution = at->Attribution;
+                else {
+                    mActiveCmbAttribution.NativeActorGeometry = at->Attribution.NativeActorGeometry;
+                    mActiveCmbAttribution.NativeActorIdentity = at->Attribution.NativeActorIdentity;
+                    mActiveCmbAttribution.TemporalIdentity.Lifetime = at->Attribution.TemporalIdentity.Lifetime;
+                    mActiveCmbAttribution.IsolatedLighting = at->Attribution.IsolatedLighting;
+                }
+            }
+        }
         if (pass == 0U) {
             ++mStats.CmbOpaquePassEntries;
         } else {
@@ -408,7 +528,7 @@ void Oot3dNativePicaCompositionTracker::ObserveBlockEntry(
             ++mStats.InvalidPrimitivePacketRanges;
         } else if (RecordPendingSpan(
                        {packet.BeginAddress, endAddress,
-                        packet.Attribution})) {
+                        packet.Attribution, packet.LightBinding})) {
             ++mStats.PrimitivePacketSpans;
             mStats.PrimitivePacketBytes +=
                 endAddress - packet.BeginAddress;
@@ -449,8 +569,12 @@ void Oot3dNativePicaCompositionTracker::ObserveBlockEntry(
             packet.Attribution = AttributionForAtmosphere(
                 mActiveAtmosphereScope->SourcePc,
                 mActiveAtmosphereScope->NativeValue);
+            packet.LightBinding.WorldToView = NativeA32LightingProbe::CaptureWorldToView(memory);
         } else if (mActiveCmbPass.has_value()) {
-            packet.Attribution = AttributionForCmbPass(*mActiveCmbPass);
+            packet.Attribution = mActiveCmbAttribution;
+            packet.Attribution.NativeProjectedShadow = std::binary_search(
+                mProjectedShadowRenderers.begin(), mProjectedShadowRenderers.end(), mActiveCmbRenderer);
+            packet.LightBinding = mLighting.CaptureRenderer(mActiveCmbRenderer, memory);
         } else {
             packet.Attribution = {
                 Oot3dPicaCompositionLayer::Unknown,
@@ -498,12 +622,32 @@ void Oot3dNativePicaCompositionTracker::ObserveBlockEntry(
         span.Attribution = AttributionForAtmosphere(
             mActiveAtmosphereScope->SourcePc,
             mActiveAtmosphereScope->NativeValue);
+        span.LightBinding.WorldToView = NativeA32LightingProbe::CaptureWorldToView(memory);
         ++mStats.AtmospherePacketSpans;
         ++mStats.RecordedPacketSpans;
         mActiveAtmosphereScope->PacketSpans.push_back(std::move(span));
         return;
     } else {
-        span.Attribution = AttributionForCmbPass(*mActiveCmbPass);
+        span.Attribution = mActiveCmbAttribution;
+        // 0030F4D0 r0 is a CMB renderer INSTANCE, while 00466E2C r0 is
+        // its mesh command-packet descriptor. The descriptor selects two
+        // alternating backing command buffers; neither the active buffer nor
+        // the destination cursor is an instance identity. The frontend adds
+        // the trigger's offset inside this packet, distinguishing its draws.
+        if (!mActiveUiScope && mActiveCmbRenderer != 0 && state.r[0] != 0 &&
+            (!span.Attribution.NativeActorGeometry || span.Attribution.NativeActorIdentity != 0)) {
+            span.Attribution.TemporalIdentity = {
+                span.Attribution.NativeActorIdentity, mActiveCmbRenderer, state.r[0],
+                uint64_t{*mActiveCmbPass} << 32U,
+                span.Attribution.NativeActorGeometry ? span.Attribution.TemporalIdentity.Lifetime
+                                                     : mWorldTemporalLifetime};
+            span.Attribution.TemporalPacketBeginAddress = cursor;
+        }
+        span.Attribution.NativeProjectedShadow = std::binary_search(
+            mProjectedShadowRenderers.begin(), mProjectedShadowRenderers.end(), mActiveCmbRenderer);
+        if (!mActiveUiScope) {
+            span.LightBinding = mLighting.CaptureRenderer(mActiveCmbRenderer, memory);
+        }
     }
     if (RecordPendingSpan(std::move(span))) {
         ++mStats.RecordedPacketSpans;
@@ -549,9 +693,18 @@ bool Oot3dNativePicaCompositionTracker::TakeCommandListCompositionSpans(
 }
 
 void Oot3dNativePicaCompositionTracker::Reset() noexcept {
+    if (++mNextTemporalLifetime == 0) ++mNextTemporalLifetime;
+    mWorldTemporalLifetime = mNextTemporalLifetime;
+    mActorLifetimes.clear();
     mActiveUiScope.reset();
     mActiveCmbPass.reset();
     mActiveCmbReturnPc.reset();
+    mActiveCmbRenderer = 0;
+    mProjectedShadowRenderers.clear();
+    mQueuedComposition.clear();
+    mActorDrawStack.clear();
+    mActiveCmbAttribution = {};
+    mLighting.Reset();
     mActiveAtmosphereScope.reset();
     mActivePrimitivePacket.reset();
     mPendingSpans.clear();

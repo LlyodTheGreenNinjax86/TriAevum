@@ -10,14 +10,17 @@
 #include "nri_interop_internal.h"
 #endif
 #include <array>
+#include <cstdlib>
+#include <limits>
 #include <stdexcept>
 #include <vector>
 
 namespace Fast::Oot3d {
 namespace {
 constexpr uint32_t kFrameSlots = 2U;
+constexpr uint32_t kDescriptorSetsPerPool = 64U;
 struct CompositePush {
-    uint32_t Width = 0, Height = 0, Cacao = 0, Reflections = 0;
+    uint32_t Width = 0, Height = 0, AmbientOcclusion = 0, Reflections = 0;
     float ReflectionStrength = 0.0F;
     uint32_t ReflectionDebug = 0;
     uint32_t Outline = 0;
@@ -31,8 +34,19 @@ struct CompositePush {
     float OutlineColorAlignment[2]{};
     float OutlineColor[3]{};
     float OutlineOpacity = 0.0F;
+    uint32_t GlobalIllumination = 0;
+    float DiffuseIntensity = 0.0F;
+    uint32_t GlobalIlluminationDebug = 0;
+    uint32_t AmbientOcclusionDebug = 0;
 };
-static_assert(sizeof(CompositePush) == 80U);
+static_assert(sizeof(CompositePush) == 96U);
+
+// Developer inspection (OOT3D_GRAPHICS_GI_DEBUG): 1 irradiance, 2 albedo,
+// 3 coverage, 4 the added bounce light, 5 the direct radiance it bounces. Replaces the composed colour.
+uint32_t GlobalIlluminationDebugView() {
+    const char* value = std::getenv("OOT3D_GRAPHICS_GI_DEBUG");
+    return value != nullptr ? static_cast<uint32_t>(std::strtoul(value, nullptr, 10)) : 0U;
+}
 
 std::vector<uint32_t> Compile(Renderer::CachedPassShaderCompiler& shaders) {
     return shaders.Resolve(BuildSceneCompositeComputeShader(), Renderer::SpirvStage::Compute, "oot3d_scene_composite.comp");
@@ -47,8 +61,40 @@ struct SceneCompositePass::Impl {
     nri::PipelineLayout* PipelineLayout = nullptr;
     nri::Pipeline* Pipeline = nullptr;
     nri::Descriptor* Sampler = nullptr;
-    nri::DescriptorPool* Pool = nullptr;
-    std::array<nri::DescriptorSet*, kFrameSlots> Sets{};
+    struct DescriptorPoolBlock {
+        nri::DescriptorPool* Pool = nullptr;
+        std::array<nri::DescriptorSet*, kDescriptorSetsPerPool> Sets{};
+    };
+    struct FrameDescriptors {
+        std::vector<DescriptorPoolBlock> Pools;
+        uint64_t FrameId = std::numeric_limits<uint64_t>::max();
+        size_t Used = 0;
+    };
+    std::array<FrameDescriptors, kFrameSlots> Frames;
+
+    bool AddDescriptorPool(FrameDescriptors& frame) {
+        frame.Pools.emplace_back();
+        auto& block = frame.Pools.back();
+        nri::DescriptorPoolDesc pool{};
+        pool.descriptorSetMaxNum = kDescriptorSetsPerPool;
+        pool.samplerMaxNum = kDescriptorSetsPerPool;
+        pool.textureMaxNum = 12U * kDescriptorSetsPerPool;
+        pool.storageTextureMaxNum = kDescriptorSetsPerPool;
+        auto* device = NriInteropAccess::Device(*Interop);
+        if (Core->CreateDescriptorPool(*device, pool, block.Pool) != nri::Result::SUCCESS ||
+            Core->AllocateDescriptorSets(*block.Pool, *PipelineLayout, 0,
+                block.Sets.data(), kDescriptorSetsPerPool, 0) != nri::Result::SUCCESS) {
+            if (block.Pool != nullptr) Core->DestroyDescriptorPool(block.Pool);
+            frame.Pools.pop_back();
+            Reason = "NRI scene composite descriptor allocation failed";
+            return false;
+        }
+        for (auto* set : block.Sets) {
+            const nri::UpdateDescriptorRangeDesc update{set, 8, 0, &Sampler, 1};
+            Core->UpdateDescriptorRanges(&update, 1);
+        }
+        return true;
+    }
 #endif
     VkImage Image = VK_NULL_HANDLE;
     VkImageView View = VK_NULL_HANDLE;
@@ -90,7 +136,7 @@ bool SceneCompositePass::Initialize(VkPhysicalDevice physical, VkDevice device,
         mImpl->Core = NriInteropAccess::Core(interop);
         if (nriDevice == nullptr || mImpl->Core == nullptr)
             throw std::runtime_error("NRI scene composite device unavailable");
-        const std::array<nri::DescriptorRangeDesc, 12> ranges{
+        const std::array<nri::DescriptorRangeDesc, 14> ranges{
             { { 0, 1, nri::DescriptorType::TEXTURE, nri::StageBits::COMPUTE_SHADER },
               { 1, 1, nri::DescriptorType::TEXTURE, nri::StageBits::COMPUTE_SHADER },
               { 2, 1, nri::DescriptorType::TEXTURE, nri::StageBits::COMPUTE_SHADER },
@@ -102,7 +148,9 @@ bool SceneCompositePass::Initialize(VkPhysicalDevice physical, VkDevice device,
               { 8, 1, nri::DescriptorType::SAMPLER, nri::StageBits::COMPUTE_SHADER },
               { 9, 1, nri::DescriptorType::TEXTURE, nri::StageBits::COMPUTE_SHADER },
               { 10, 1, nri::DescriptorType::TEXTURE, nri::StageBits::COMPUTE_SHADER },
-              { 11, 1, nri::DescriptorType::TEXTURE, nri::StageBits::COMPUTE_SHADER } }
+              { 11, 1, nri::DescriptorType::TEXTURE, nri::StageBits::COMPUTE_SHADER },
+              { 12, 1, nri::DescriptorType::TEXTURE, nri::StageBits::COMPUTE_SHADER },
+              { 13, 1, nri::DescriptorType::TEXTURE, nri::StageBits::COMPUTE_SHADER } }
         };
         nri::DescriptorSetDesc setDesc{};
         setDesc.ranges = ranges.data();
@@ -126,6 +174,7 @@ bool SceneCompositePass::Initialize(VkPhysicalDevice physical, VkDevice device,
         pipeline.shader.stage = nri::StageBits::COMPUTE_SHADER;
         pipeline.shader.bytecode = shader.data();
         pipeline.shader.size = shader.size() * sizeof(uint32_t);
+        pipeline.cache = NriInteropAccess::PipelineCache(interop);
         if (mImpl->Core->CreateComputePipeline(
                 *nriDevice, pipeline, mImpl->Pipeline) != nri::Result::SUCCESS)
             throw std::runtime_error("NRI scene composite pipeline failed");
@@ -167,90 +216,72 @@ bool SceneCompositePass::Configure(
 #ifndef ENABLE_OOT3D_NRI
     return false;
 #else
-    if (mImpl->Width != 0U && vkDeviceWaitIdle(mImpl->Device) != VK_SUCCESS)
-        return false;
     InvalidateScreenResources();
-    try {
-        mImpl->Image = output.Texture.Image;
-        mImpl->View = output.Texture.SampledView;
-        mImpl->StorageView = output.Texture.StorageView;
-        mImpl->OutputStates = output.StateTracker;
-        nri::DescriptorPoolDesc pool{};
-        pool.descriptorSetMaxNum = kFrameSlots;
-        pool.samplerMaxNum = kFrameSlots;
-        pool.textureMaxNum = 10U * kFrameSlots;
-        pool.storageTextureMaxNum = kFrameSlots;
-        nri::Device* device = NriInteropAccess::Device(*mImpl->Interop);
-        if (mImpl->Core->CreateDescriptorPool(*device, pool, mImpl->Pool) !=
-            nri::Result::SUCCESS)
-            throw std::runtime_error("NRI scene composite pool failed");
-        if (mImpl->Core->AllocateDescriptorSets(
-                *mImpl->Pool, *mImpl->PipelineLayout, 0, mImpl->Sets.data(),
-                kFrameSlots, 0) != nri::Result::SUCCESS)
-            throw std::runtime_error("NRI scene composite sets failed");
-        for (uint32_t slot = 0; slot < kFrameSlots; ++slot) {
-            const nri::UpdateDescriptorRangeDesc update{
-                mImpl->Sets[slot], 8, 0, &mImpl->Sampler, 1};
-            mImpl->Core->UpdateDescriptorRanges(&update, 1);
-        }
-        mImpl->Width = output.Width;
-        mImpl->Height = output.Height;
-        return true;
-    } catch (const std::exception& exception) {
-        mImpl->Reason = exception.what();
-        InvalidateScreenResources();
-        return false;
-    }
+    mImpl->Image = output.Texture.Image;
+    mImpl->View = output.Texture.SampledView;
+    mImpl->StorageView = output.Texture.StorageView;
+    mImpl->OutputStates = output.StateTracker;
+    mImpl->Width = output.Width;
+    mImpl->Height = output.Height;
+    return true;
 #endif
 }
 
-bool SceneCompositePass::Execute(VkCommandBuffer command, uint32_t frameSlot, VkImage colorImage, VkFormat colorFormat,
-                                 VkImage cacaoImage, VkFormat cacaoFormat, VkImage reflectionImage,
+bool SceneCompositePass::Execute(VkCommandBuffer command, uint32_t frameSlot, uint64_t frameId, VkImage colorImage, VkFormat colorFormat,
+                                 VkImage aoImage, VkFormat aoFormat, VkImage reflectionImage,
                                  VkFormat reflectionFormat, VkImage materialImage, VkFormat materialFormat,
                                  VkImage normalImage, VkFormat normalFormat, VkImage transparentDepthImage,
                                  VkFormat transparentDepthFormat, VkImage ambientImage, VkFormat ambientFormat,
                                  VkImage depthImage, VkFormat depthFormat, VkImage fogImage, VkFormat fogFormat,
-                                 VkImage outlineGeometryImage, VkFormat outlineGeometryFormat, bool cacaoEnabled,
-                                 bool reflectionsEnabled, float reflectionStrength, uint32_t reflectionDebug,
+                                 VkImage outlineGeometryImage, VkFormat outlineGeometryFormat,
+                                 VkImage diffuseIlluminationImage, VkFormat diffuseIlluminationFormat,
+                                 VkImage diffuseAlbedoImage, VkFormat diffuseAlbedoFormat,
+                                 bool globalIlluminationEnabled, float diffuseIntensity, bool aoEnabled,
+                                 uint32_t aoDebugView, bool reflectionsEnabled, float reflectionStrength, uint32_t reflectionDebug,
                                  bool outlineEnabled, const ToonStyleSettings& outlineSettings,
                                  SceneColorEncoding inputEncoding, const EffectPassBarrierPlan& barrierPlan) {
     const auto* outputBarrier = barrierPlan.Find(
         EffectResource::CompositeColor);
     if (mImpl->Width == 0U || mImpl->OutputStates == nullptr ||
         colorImage == VK_NULL_HANDLE ||
-        cacaoImage == VK_NULL_HANDLE || reflectionImage == VK_NULL_HANDLE ||
+        aoImage == VK_NULL_HANDLE || reflectionImage == VK_NULL_HANDLE ||
         materialImage == VK_NULL_HANDLE ||
         normalImage == VK_NULL_HANDLE ||
         transparentDepthImage == VK_NULL_HANDLE ||
         ambientImage == VK_NULL_HANDLE ||
         depthImage == VK_NULL_HANDLE ||
+        diffuseIlluminationImage == VK_NULL_HANDLE || diffuseAlbedoImage == VK_NULL_HANDLE ||
         !IsKnownSceneColorEncoding(inputEncoding) ||
         !barrierPlan.Valid() ||
         outputBarrier == nullptr || !outputBarrier->Managed())
         return false;
 #ifndef ENABLE_OOT3D_NRI
-    (void)command; (void)frameSlot; (void)colorFormat; (void)cacaoFormat;
+    (void)command; (void)frameSlot; (void)colorFormat; (void)aoFormat;
+    (void)frameId;
     (void)reflectionFormat; (void)materialFormat; (void)normalFormat;
     (void)transparentDepthFormat;
     (void)ambientFormat;
     (void)depthFormat; (void)outlineEnabled;
     (void)outlineSettings; (void)inputEncoding;
-    (void)cacaoEnabled;
+    (void)aoEnabled; (void)aoDebugView;
     (void)reflectionsEnabled; (void)reflectionStrength; (void)reflectionDebug;
-    (void)barrierPlan;
+    (void)barrierPlan; (void)diffuseIlluminationFormat; (void)diffuseAlbedoFormat;
+    (void)globalIlluminationEnabled; (void)diffuseIntensity; 
     return false;
 #else
     nri::CommandBuffer* nriCommand =
         NriInteropAccess::CommandBuffer(*mImpl->Interop, frameSlot);
     if (nriCommand == nullptr) return false;
-    const std::array<VkImage, 10> images{ colorImage,  cacaoImage,          reflectionImage, materialImage,
+    const std::array<VkImage, 12> images{ colorImage,  aoImage,          reflectionImage, materialImage,
                                           normalImage, depthImage,          ambientImage,    transparentDepthImage,
-                                          fogImage,    outlineGeometryImage };
-    const std::array<VkFormat, 10> formats{
-        colorFormat, cacaoFormat,   reflectionFormat,       materialFormat, normalFormat,
-        depthFormat, ambientFormat, transparentDepthFormat, fogFormat,      outlineGeometryFormat
+                                          fogImage,    outlineGeometryImage, diffuseIlluminationImage,
+                                          diffuseAlbedoImage };
+    const std::array<VkFormat, 12> formats{
+        colorFormat, aoFormat,   reflectionFormat,       materialFormat, normalFormat,
+        depthFormat, ambientFormat, transparentDepthFormat, fogFormat,      outlineGeometryFormat,
+        diffuseIlluminationFormat, diffuseAlbedoFormat
     };
-    std::array<nri::Descriptor*, 10> sampledDescriptors{};
+    std::array<nri::Descriptor*, 12> sampledDescriptors{};
     for (uint32_t i = 0; i < images.size(); ++i) {
         if (!mImpl->Interop->WrapTexture(
                 images[i], formats[i], VK_IMAGE_TYPE_2D,
@@ -266,6 +297,17 @@ bool SceneCompositePass::Execute(VkCommandBuffer command, uint32_t frameSlot, Vk
     if (outputDescriptor == nullptr) return false;
 
     (void)command;
+    auto& frame = mImpl->Frames[frameSlot % kFrameSlots];
+    if (frame.FrameId != frameId) {
+        frame.FrameId = frameId;
+        frame.Used = 0;
+    }
+    const size_t poolIndex = frame.Used / kDescriptorSetsPerPool;
+    // Recorded invocations retain immutable sets until this slot's fence passes.
+    if (poolIndex == frame.Pools.size() && !mImpl->AddDescriptorPool(frame))
+        return false;
+    auto& descriptorPool = frame.Pools[poolIndex];
+    auto* descriptorSet = descriptorPool.Sets[frame.Used++ % kDescriptorSetsPerPool];
     mImpl->NriBarriersUsed = false;
     mImpl->LastBarrierExecution = barrierPlan.BeginExecution();
     const auto writeTransition = mImpl->OutputStates->PlanTransition(
@@ -276,21 +318,22 @@ bool SceneCompositePass::Execute(VkCommandBuffer command, uint32_t frameSlot, Vk
         return false;
     mImpl->LastBarrierExecution.RecordGraphTransition(writeTransition);
     mImpl->OutputStates->Commit(writeTransition);
-    const uint32_t slot = frameSlot % kFrameSlots;
-    std::array<nri::UpdateDescriptorRangeDesc, 11> updates{};
+    std::array<nri::UpdateDescriptorRangeDesc, 13> updates{};
     for (uint32_t i = 0; i < 7U; ++i) {
-        updates[i] = {mImpl->Sets[slot], i, 0,
+        updates[i] = {descriptorSet, i, 0,
                       &sampledDescriptors[i], 1};
     }
-    updates[7] = {mImpl->Sets[slot], 7, 0, &outputDescriptor, 1};
-    updates[8] = {mImpl->Sets[slot], 9, 0,
+    updates[7] = {descriptorSet, 7, 0, &outputDescriptor, 1};
+    updates[8] = {descriptorSet, 9, 0,
                   &sampledDescriptors[7], 1};
-    updates[9] = {mImpl->Sets[slot], 10, 0, &sampledDescriptors[8], 1};
-    updates[10] = { mImpl->Sets[slot], 11, 0, &sampledDescriptors[9], 1 };
+    updates[9] = {descriptorSet, 10, 0, &sampledDescriptors[8], 1};
+    updates[10] = {descriptorSet, 11, 0, &sampledDescriptors[9], 1};
+    updates[11] = {descriptorSet, 12, 0, &sampledDescriptors[10], 1};
+    updates[12] = {descriptorSet, 13, 0, &sampledDescriptors[11], 1};
     mImpl->Core->UpdateDescriptorRanges(
         updates.data(), static_cast<uint32_t>(updates.size()));
     const CompositePush push{
-        mImpl->Width, mImpl->Height, static_cast<uint32_t>(cacaoEnabled),
+        mImpl->Width, mImpl->Height, static_cast<uint32_t>(aoEnabled),
         static_cast<uint32_t>(reflectionsEnabled), reflectionStrength,
         reflectionDebug, static_cast<uint32_t>(outlineEnabled),
         static_cast<uint32_t>(SceneColorIsLinear(inputEncoding)),
@@ -304,12 +347,16 @@ bool SceneCompositePass::Execute(VkCommandBuffer command, uint32_t frameSlot, Vk
         {outlineSettings.OutlineTint[0],
          outlineSettings.OutlineTint[1],
          outlineSettings.OutlineTint[2]},
-        outlineSettings.OutlineOpacity};
-    mImpl->Core->CmdSetDescriptorPool(*nriCommand, *mImpl->Pool);
+        outlineSettings.OutlineOpacity,
+        static_cast<uint32_t>(globalIlluminationEnabled),
+        diffuseIntensity,
+        globalIlluminationEnabled ? GlobalIlluminationDebugView() : 0U,
+        aoEnabled ? aoDebugView : 0U};
+    mImpl->Core->CmdSetDescriptorPool(*nriCommand, *descriptorPool.Pool);
     mImpl->Core->CmdSetPipelineLayout(
         *nriCommand, nri::BindPoint::COMPUTE, *mImpl->PipelineLayout);
     mImpl->Core->CmdSetPipeline(*nriCommand, *mImpl->Pipeline);
-    const nri::SetDescriptorSetDesc set{0, mImpl->Sets[slot]};
+    const nri::SetDescriptorSetDesc set{0, descriptorSet};
     mImpl->Core->CmdSetDescriptorSet(*nriCommand, set);
     const nri::SetRootConstantsDesc constants{0, &push, sizeof(push)};
     mImpl->Core->CmdSetRootConstants(*nriCommand, constants);
@@ -331,12 +378,6 @@ bool SceneCompositePass::Execute(VkCommandBuffer command, uint32_t frameSlot, Vk
 }
 
 void SceneCompositePass::InvalidateScreenResources() {
-#ifdef ENABLE_OOT3D_NRI
-    if (mImpl->Core != nullptr && mImpl->Pool != nullptr)
-        mImpl->Core->DestroyDescriptorPool(mImpl->Pool);
-    mImpl->Pool = nullptr;
-    mImpl->Sets = {};
-#endif
     mImpl->Image = VK_NULL_HANDLE;
     mImpl->View = VK_NULL_HANDLE;
     mImpl->StorageView = VK_NULL_HANDLE;
@@ -351,6 +392,9 @@ void SceneCompositePass::Shutdown() {
     InvalidateScreenResources();
 #ifdef ENABLE_OOT3D_NRI
     if (mImpl->Core != nullptr) {
+        for (auto& frame : mImpl->Frames)
+            for (const auto& block : frame.Pools)
+                mImpl->Core->DestroyDescriptorPool(block.Pool);
         if (mImpl->Sampler != nullptr) mImpl->Core->DestroyDescriptor(mImpl->Sampler);
         if (mImpl->Pipeline != nullptr) mImpl->Core->DestroyPipeline(mImpl->Pipeline);
         if (mImpl->PipelineLayout != nullptr)
@@ -370,7 +414,7 @@ bool SceneCompositePass::OutputOwnedByNri() const {
 bool SceneCompositePass::ComputeOwnedByNri() const {
 #ifdef ENABLE_OOT3D_NRI
     return mImpl->Ready && mImpl->Pipeline != nullptr &&
-           mImpl->Pool != nullptr && mImpl->Sampler != nullptr;
+           mImpl->Sampler != nullptr;
 #else
     return false;
 #endif

@@ -33,13 +33,23 @@ enum class GraphicsCapability : uint8_t {
     TemporalHistory,
     Smaa1x,
     FidelityFxSssr,
+    FidelityFxCacao,
     NriNisUpscaler,
     NriFsrUpscaler,
     NriXessUpscaler,
     NriDlssUpscaler,
     PresentTearing,
     ExclusiveFullscreen,
+    NativeSurfaceLighting,
+    BrixelizerGlobalIllumination,
+    ImmerseMxao,
+    // Screen-space diffuse GI (fast/renderer/diffuse_gi_pass.h on this device).
+    ScreenSpaceGlobalIllumination,
 };
+
+// Last enumerator, for code that visits every capability.
+inline constexpr GraphicsCapability kLastGraphicsCapability =
+    GraphicsCapability::ScreenSpaceGlobalIllumination;
 
 struct GraphicsCapabilityState {
     bool Available = false;

@@ -115,6 +115,15 @@ The release ships it as `resources/gamecontrollerdb.txt` together with its
 zlib notice in `LICENSES/SDL-GameControllerDB-zlib.txt`. These community
 mappings supplement SDL's built-in controller database.
 
+## Zstandard
+
+The runtime links [Zstandard](https://github.com/facebook/zstd) 1.5.6 (release
+archive SHA-256
+`8c29e06cf42aacc1eafc4077ae2ec6c6fcb96a626157e0593d5e82a34fd403c1`) statically
+to compress save states. Zstandard is dual-licensed upstream under BSD and
+GPL-2.0; TriAevum uses it under the BSD license, copyright Meta Platforms, Inc.
+and affiliates. Its notice is in `LICENSES/zstd-BSD-3-Clause.txt`.
+
 ## NVIDIA NRI
 
 The primary renderer uses
@@ -123,8 +132,164 @@ current integration to revision `4b485316463969f182db15e67aad2aec2f40a3d7`.
 NRI is licensed under the MIT License, copyright 2021 NVIDIA Corporation.
 TriAevum must ship that notice with runtime binaries that contain NRI.
 
-NRI is distinct from proprietary NGX/DLSS SDK components. No proprietary SDK,
-model or DLL is part of the clean public release baseline.
+NRI is distinct from proprietary NGX/DLSS SDK components. The runtime is built
+with NRI's NGX support disabled; NGX is only in the DLSS module below.
+
+## NVIDIA DLSS (separately licensed DLSS module)
+
+Upscaling by NVIDIA DLSS. NVIDIA and DLSS are trademarks and/or registered
+trademarks of NVIDIA Corporation. TriAevum is not sponsored or endorsed by
+NVIDIA.
+
+The DLSS module (`triaevum_dlss.dll`, `libtriaevum_dlss.so`; source in
+`runtime/three_ds_recomp/src/fast/dlss/`) links the NGX SDK library from
+NVIDIA's public [DLSS SDK](https://github.com/NVIDIA/DLSS) and is distributed
+beside NVIDIA's DLSS runtime (`nvngx_dlss.dll`,
+`libnvidia-ngx-dlss.so.<version>`), both unmodified and from the same SDK
+release. They are NVIDIA's property and are distributed under the NVIDIA RTX
+SDKs licence reproduced in `LICENSES/NVIDIA-DLSS-SDK-LICENSE.txt`, not under
+TriAevum's GPL; the module's own integration code is MIT. See the module's
+`LICENSE.md` and `LICENSE_SCOPE.md`. Without the module, DLSS is not offered.
+
+## AMD FidelityFX SDK (FSR runtime)
+
+On Windows, FSR runs through AMD's signed FidelityFX runtime
+`amd_fidelityfx_vk.dll` from the [FidelityFX SDK](https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK)
+(`PrebuiltSignedDLL/`), which NRI loads by name. The FidelityFX SDK is
+licensed under the MIT License, copyright Advanced Micro Devices, Inc.; its
+notice is in `LICENSES/FidelityFX-SDK-MIT.txt`.
+
+## AMD FidelityFX CACAO
+
+The optional original CACAO provider integrates
+[AMD FidelityFX CACAO](https://github.com/GPUOpen-Effects/FidelityFX-CACAO)
+at revision `0ddca95e6714727a252ead345591ca8f2598f261`.
+Its upstream MIT license is reproduced below and must accompany binaries
+containing this provider.
+
+Copyright (c) 2020-2021 Advanced Micro Devices, Inc. All rights reserved.
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+
+## Intel XeGTAO
+
+The multiscale GTAO shader in
+`runtime/three_ds_recomp/src/fast/renderer/gtao_shader.cpp` adapts the
+normal-relative radius falloff from [Intel XeGTAO](https://github.com/GameTechDev/XeGTAO).
+This is not an unmodified integration of the complete XeGTAO implementation.
+The upstream [MIT license](https://github.com/GameTechDev/XeGTAO/blob/master/LICENSE)
+is retained in source and reproduced here for binary distributions.
+
+Copyright (C) 2016-2021, Intel Corporation
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+## Godot Engine screen-space contact shadows
+
+The optional contact shadows of the directional shadow light,
+`runtime/three_ds_recomp/src/fast/oot3d/contact_shadow_shader.cpp` and
+`runtime/three_ds_recomp/src/fast/oot3d/contact_shadows.cpp`, port
+`servers/rendering/renderer_rd/shaders/effects/screen_space_contact_shadows.glsl`
+and `SSEffects::screen_space_contact_shadows` from
+[Godot Engine](https://github.com/godotengine/godot) 4.8 (pull request 118045).
+Godot's implementation follows the screen-space shadows technique Bend Studio
+presented for Days Gone; no Bend Studio code is included here. The changes (the
+depth and sampler bindings, the camera depth of the shadow casters, the
+far-plane write) are listed in the files. The upstream
+[MIT license](https://github.com/godotengine/godot/blob/master/LICENSE.txt) is
+retained in source, in `LICENSES/Godot-MIT.txt` and here for binary distributions.
+
+Copyright (c) 2014-present Godot Engine contributors (see AUTHORS.md).
+Copyright (c) 2007-2014 Juan Linietsky, Ariel Manzur.
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+## iMMERSE (Pascal Gilcher)
+
+The optional MXAO ambient-occlusion provider is the iMMERSE module,
+`runtime/three_ds_recomp/src/fast/immerse/`. It is ported from
+`Shaders/MartysMods_MXAO.fx` of [iMMERSE](https://github.com/martymcmodding/iMMERSE)
+at revision `f57d3afa1ebe5d1fd6152d4f6fb9a2e75bd1d1cb`, by Pascal Gilcher
+([Marty's Mods](https://martysmods.com)). Its changes are listed in the headers of
+its files and in its `README.md`.
+
+iMMERSE is not under an open-source license: "Copyright (c) Pascal Gilcher. All
+rights reserved." Its original license is reproduced unchanged in the module as
+`LICENSE-iMMERSE.txt` and remains the license of the module, including the changes
+that integrate it. Its terms forbid public redistribution, public modified versions,
+use of its parts in another project and monetization unless the author gives
+explicit permission, and require clear credit of the project, its author and the
+parts used.
+
+All rights remain with the author. TriAevum integrates and modifies MXAO under the
+author's explicit permission, granted exclusively to the TriAevum project; the
+maintainer reports it for MXAO, LAUNCHPAD and SOLARIS (2026-09-30), and only MXAO
+is integrated. The permission does not extend to recipients, forks or other
+projects. The module's `LICENSE.md` records this exception and its boundary to
+TriAevum's GPL code, and `LICENSE_SCOPE.md` excludes the module from the GPL grant.
+
+This material is not an original TriAevum contribution. It is compiled only with
+`THREE_DS_RECOMP_ENABLE_IMMERSE`, into its own shared library
+(`triaevum_immerse.dll`, `libtriaevum_immerse.so`) that contains nothing of
+TriAevum and is loaded by the runtime through the MIT module interface
+`runtime/three_ds_recomp/module_interface/triaevum/immerse_module.h`; without
+the library TriAevum runs without MXAO. Binary packages that include the
+library ship it beside the runtime as a separately licensed component, with
+the module's `LICENSE.md` and the original license under `LICENSES/`.
+
+The permission, as the maintainer reports it on 2026-10-12, expressly allows
+the distribution and modification of MXAO for the exclusive use of this
+repository of the TriAevum project, on the condition that all rights in it,
+and the license for any further use, remain the author's
+(`docs/TRIAEVUM_RELEASE_APPROVAL_RECORD.md`).
 
 ## TopScreen single-screen modifications
 

@@ -395,9 +395,21 @@ void MarkTopScreenStartCloseGestureConsumed(
     state.CloseGestureHeld = true;
 }
 
+void ObserveTopScreenStartRoutingPage(bool itemsActive, bool gearActive,
+                                      bool mapActive,
+                                      TopScreenStartRoutingState& state) noexcept {
+    if (itemsActive)
+        state.LastPage = NativeA32TopScreenPage::Items;
+    else if (gearActive)
+        state.LastPage = NativeA32TopScreenPage::Gear;
+    else if (mapActive)
+        state.LastPage = NativeA32TopScreenPage::Map;
+}
+
 void ReleaseTopScreenStartRoutingLatch(
     bool physicalStartHeld, TopScreenStartRoutingState& state) noexcept {
     if (!physicalStartHeld) {
+        state.StartHeld = false;
         state.OpenGestureHeld = false;
         state.CloseGestureHeld = false;
     }
@@ -413,53 +425,78 @@ bool ResolveNativeA32TouchInputEnabled(
     return nativeFrontendPresentationActive || nativePausePageActive;
 }
 
+bool ApplyTopScreenVersionChoiceReveal(
+    NativeA32InputFrame& frame, bool awaitingReveal, bool prompting,
+    TopScreenVersionChoiceRevealState& state) noexcept {
+    const uint32_t gestureButtons =
+        NativeA32HidButtonMask(NativeA32HidButton::Start) |
+        NativeA32HidButtonMask(NativeA32HidButton::A);
+    const bool gesture = (frame.Hid.Buttons & gestureButtons) != 0U ||
+                         frame.Hid.TouchPressed;
+    const auto withhold = [&frame] {
+        frame.Hid.Buttons = 0U;
+        frame.Hid.CirclePadX = 0;
+        frame.Hid.CirclePadY = 0;
+        frame.Hid.TouchPressed = false;
+    };
+    if (state.GestureHeld) {
+        if (gesture) {
+            withhold();
+            return false;
+        }
+        state.GestureHeld = false;
+    }
+    if (prompting && !awaitingReveal) {
+        if (!gesture) {
+            return false;
+        }
+        state.GestureHeld = true;
+        return true;
+    }
+    if (!awaitingReveal) {
+        return false;
+    }
+    withhold();
+    if (!gesture) {
+        return false;
+    }
+    state.GestureHeld = true;
+    return true;
+}
+
 void ApplyTopScreenStartRouting(NativeA32InputFrame& frame,
                                 bool topScreenProfile,
-                                bool routeGameplayStartToItems,
+                                bool routeGameplayStartToLastPage,
                                 bool nativePauseOpen,
                                 bool guestRefreshWillConsume,
                                 TopScreenStartRoutingState& state) noexcept {
     if (!guestRefreshWillConsume) {
         return;
     }
+    state.OpenRequested = false;
     const uint32_t start = NativeA32HidButtonMask(NativeA32HidButton::Start);
     const bool startHeld = (frame.Hid.Buttons & start) != 0U;
+    const bool startPressed = startHeld && !state.StartHeld;
+    state.StartHeld = startHeld;
     if (!topScreenProfile) {
         state.OpenGestureHeld = false;
         state.CloseGestureHeld = false;
         return;
     }
-    if (state.CloseGestureHeld) {
+    if (state.CloseGestureHeld || state.OpenGestureHeld) {
         if (startHeld) {
             frame.Hid.Buttons &= ~start;
             return;
         }
         state.CloseGestureHeld = false;
-    }
-    if (state.OpenGestureHeld) {
-        if (startHeld) {
-            frame.Hid.Buttons &= ~start;
-            if (!nativePauseOpen && routeGameplayStartToItems) {
-                const auto items = MapTopScreenPageShortcutToNativeTouch(
-                    NativeA32TopScreenPage::Items);
-                frame.Hid.TouchX = items.X;
-                frame.Hid.TouchY = items.Y;
-                frame.Hid.TouchPressed = items.Pressed;
-            }
-            return;
-        }
         state.OpenGestureHeld = false;
     }
-    if (nativePauseOpen || !routeGameplayStartToItems || !startHeld) {
+    if (nativePauseOpen || !routeGameplayStartToLastPage || !startPressed) {
         return;
     }
 
     frame.Hid.Buttons &= ~start;
-    const auto items = MapTopScreenPageShortcutToNativeTouch(
-        NativeA32TopScreenPage::Items);
-    frame.Hid.TouchX = items.X;
-    frame.Hid.TouchY = items.Y;
-    frame.Hid.TouchPressed = items.Pressed;
+    state.OpenRequested = true;
     MarkTopScreenStartOpenGestureConsumed(state);
 }
 

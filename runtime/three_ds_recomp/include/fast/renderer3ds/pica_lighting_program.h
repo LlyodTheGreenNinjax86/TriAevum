@@ -1,5 +1,4 @@
 #pragma once
-#include "fast/oot3d/pica_fragment_lighting.h"
 #include <array>
 #include <cstdint>
 #include <string_view>
@@ -7,6 +6,8 @@
 namespace Fast::Renderer3ds {
 // std140 payload. LUT support is resolved by the canonical register decoder,
 // never by material names. Lights remain in native accumulation order.
+// Title-neutral: the decoded native state and its packing live in the title
+// adapter, which consumes this struct.
 struct alignas(16) PicaLightingProgram {
     std::array<uint32_t, 4> Control{}; // count, environment, fresnel, flags
     std::array<std::array<uint32_t, 4>, 8> Lights{}; // index, flags, reserved
@@ -14,35 +15,6 @@ struct alignas(16) PicaLightingProgram {
     bool operator==(const PicaLightingProgram&) const = default;
 };
 static_assert(sizeof(PicaLightingProgram) == 256);
-
-inline PicaLightingProgram BuildPicaLightingProgram(const Oot3d::PicaFragmentLightingState& state) {
-    PicaLightingProgram p;
-    p.Control = {state.ActiveLightCount, state.EnvironmentConfiguration, state.FresnelSelector,
-        uint32_t(state.ClampHighlights) | (uint32_t(state.ShadowPrimary) << 1) |
-        (uint32_t(state.ShadowSecondary) << 2) | (uint32_t(state.ShadowAlpha) << 3) |
-        (uint32_t(state.BumpMode) << 4) | (uint32_t(state.RecalculateBumpVectors) << 6) |
-        (uint32_t(state.ShadowFactorEnabled) << 7) | (uint32_t(state.InvertShadow) << 8) |
-        (uint32_t(state.BumpTextureUnit) << 9) | (uint32_t(state.ShadowTextureUnit) << 11)};
-    for (size_t slot = 0; slot < p.Lights.size(); ++slot) {
-        const auto index = state.LightPermutation[slot];
-        const auto& light = state.Lights[index];
-        const bool spot = light.SpotAttenuationEnabled &&
-            Oot3d::IsPicaLightingLutSamplerSupported(state.EnvironmentConfiguration, uint8_t(8 + index));
-        p.Lights[slot] = {index, uint32_t(light.Directional) | (uint32_t(light.TwoSidedDiffuse) << 1) |
-            (uint32_t(light.GeometricFactor0) << 2) | (uint32_t(light.GeometricFactor1) << 3) |
-            (uint32_t(light.ShadowEnabled) << 4) | (uint32_t(spot) << 5) |
-            (uint32_t(light.DistanceAttenuationEnabled) << 6), 0, 0};
-    }
-    constexpr uint8_t tables[]{0, 1, 8, 3, 4, 5, 6};
-    constexpr uint8_t disableBits[]{16, 17, 0, 19, 22, 21, 20};
-    for (size_t i = 0; i < p.Luts.size(); ++i) {
-        const auto& lut = state.LutSamplers[i];
-        const bool enabled = i == 2 || ((state.Config1 & (1U << disableBits[i])) == 0 &&
-            Oot3d::IsPicaLightingLutSamplerSupported(state.EnvironmentConfiguration, tables[i]));
-        p.Luts[i] = {float(lut.Input), float(lut.AbsoluteInput), lut.Scale, float(enabled)};
-    }
-    return p;
-}
 
 inline constexpr std::string_view PicaLightingProgramDeclaration = R"glsl(
 struct PicaLightingProgram {
@@ -52,7 +24,28 @@ struct PicaLightingProgram {
 };
 )glsl";
 
-// Requires the canonical signed/unsigned LUT readers and fragment UBO.
+// Lighting arithmetic spelled out, every operation `precise`: the driver
+// expands builtins such as cross() differently once a program's inputs fold
+// to constants, so a specialized program and the always-available one would
+// round differently. Only inversesqrt/sqrt remain single instructions.
+inline constexpr std::string_view PicaLightingArithmeticFunctions = R"glsl(
+float pica_lighting_dot(vec2 a, vec2 b) { precise float r = a.x * b.x + a.y * b.y; return r; }
+float pica_lighting_dot(vec3 a, vec3 b) { precise float r = a.x * b.x + a.y * b.y + a.z * b.z; return r; }
+float pica_lighting_dot(vec4 a, vec4 b) {
+    precise float r = a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
+    return r;
+}
+vec3 pica_lighting_normalize(vec3 v) { precise vec3 r = v * inversesqrt(pica_lighting_dot(v, v)); return r; }
+vec4 pica_lighting_normalize(vec4 v) { precise vec4 r = v * inversesqrt(pica_lighting_dot(v, v)); return r; }
+float pica_lighting_length(vec3 v) { precise float r = sqrt(pica_lighting_dot(v, v)); return r; }
+vec3 pica_lighting_cross(vec3 a, vec3 b) {
+    precise vec3 r = vec3(a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x);
+    return r;
+}
+)glsl";
+
+// Requires PicaLightingArithmeticFunctions, the canonical signed/unsigned
+// LUT readers and the fragment UBO.
 inline constexpr std::string_view PicaLightingProgramFunctions = R"glsl(
 void pica_program_surface(PicaLightingProgram p, vec4 bump_sample, vec4 shadow_sample,
                          out vec3 n, out vec3 t, out vec4 shadow) {
@@ -60,10 +53,13 @@ void pica_program_surface(PicaLightingProgram p, vec4 bump_sample, vec4 shadow_s
     t = vec3(1.0, 0.0, 0.0);
     uint mode = (p.control.w >> 4u) & 3u;
     if (mode == 1u) {
-        n = 2.0 * bump_sample.rgb - vec3(1.0);
-        if ((p.control.w & 64u) != 0u) n.z = sqrt(max(1.0 - dot(n.xy, n.xy), 0.0));
+        precise vec3 bump_normal = 2.0 * bump_sample.rgb - vec3(1.0);
+        if ((p.control.w & 64u) != 0u)
+            bump_normal.z = sqrt(max(1.0 - pica_lighting_dot(bump_normal.xy, bump_normal.xy), 0.0));
+        n = bump_normal;
     } else if (mode == 2u) {
-        t = 2.0 * bump_sample.rgb - vec3(1.0);
+        precise vec3 bump_tangent = 2.0 * bump_sample.rgb - vec3(1.0);
+        t = bump_tangent;
     }
     shadow = vec4(1.0);
     if ((p.control.w & 128u) != 0u)
@@ -72,22 +68,24 @@ void pica_program_surface(PicaLightingProgram p, vec4 bump_sample, vec4 shadow_s
 float pica_program_lut(PicaLightingProgram p, int sampler_index, int table_index,
     bool two_sided, vec3 n, vec3 t, vec3 v, vec3 l, vec3 h, vec3 spot) {
     vec4 config = p.luts[sampler_index];
-    float x = 0.0;
+    precise float x = 0.0;
     switch (int(config.x)) {
-    case 0: x = dot(n, normalize(h)); break;
-    case 1: x = dot(v, normalize(h)); break;
-    case 2: x = dot(n, v); break;
-    case 3: x = dot(l, n); break;
-    case 4: x = dot(l, spot); break;
+    case 0: x = pica_lighting_dot(n, pica_lighting_normalize(h)); break;
+    case 1: x = pica_lighting_dot(v, pica_lighting_normalize(h)); break;
+    case 2: x = pica_lighting_dot(n, v); break;
+    case 3: x = pica_lighting_dot(l, n); break;
+    case 4: x = pica_lighting_dot(l, spot); break;
     case 5:
-        if (p.control.y == 8u) x = dot(normalize(h) - n * dot(n, normalize(h)), t);
+        if (p.control.y == 8u) x = pica_lighting_dot(pica_lighting_normalize(h) - n * pica_lighting_dot(n, pica_lighting_normalize(h)), t);
         break;
     }
     if (config.y != 0.0) {
         x = two_sided ? abs(x) : max(x, 0.0);
-        return config.z * pica_lighting_lut_unsigned(table_index, x);
+        precise float unsigned_value = config.z * pica_lighting_lut_unsigned(table_index, x);
+        return unsigned_value;
     }
-    return config.z * pica_lighting_lut_signed(table_index, x);
+    precise float signed_value = config.z * pica_lighting_lut_signed(table_index, x);
+    return signed_value;
 }
 )glsl";
 
@@ -99,15 +97,15 @@ inline constexpr std::string_view PicaLightingProgramBody = R"glsl(
         bool two_sided = (flags & 2u) != 0u;
         vec3 l = fragment_uniforms.lighting_position[i].xyz;
         if ((flags & 1u) == 0u) l += pica_view;
-        float distance_to_light = length(l);
-        l = normalize(l);
+        float distance_to_light = pica_lighting_length(l);
+        l = pica_lighting_normalize(l);
         vec3 spot = fragment_uniforms.lighting_spot_direction[i].xyz;
         vec3 h = pica_normalized_view + l;
-        float ndotl = two_sided ? abs(dot(l, pica_lighting_normal)) : max(dot(l, pica_lighting_normal), 0.0);
+        float ndotl = two_sided ? abs(pica_lighting_dot(l, pica_lighting_normal)) : max(pica_lighting_dot(l, pica_lighting_normal), 0.0);
         float highlight = (lp.control.w & 1u) != 0u ? sign(ndotl) : 1.0;
         float geo = 0.0;
         if ((flags & 12u) != 0u) {
-            float hlength = dot(h, h);
+            float hlength = pica_lighting_dot(h, h);
             geo = hlength == 0.0 ? 0.0 : min(ndotl / hlength, 1.0);
         }
         float spot_attenuation = 1.0;

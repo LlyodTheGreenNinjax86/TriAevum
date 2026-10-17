@@ -1,4 +1,5 @@
 #include "oot3d_native_a32_process.h"
+#include "oot3d_native_a32_memory_region.h"
 #include "oot3d_native_compiled_functions.h"
 #include "oot3d_native_owner_call_adapter.h"
 #include "oot3d_native_true_aot_blocks.h"
@@ -713,6 +714,183 @@ void TestMemoryContract() {
     Expect(memory.StoreExclusive(0x2000U, 4, 13U, token, nullptr) ==
                oot3d::recomp::a32::ExclusiveStoreResult::ReservationLost,
            "intervening write must invalidate exclusive token");
+}
+
+void TestMemoryFastBlockEquivalence() {
+    using Oot3dNativeGame::NativeA32Memory;
+    std::string error;
+    const auto prepare = [&](NativeA32Memory& memory) {
+        Expect(memory.MapRegion({"data", 0x1101U, 0x4000U, true, false, {}}, &error) &&
+                   memory.MapRegion({"rom", 0x8000U, 0x1000U, false, false, {}}, &error),
+               "map fast-block memory");
+        for (uint32_t address = 0x2000U; address < 0x5000U; address += 4U) {
+            Expect(memory.Write32(address, address * 2654435761U), "seed memory");
+        }
+    };
+    const auto sameState = [&](NativeA32Memory& checked, NativeA32Memory& fast,
+                               const char* label) {
+        Expect(checked.WriteGeneration() == fast.WriteGeneration() &&
+                   checked.ContentFingerprint() == fast.ContentFingerprint() &&
+                   checked.StateFingerprint() == fast.StateFingerprint(),
+               label);
+        for (uint32_t page = 0x2000U; page < 0x5000U; page += 0x1000U) {
+            Expect(checked.RangeWriteGeneration(page, 4U) ==
+                       fast.RangeWriteGeneration(page, 4U),
+                   label);
+        }
+    };
+    std::array<uint8_t, 48> block{};
+    for (size_t index = 0; index < block.size(); ++index) {
+        block[index] = static_cast<uint8_t>(0xA0U + index);
+    }
+
+    NativeA32Memory checked;
+    NativeA32Memory fast;
+    prepare(checked);
+    prepare(fast);
+    Expect(fast.SpanOnFastReadPage(0x2100U, 48U) &&
+               fast.SpanOnFastWritePage(0x2100U, 48U) &&
+               checked.WriteBytes(0x2100U, block) &&
+               fast.WriteBytesFast(0x2100U, block),
+           "an in-page block takes the fast form");
+    sameState(checked, fast, "a fast block write equals the checked write");
+    std::array<uint8_t, 48> readChecked{};
+    std::array<uint8_t, 48> readFast{};
+    Expect(checked.ReadBytes(0x2100U, readChecked) &&
+               fast.ReadBytesFast(0x2100U, readFast) && readChecked == readFast &&
+               readFast == block,
+           "a fast block read equals the checked read");
+
+    const auto declines = [&](NativeA32Memory& memory, uint32_t address,
+                              size_t size, const char* label) {
+        const uint64_t generation = memory.WriteGeneration();
+        const uint64_t content = memory.ContentFingerprint();
+        std::vector<uint8_t> bytes(size, 0xEEU);
+        Expect(!memory.WriteBytesFast(address, bytes) &&
+                   memory.WriteGeneration() == generation &&
+                   memory.ContentFingerprint() == content,
+               label);
+    };
+    declines(fast, 0x2FF0U, 48U, "a page-crossing block declines without effect");
+    declines(fast, 0x1100U, 8U, "a partially mapped page declines");
+    declines(fast, 0x8000U, 8U, "a read-only page declines writes");
+    declines(fast, 0x9000U, 8U, "an unmapped page declines");
+    declines(fast, 0x2100U, 0U, "an empty block declines");
+    Expect(fast.SpanOnFastReadPage(0x8000U, 8U) &&
+               !fast.SpanOnFastWritePage(0x8000U, 8U) &&
+               !fast.SpanOnFastReadPage(0x9000U, 8U) &&
+               !fast.ReadBytesFast(0x2FF0U, readFast),
+           "fast span queries follow their pages");
+
+    fast.EnableWriteTraceFingerprint(true);
+    declines(fast, 0x2100U, 8U, "write tracing keeps the checked path");
+    fast.EnableWriteTraceFingerprint(false);
+
+    fast.SetWriteObserver([](uint32_t, size_t) {});
+    Expect(fast.ObserveWrites(0x3100U, 16U), "observe a range");
+    declines(fast, 0x3000U, 8U, "an observed page declines");
+
+    const std::array ranges{std::pair<uint32_t, size_t>{0x4100U, 16U}};
+    Expect(fast.DeferWrites(ranges, [](uint32_t, std::span<uint8_t> bytes) {
+               std::fill(bytes.begin(), bytes.end(), 0x5AU);
+               return true;
+           }),
+           "defer a device range");
+    Expect(!fast.SpanOnFastReadPage(0x4000U, 4U) &&
+               !fast.ReadBytesFast(0x4000U, std::span<uint8_t>(readFast.data(), 4U)),
+           "a deferred page keeps the checked read");
+    // Fingerprinting materializes deferred bytes, so probe the write first.
+    const uint64_t beforeDeferredWrite = fast.WriteGeneration();
+    const std::array<uint8_t, 4> deferredBytes{1U, 2U, 3U, 4U};
+    Expect(!fast.WriteBytesFast(0x4000U, deferredBytes) &&
+               fast.WriteGeneration() == beforeDeferredWrite,
+           "a deferred page declines writes");
+}
+
+void TestMemoryRangeGenerations() {
+    using Oot3dNativeGame::NativeA32Memory;
+    NativeA32Memory memory;
+    std::string error;
+    Expect(memory.MapRegion({"data", 0x1101U, 0x3000U, true, false, {}}, &error),
+           "map partial boundary pages");
+    const auto first = memory.RangeWriteGeneration(0x1200U, 4U);
+    const auto second = memory.RangeWriteGeneration(0x2200U, 4U);
+    Expect(first && second, "mapped ranges provide certificates");
+    Expect(memory.WriteFast<uint32_t>(0x2200U, 17U) &&
+               memory.RangeWriteGeneration(0x1200U, 4U) == first &&
+               memory.RangeWriteGeneration(0x2200U, 4U) != second,
+           "a native store must invalidate only its page");
+    const auto beforeCrossing = memory.RangeWriteGeneration(0x2000U, 4U);
+    Expect(memory.WriteFast<uint16_t>(0x1FFFU, 0x1234U) &&
+               memory.RangeWriteGeneration(0x1200U, 4U) != first &&
+               memory.RangeWriteGeneration(0x2000U, 4U) != beforeCrossing,
+           "a checked crossing-page store must invalidate both pages");
+
+    auto saved = memory.CaptureState();
+    Expect(memory.Write32(0x2200U, 29U), "change snapshot bytes");
+    const auto replaced = memory.RangeWriteGeneration(0x2200U, 4U);
+    const auto architecturalGeneration = saved.at("write_generation").get<uint64_t>();
+    Expect(memory.RestoreState(saved, &error) &&
+               memory.WriteGeneration() == architecturalGeneration &&
+               memory.RangeWriteGeneration(0x2200U, 4U) != replaced,
+           "restore invalidates certificates without changing architectural generation");
+    uint32_t word = 0;
+    Expect(memory.Read32(0x2200U, &word) && word == 17U, "restore original bytes");
+
+    const auto beforeDevice = memory.RangeWriteGeneration(0x3000U, 4U);
+    const std::array ranges{std::pair<uint32_t, size_t>{0x3000U, 4U}};
+    Expect(memory.DeferWrites(ranges, [](uint32_t, std::span<uint8_t> bytes) {
+               std::fill(bytes.begin(), bytes.end(), 0x5AU);
+               return true;
+           }) && memory.RangeWriteGeneration(0x3000U, 4U) != beforeDevice &&
+               memory.Read32(0x3000U, &word) && word == 0x5A5A5A5AU,
+           "logical device publication invalidates before lazy readback");
+    auto* escaped = memory.GetWritePointer(0x2200U, 4U);
+    Expect(escaped && !memory.RangeWriteGeneration(0x2200U, 4U),
+           "an escaped writable pointer cannot yield an unchanged certificate");
+    escaped[0] = 0x2CU;
+    Expect(!memory.RangeWriteGeneration(0x2200U, 4U) &&
+               memory.Read32(0x2200U, &word) && word == 0x2CU,
+           "later untracked writes remain uncertified and visible");
+
+    NativeA32Memory replacement;
+    NativeA32Memory destination;
+    Expect(replacement.MapRegion({"move", 0x1000U, 4096U, true, false, {}}, &error) &&
+               destination.MapRegion({"move", 0x1000U, 4096U, true, false, {}}, &error) &&
+               replacement.Write32(0x1000U, 11U) && destination.Write32(0x1000U, 22U),
+           "prepare different images with identical architectural generations");
+    const auto beforeMove = destination.RangeWriteGeneration(0x1000U, 4U);
+    const auto movedGeneration = replacement.WriteGeneration();
+    destination = std::move(replacement);
+    Expect(destination.Read32(0x1000U, &word) && word == 11U &&
+               destination.WriteGeneration() == movedGeneration &&
+               destination.RangeWriteGeneration(0x1000U, 4U) != beforeMove,
+           "moving a replacement image must invalidate destination certificates");
+    Expect(replacement.MapRegion({"reused", 0x1000U, 4096U, true, false, {}}, &error) &&
+               replacement.RangeWriteGeneration(0x1000U, 4U) != beforeMove,
+           "reusing a moved-from image must not revive its certificates");
+
+    NativeA32Memory batched;
+    Expect(batched.MapRegion({"batch", 0x1000U, 0x3000U, true, false, {}}, &error),
+           "map batched memory");
+    const auto untouched = batched.RangeWriteGeneration(0x1000U, 4U);
+    const auto crossing = batched.RangeWriteGeneration(0x2FFFU, 2U);
+    const auto beforeBatch = batched.WriteGeneration();
+    {
+        Oot3dNativeGame::NativeA32UnobservedMemory region(batched);
+        Expect(region.WriteFast<uint16_t>(0x2FFFU, 0x1234U) &&
+                   region.WriteFast<uint32_t>(0x2000U, 17U),
+               "batched stores across a page boundary");
+        Expect(!region.ReadFast<uint32_t>(0U, &word),
+               "a checked fault must commit preceding batched stores");
+    }
+    uint16_t halfword = 0;
+    Expect(batched.Read16(0x2FFFU, &halfword) && halfword == 0x1234U &&
+               batched.Read32(0x2000U, &word) && word == 17U &&
+               batched.WriteGeneration() == beforeBatch + 2U &&
+               batched.RangeWriteGeneration(0x1000U, 4U) == untouched &&
+               batched.RangeWriteGeneration(0x2FFFU, 2U) != crossing,
+           "batched fault exits preserve bytes, write counts and range-local invalidation");
 }
 
 #if defined(OOT3D_NATIVE_A32_AOT_TESTS)
@@ -1728,12 +1906,21 @@ void TestTrueAotNativeCurveType2Scan() {
 
 int main(int argc, char** argv) {
     try {
+        if (argc == 2 && std::string_view(argv[1]) == "--memory-only") {
+            TestMemoryContract();
+            TestMemoryFastBlockEquivalence();
+            TestMemoryRangeGenerations();
+            std::cout << "oot3d_native_a32_process_tests: memory ok\n";
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--tls-only") {
             TestPrioritySchedulerAndTls(false);
             std::cout << "oot3d_native_a32_process_tests: TLS ok\n";
             return 0;
         }
         TestMemoryContract();
+        TestMemoryFastBlockEquivalence();
+        TestMemoryRangeGenerations();
 #if defined(OOT3D_NATIVE_A32_AOT_TESTS)
         TestWholeAotShiftAndFlagSemantics();
 #if defined(OOT3D_NATIVE_WHOLE_AOT_TESTS)
@@ -1741,6 +1928,7 @@ int main(int argc, char** argv) {
         TestWholeAotAllocatorLeafDifferential();
 #endif
 #endif
+#if !defined(OOT3D_NATIVE_A32_PRODUCT_DISPATCH_TESTS)
         TestNativeFunctionAtDispatchEntry();
         TestSynchronousOriginalFunctionInvocation();
         TestSynchronousFiniteWaitCompletion();
@@ -1753,6 +1941,17 @@ int main(int argc, char** argv) {
         TestFallbackBoundary();
         TestBlockEntryCallback();
         TestBlockEntryCallbackFilter();
+#else
+        // Whole-AOT product mode: Run() and InvokeFunction() dispatch the title's
+        // compiled blocks, not the synthetic registry code these cases execute
+        // through the interpreter dispatcher, so they apply to the interpreter
+        // configuration only (the game scenarios exercise scheduling, state
+        // round trips and block-entry callbacks in this one). Thread and TLS
+        // initialization does not dispatch.
+        TestPrioritySchedulerAndTls(false);
+        std::cout << "oot3d_native_a32_process_tests: 12 interpreter-dispatcher cases "
+                     "do not apply in whole-AOT product mode\n";
+#endif
         TestCompiledRuntimeMemcpy();
         TestCompiledPicaRegisterRangeWriter();
         TestCompiledPicaVertexFloatUniformWriter();
@@ -1763,8 +1962,15 @@ int main(int argc, char** argv) {
         TestCompiledAudioFourChannelDelay();
         TestCompiledAudioStereoReverb();
         TestTrueAotBgCheckClearBlock();
+#if defined(OOT3D_NATIVE_A32_AOT_TESTS)
+        // These blocks exist only in the generated true-AOT set, which the
+        // process library compiles when the A32 AOT inputs are generated.
         TestTrueAotCopyU32x16Loop();
         TestTrueAotNativeCurveType2Scan();
+#else
+        std::cout << "oot3d_native_a32_process_tests: 2 generated true-AOT cases "
+                     "need the generated A32 AOT inputs\n";
+#endif
         std::cout << "oot3d_native_a32_process_tests: ok\n";
         return 0;
     } catch (const std::exception& ex) {

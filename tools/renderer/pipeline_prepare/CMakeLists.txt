@@ -17,6 +17,11 @@ if(NOT TARGET NRI)
         set(NRI_ENABLE_${feature} OFF CACHE BOOL "" FORCE)
     endforeach()
     add_subdirectory("${TRIAEVUM_NRI_SOURCE_DIR}" nri)
+    if(MSVC AND CMAKE_CXX_COMPILER_ID MATCHES "Clang" AND TARGET NRI_Shared)
+        # As the runtime build: NRI enables /WX for clang-cl after its Clang
+        # suppressions; warnings in the pinned SDK must not block the helper.
+        target_compile_options(NRI_Shared PUBLIC /WX-)
+    endif()
 endif()
 set(runtime "${root}/runtime/three_ds_recomp")
 add_library(triaevum_pipeline_preparation STATIC
@@ -24,6 +29,7 @@ add_library(triaevum_pipeline_preparation STATIC
     "${runtime}/src/fast/renderer/pipeline_preparation_job.cpp"
     "${runtime}/src/fast/renderer3ds/vulkan_pipeline_cache_store.cpp"
     "${runtime}/src/fast/renderer3ds/nri_pica_pipeline_bridge.cpp"
+    "${runtime}/src/fast/renderer3ds/pica_preparation_queue.cpp"
     "${runtime}/src/fast/renderer3ds/nri_pica_upload_arena.cpp"
     "${runtime}/src/fast/renderer3ds/pica_nri_upload.cpp"
     "${runtime}/src/fast/renderer3ds/pica_nri_shader_contract.cpp"
@@ -39,8 +45,21 @@ if(MSVC)
     target_compile_definitions(triaevum_pipeline_preparation PUBLIC NOMINMAX)
     target_compile_options(triaevum_pipeline_preparation PRIVATE /utf-8)
 endif()
-add_executable(triaevum_nri_pipeline_prepare main.cpp)
+# The built-in fragment families resolve before the portable pack, as in the
+# runtime (pica_builtin_fragment_families.h).
+add_executable(triaevum_nri_pipeline_prepare main.cpp "${runtime}/src/fast/oot3d/pica_builtin_fragment_families.cpp")
 target_link_libraries(triaevum_nri_pipeline_prepare PRIVATE triaevum_pipeline_preparation)
+# --startup-programs embeds the translated title vertex family, as the runtime
+# executable does: this helper is the title's Forge tool, not title-neutral.
+target_include_directories(triaevum_nri_pipeline_prepare PRIVATE "${root}/tools/oot3d/native_pica_frontend")
+include("${runtime}/cmake/spirv_pack.cmake")
+triaevum_add_spirv_pack(triaevum_nri_pipeline_prepare "${root}/tools/oot3d/native_pica_frontend/oot3d_native_vertex_binaries.cpp"
+    "${root}/tools/oot3d/native_pica_frontend/oot3d_native_vertex.spvpack")
+foreach(_pack renderer3ds/pica_native_fragment oot3d/pica_temporal_fragment oot3d/pica_toon_fragment
+              oot3d/pica_uber_fragment)
+    triaevum_add_spirv_pack(triaevum_nri_pipeline_prepare "${runtime}/src/fast/${_pack}_binaries.cpp"
+        "${runtime}/src/fast/${_pack}.spvpack")
+endforeach()
 add_executable(triaevum_pipeline_preparation_tests tests.cpp)
 target_link_libraries(triaevum_pipeline_preparation_tests PRIVATE triaevum_pipeline_preparation)
 enable_testing()

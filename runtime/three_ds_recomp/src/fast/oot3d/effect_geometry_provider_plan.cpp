@@ -8,9 +8,9 @@
 namespace Fast::Oot3d {
 namespace {
 
-[[nodiscard]] constexpr uint32_t ResourceBit(
+[[nodiscard]] constexpr uint64_t ResourceBit(
     EffectResource resource) noexcept {
-    return 1U << static_cast<uint32_t>(resource);
+    return uint64_t{1} << static_cast<uint32_t>(resource);
 }
 
 [[nodiscard]] constexpr bool IsInputUnavailable(
@@ -88,7 +88,7 @@ EffectStage EffectGeometryProviderPlan::Stage() const noexcept {
 bool EffectGeometryProviderPlan::Requires(
     EffectResource resource) const noexcept {
     const auto index = static_cast<uint32_t>(resource);
-    return index < 32U && (mReadMask & ResourceBit(resource)) != 0U;
+    return index < 64U && (mReadMask & ResourceBit(resource)) != 0U;
 }
 
 bool EffectGeometryProviderPlan::ProducesExtensionGeometry() const noexcept {
@@ -149,7 +149,7 @@ EffectGeometryProviderPlan BuildEffectGeometryProviderPlan(
     bool unsupportedWrite = false;
     for (const auto& use : pass->Resources) {
         const auto index = static_cast<uint32_t>(use.Resource);
-        if (ReadsEffectResource(use.Access) && index < 32U) {
+        if (ReadsEffectResource(use.Access) && index < 64U) {
             plan.mReadMask |= ResourceBit(use.Resource);
         }
         if (!WritesEffectResource(use.Access)) {

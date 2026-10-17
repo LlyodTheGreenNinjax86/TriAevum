@@ -1,9 +1,12 @@
 #include "oot3d_native_pica_fragment_shader_gen.h"
 #include "oot3d_native_pica_program_descriptor.h"
 #include "oot3d_native_pica_canonical_hash.h"
+#include "fast/oot3d/pica_fragment_lighting.h"
 
 #include <cstdlib>
 #include <iostream>
+#include <optional>
+#include <string>
 
 #if defined(OOT3D_NATIVE_PICA_TEST_SHADERC)
 #include <shaderc/shaderc.hpp>
@@ -34,6 +37,20 @@ void RequireFragmentShaderCompiles(const std::string& source) {
     }
 }
 #endif
+
+// The specialized program runs the parametric lighting text with its decoded
+// program as a constant: returns that program when the source carries it.
+std::optional<Fast::Renderer3ds::PicaLightingProgram> ConstantLightingProgram(
+    const std::string& source, const Oot3dNativeGame::Oot3dPicaDrawPacket& packet) {
+    const auto program = Fast::Oot3d::BuildPicaLightingProgram(
+        Fast::Oot3d::DecodePicaFragmentLighting(packet.Registers));
+    std::string control = "const PicaLightingProgram pica_lighting_constant_program = "
+                          "PicaLightingProgram(uvec4(";
+    for (size_t i = 0; i < program.Control.size(); ++i)
+        control += std::to_string(program.Control[i]) + (i + 1 < program.Control.size() ? "u, " : "u)");
+    if (source.find(control) == std::string::npos) return std::nullopt;
+    return program;
+}
 
 Oot3dNativeGame::Oot3dPicaDrawPacket MakePacket() {
     Oot3dNativeGame::Oot3dPicaDrawPacket packet;
@@ -127,11 +144,72 @@ void TestCanonicalHashZeroRuns() {
               << " byte-stream differential cases passed\n";
 }
 
+// The register-file ID resumes from the previous draw's fold state. Every
+// value must still equal a bytewise FNV-1a of the whole file, whatever
+// changed in between.
+void TestIncrementalRegisterFileHash() {
+    using namespace Oot3dNativeGame;
+    const auto reference = [](const Oot3dPicaDrawPacket& packet) {
+        uint64_t hash = 1469598103934665603ULL;
+        const auto appendByte = [&](uint8_t byte) {
+            hash = (hash ^ byte) * 1099511628211ULL;
+        };
+        const auto appendWord = [&](uint32_t word) {
+            for (unsigned shift = 0; shift < 32U; shift += 8U) {
+                appendByte(static_cast<uint8_t>(word >> shift));
+            }
+        };
+        constexpr std::string_view domain = "oot3d.pica.register_file";
+        appendWord(kOot3dPicaProgramDescriptorSchemaVersion);
+        appendWord(static_cast<uint32_t>(domain.size()));
+        for (const char c : domain) appendByte(static_cast<uint8_t>(c));
+        appendWord(static_cast<uint32_t>(packet.Registers.size()));
+        for (const uint32_t word : packet.Registers) appendWord(word);
+        return hash == 0U ? 1U : hash;
+    };
+    uint32_t random = 0x9E3779B9U;
+    const auto next = [&] {
+        random ^= random << 13;
+        random ^= random >> 17;
+        random ^= random << 5;
+        return random;
+    };
+    auto packet = MakePacket();
+    const auto state = MakeState();
+    const auto original = packet.Registers;
+    for (int draw = 0; draw < 3000; ++draw) {
+        switch (next() % 6U) {
+        case 0:
+            break;  // unchanged file
+        case 1:
+            packet.Registers[0] ^= next() | 1U;  // first block
+            break;
+        case 2:
+            packet.Registers.back() = next();  // last block
+            break;
+        case 3:
+            packet.Registers = original;  // back to a state seen before
+            break;
+        default:
+            for (uint32_t n = next() % 4U; n != 0U; --n) {
+                packet.Registers[next() % packet.Registers.size()] =
+                    next() % 3U == 0U ? 0U : next();
+            }
+            break;
+        }
+        Require(BuildOot3dPicaCanonicalDrawIdentity(packet, state)
+                        .FullRegisterStateId == reference(packet),
+                "incremental register-file ID differs from a full bytewise hash");
+    }
+    std::cout << "register-file ID: 3000 incremental draws match full hashes\n";
+}
+
 } // namespace
 
 int main() {
     using namespace Oot3dNativeGame;
     TestCanonicalHashZeroRuns();
+    TestIncrementalRegisterFileHash();
     auto packet = MakePacket();
     auto state = MakeState();
     const auto baseline = BuildOot3dPicaCanonicalDrawIdentity(packet, state);
@@ -245,14 +323,19 @@ int main() {
                     "return value.x > z ? float(value.y)") !=
                     std::string::npos &&
                 lightingShader.Source.find(
-                    "vec4(1.0) - (pica_sample_shadow2d") !=
-                    std::string::npos &&
+                    "pica_program_surface(pica_lighting_constant_program, "
+                    "vec4(0.0), pica_sample_shadow2d") != std::string::npos &&
+                ConstantLightingProgram(lightingShader.Source, shadowPacket)
+                    .has_value() &&
+                // Shadow factor, inverted, on the primary color and alpha;
+                // light 0 casts it.
+                (ConstantLightingProgram(lightingShader.Source, shadowPacket)
+                     ->Control[3] & (128U | 256U | 2U | 8U)) ==
+                    (128U | 256U | 2U | 8U) &&
+                (ConstantLightingProgram(lightingShader.Source, shadowPacket)
+                     ->Lights[0][1] & 16U) != 0U &&
                 lightingShader.Source.find(
-                    "lighting_diffuse[0].rgb * pica_light_dot_0 * "
-                    "pica_shadow_factor.rgb") != std::string::npos &&
-                lightingShader.Source.find(
-                    "lighting_ambient[0].rgb * pica_light_attenuation_0") !=
-                    std::string::npos &&
+                    "diffuse *= pica_shadow_factor.rgb") != std::string::npos &&
                 lightingShader.Source.find(
                     "pica_specular_sum.a *= pica_shadow_factor.a") !=
                     std::string::npos &&
@@ -316,13 +399,17 @@ int main() {
                     *bumpPacket, bumpState, lightingShader,
                     &lightingError) &&
                 lightingShader.Source.find(
-                    "vec3 pica_surface_normal = 2.0 * ("
+                    "pica_program_surface(pica_lighting_constant_program, "
                     "pica_sample_texture2(vec2(pica_texcoord1.x, 1.0 - "
-                    "pica_texcoord1.y))).rgb - vec3(1.0)") !=
-                    std::string::npos &&
-                lightingShader.Source.find(
-                    "pica_surface_normal_z_squared") !=
-                    std::string::npos &&
+                    "pica_texcoord1.y)), vec4(1.0)") != std::string::npos &&
+                ConstantLightingProgram(lightingShader.Source, *bumpPacket)
+                    .has_value() &&
+                // Normal map with the recalculated Z component.
+                ((ConstantLightingProgram(lightingShader.Source, *bumpPacket)
+                      ->Control[3] >> 4U) & 3U) ==
+                    static_cast<uint32_t>(Fast::Oot3d::PicaLightingBumpMode::NormalMap) &&
+                (ConstantLightingProgram(lightingShader.Source, *bumpPacket)
+                     ->Control[3] & 64U) != 0U &&
                 lightingShader.Source.find(
                     "pica_normal_quaternion, pica_surface_normal") !=
                     std::string::npos &&
@@ -342,12 +429,13 @@ int main() {
     Require(GenerateOot3dPicaFragmentShader(
                 *bumpPacket, bumpState, lightingShader,
                 &lightingError) &&
-                lightingShader.Source.find(
-                    "vec3 pica_surface_normal = 2.0 * (") !=
-                    std::string::npos &&
-                lightingShader.Source.find(
-                    "pica_surface_normal_z_squared") ==
-                    std::string::npos,
+                ConstantLightingProgram(lightingShader.Source, *bumpPacket)
+                    .has_value() &&
+                ((ConstantLightingProgram(lightingShader.Source, *bumpPacket)
+                      ->Control[3] >> 4U) & 3U) ==
+                    static_cast<uint32_t>(Fast::Oot3d::PicaLightingBumpMode::NormalMap) &&
+                (ConstantLightingProgram(lightingShader.Source, *bumpPacket)
+                     ->Control[3] & 64U) == 0U,
             "PICA disable-bump-renormalization bit was ignored");
 #if defined(OOT3D_NATIVE_PICA_TEST_SHADERC)
     RequireFragmentShaderCompiles(lightingShader.Source);
@@ -364,16 +452,14 @@ int main() {
                 *bumpPacket, tangentState, lightingShader,
                 &lightingError) &&
                 lightingShader.Source.find(
-                    "vec3 pica_surface_normal = vec3(0.0, 0.0, 1.0)") !=
-                    std::string::npos &&
-                lightingShader.Source.find(
-                    "vec3 pica_surface_tangent = 2.0 * ("
+                    "pica_program_surface(pica_lighting_constant_program, "
                     "pica_sample_texture1(vec2(pica_texcoord1.x, 1.0 - "
-                    "pica_texcoord1.y))).rgb - vec3(1.0)") !=
-                    std::string::npos &&
-                lightingShader.Source.find(
-                    "pica_surface_normal_z_squared") ==
-                    std::string::npos &&
+                    "pica_texcoord1.y)), vec4(1.0)") != std::string::npos &&
+                ConstantLightingProgram(lightingShader.Source, *bumpPacket)
+                    .has_value() &&
+                ((ConstantLightingProgram(lightingShader.Source, *bumpPacket)
+                      ->Control[3] >> 4U) & 3U) ==
+                    static_cast<uint32_t>(Fast::Oot3d::PicaLightingBumpMode::TangentMap) &&
                 lightingShader.Hooks.SamplesTexture(1U),
             "native PICA tangent-map bump lighting was not generated");
 #if defined(OOT3D_NATIVE_PICA_TEST_SHADERC)
@@ -410,8 +496,10 @@ int main() {
                 lightingShader.Source.find(
                     "binding=13) uniform usampler2D pica_lighting_lut") !=
                     std::string::npos &&
-                lightingShader.Source.find(
-                    "pica_lighting_lut_unsigned(0") != std::string::npos,
+                ConstantLightingProgram(lightingShader.Source, lutLightingPacket)
+                    .has_value() &&
+                ConstantLightingProgram(lightingShader.Source, lutLightingPacket)
+                        ->Luts[0][3] != 0.0F,
             "native fragment-lighting LUT shader was not generated");
 #if defined(OOT3D_NATIVE_PICA_TEST_SHADERC)
     RequireFragmentShaderCompiles(lightingShader.Source);
@@ -448,19 +536,18 @@ int main() {
                     completeLutLightingPacket, state, lightingShader,
                     &lightingError),
             "complete native fragment-lighting LUT configuration failed");
-    for (const char* expectedCall : {
-             "pica_lighting_lut_unsigned(0",
-             "pica_lighting_lut_unsigned(1",
-             "pica_lighting_lut_unsigned(3",
-             "pica_lighting_lut_unsigned(4",
-             "pica_lighting_lut_unsigned(5",
-             "pica_lighting_lut_unsigned(6",
-             "pica_lighting_lut_unsigned(8",
-             "pica_lighting_lut_unsigned(16",
-         }) {
-        Require(lightingShader.Source.find(expectedCall) != std::string::npos,
+    // Every LUT path is enabled in the constant program: D0, D1, fresnel and
+    // the three reflection tables, light 0's spot and distance attenuation.
+    const auto completeProgram =
+        ConstantLightingProgram(lightingShader.Source, completeLutLightingPacket);
+    Require(completeProgram.has_value(),
+            "complete native fragment-lighting program is missing");
+    for (const size_t sampler : {0U, 1U, 3U, 4U, 5U, 6U}) {
+        Require(completeProgram->Luts[sampler][3] != 0.0F,
                 "complete native fragment-lighting LUT path is missing");
     }
+    Require((completeProgram->Lights[0][1] & (32U | 64U)) == (32U | 64U),
+            "complete native fragment-lighting attenuation path is missing");
 #if defined(OOT3D_NATIVE_PICA_TEST_SHADERC)
     RequireFragmentShaderCompiles(lightingShader.Source);
 #endif
@@ -497,6 +584,47 @@ int main() {
                 procedural.ProceduralTextureReferenced &&
                 !procedural.FullySupported(),
             "procedural-texture coverage gap was not classified");
+
+    // Z-buffering with scale -1 and offset 0: the PICA depth is the
+    // rasterized depth, so the program leaves depth to fixed function (early
+    // depth testing) and gets its own key. A depth offset, another scale or
+    // W-buffering keeps the explicit depth.
+    auto rasterState = state;
+    rasterState.Viewport.ZBuffering = true;
+    rasterState.Viewport.DepthRange = -1.0F;
+    rasterState.Viewport.NearPlane = 0.0F;
+    Oot3dPicaGeneratedFragmentShader rasterShader;
+    std::string rasterError;
+    Require(Oot3dPicaFragmentDepthIsRasterDepth(rasterState) &&
+                GenerateOot3dPicaFragmentShader(packet, rasterState, rasterShader, &rasterError) &&
+                rasterShader.Source.find("gl_FragDepth") == std::string::npos &&
+                rasterShader.Source.find("float pica_depth = gl_FragCoord.z;") != std::string::npos &&
+                rasterShader.Hooks.Outputs.Depth == Oot3d::Renderer::PicaFragmentDepthOutput::FixedFunction,
+            "raster-depth fragment program still writes its depth");
+    Oot3dPicaGeneratedFragmentShader parametricShader;
+    Require(!Oot3dPicaFragmentDepthIsRasterDepth(rasterState, Oot3dPicaTevMode::Parametric) &&
+                GenerateOot3dPicaFragmentShader(packet, rasterState, parametricShader, &rasterError,
+                                                Oot3dPicaShaderBuildPurpose::RuntimeDraw,
+                                                Oot3dPicaTevMode::Parametric) &&
+                parametricShader.Source.find("gl_FragDepth = pica_depth;") != std::string::npos,
+            "parametric program lost its explicit depth");
+#if defined(OOT3D_NATIVE_PICA_TEST_SHADERC)
+    RequireFragmentShaderCompiles(rasterShader.Source);
+#endif
+    for (int variant = 0; variant < 3; ++variant) {
+        auto explicitState = rasterState;
+        if (variant == 0) explicitState.Viewport.NearPlane = -3.0517578125e-05F;
+        if (variant == 1) explicitState.Viewport.DepthRange = -0.5F;
+        if (variant == 2) explicitState.Viewport.ZBuffering = false;
+        Oot3dPicaGeneratedFragmentShader explicitShader;
+        Require(!Oot3dPicaFragmentDepthIsRasterDepth(explicitState) &&
+                    GenerateOot3dPicaFragmentShader(packet, explicitState, explicitShader, &rasterError) &&
+                    explicitShader.Source.find("gl_FragDepth = pica_depth;") != std::string::npos &&
+                    explicitShader.Hooks.Outputs.Depth ==
+                        Oot3d::Renderer::PicaFragmentDepthOutput::ExplicitNative &&
+                    explicitShader.StateKey != rasterShader.StateKey,
+                "explicit-depth fragment program lost its depth write or key");
+    }
     std::cout << "oot3d_native_pica_program_descriptor_tests: ok\n";
     return 0;
 }

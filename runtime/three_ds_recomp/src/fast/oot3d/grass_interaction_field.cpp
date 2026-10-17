@@ -1,8 +1,10 @@
 #include "fast/oot3d/grass_interaction_field.h"
 
 #include <algorithm>
+#include <bit>
 #include <cmath>
 #include <limits>
+#include <utility>
 
 namespace Fast::Oot3d {
 namespace {
@@ -11,6 +13,21 @@ constexpr float kNoInteractionHeight =
     std::numeric_limits<float>::quiet_NaN();
 
 float PlanarLength(float x, float z) { return std::sqrt(x * x + z * z); }
+
+// Holds a displacement at the maximum bend and drops the velocity that pushes
+// it further out: a pinned blade must not store outward speed that keeps it
+// pinned after the push ends.
+void ClampBend(std::array<float, 2>& displacement, std::array<float, 2>& velocity, float maximum) {
+    const float length = PlanarLength(displacement[0], displacement[1]);
+    if (length <= maximum || length <= 1.0e-6F) return;
+    const float ux = displacement[0] / length, uz = displacement[1] / length;
+    displacement = {ux * maximum, uz * maximum};
+    const float outward = velocity[0] * ux + velocity[1] * uz;
+    if (outward > 0.0F) {
+        velocity[0] -= outward * ux;
+        velocity[1] -= outward * uz;
+    }
+}
 
 } // namespace
 
@@ -22,9 +39,7 @@ GrassInteractionField::GrassInteractionField(uint32_t resolution,
     mDisplacement.resize(size);
     mVelocity.resize(size);
     mInteractionHeight.assign(size, kNoInteractionHeight);
-    mScratchDisplacement.resize(size);
-    mScratchVelocity.resize(size);
-    mScratchHeight.resize(size, kNoInteractionHeight);
+    mActiveColumns.assign(mResolution, {0U, 0U});
 }
 
 void GrassInteractionField::Configure(uint32_t resolution,
@@ -39,9 +54,7 @@ void GrassInteractionField::Configure(uint32_t resolution,
     mDisplacement.assign(size, {});
     mVelocity.assign(size, {});
     mInteractionHeight.assign(size, kNoInteractionHeight);
-    mScratchDisplacement.assign(size, {});
-    mScratchVelocity.assign(size, {});
-    mScratchHeight.assign(size, kNoInteractionHeight);
+    mActiveColumns.assign(mResolution, {0U, 0U});
     mInitialized = false;
     mPreviousActors.clear();
 }
@@ -53,6 +66,22 @@ void GrassInteractionField::ClearValues() {
               std::array<float, 2>{});
     std::fill(mInteractionHeight.begin(), mInteractionHeight.end(),
               kNoInteractionHeight);
+    ClearActiveColumns();
+}
+
+void GrassInteractionField::ClearActiveColumns() {
+    std::fill(mActiveColumns.begin(), mActiveColumns.end(),
+              std::array<uint32_t, 2>{0U, 0U});
+}
+
+bool GrassInteractionField::AtRest(size_t index) const noexcept {
+    const auto zero = [](float value) {
+        return std::bit_cast<uint32_t>(value) == 0U;
+    };
+    return zero(mDisplacement[index][0]) && zero(mDisplacement[index][1]) &&
+           zero(mVelocity[index][0]) && zero(mVelocity[index][1]) &&
+           std::bit_cast<uint32_t>(mInteractionHeight[index]) ==
+               std::bit_cast<uint32_t>(kNoInteractionHeight);
 }
 
 void GrassInteractionField::ShiftTo(const std::array<float, 2>& center) {
@@ -75,29 +104,37 @@ void GrassInteractionField::ShiftTo(const std::array<float, 2>& center) {
         return;
     }
 
-    std::fill(mScratchDisplacement.begin(), mScratchDisplacement.end(),
-              std::array<float, 2>{});
-    std::fill(mScratchVelocity.begin(), mScratchVelocity.end(),
-              std::array<float, 2>{});
-    std::fill(mScratchHeight.begin(), mScratchHeight.end(),
-              kNoInteractionHeight);
-    for (int y = 0; y < static_cast<int>(mResolution); ++y) {
-        const int oldY = y + shiftY;
-        if (oldY < 0 || oldY >= static_cast<int>(mResolution)) continue;
-        for (int x = 0; x < static_cast<int>(mResolution); ++x) {
-            const int oldX = x + shiftX;
-            if (oldX < 0 || oldX >= static_cast<int>(mResolution)) continue;
-            const size_t next = static_cast<size_t>(y) * mResolution + x;
-            const size_t previous =
-                static_cast<size_t>(oldY) * mResolution + oldX;
-            mScratchDisplacement[next] = mDisplacement[previous];
-            mScratchVelocity[next] = mVelocity[previous];
-            mScratchHeight[next] = mInteractionHeight[previous];
+    // Cell (x, y) moves to (x - shiftX, y - shiftY). Cells outside the
+    // active columns and cells entering the field are at rest, so only the
+    // active cells move; the rest of the field already holds rest values.
+    const int resolution = static_cast<int>(mResolution);
+    mShiftScratch.clear();
+    for (uint32_t y = 0; y < mResolution; ++y) {
+        auto& columns = mActiveColumns[y];
+        const int nextY = static_cast<int>(y) - shiftY;
+        for (uint32_t x = columns[0]; x < columns[1]; ++x) {
+            const size_t index = static_cast<size_t>(y) * mResolution + x;
+            const int nextX = static_cast<int>(x) - shiftX;
+            if (nextY >= 0 && nextY < resolution && nextX >= 0 && nextX < resolution) {
+                mShiftScratch.push_back({static_cast<size_t>(nextY) * mResolution + static_cast<size_t>(nextX),
+                    {mDisplacement[index], mVelocity[index], mInteractionHeight[index]}});
+            }
+            mDisplacement[index] = {};
+            mVelocity[index] = {};
+            mInteractionHeight[index] = kNoInteractionHeight;
         }
+        columns = {0U, 0U};
     }
-    mDisplacement.swap(mScratchDisplacement);
-    mVelocity.swap(mScratchVelocity);
-    mInteractionHeight.swap(mScratchHeight);
+    for (const auto& [index, value] : mShiftScratch) {
+        mDisplacement[index] = value.Displacement;
+        mVelocity[index] = value.Velocity;
+        mInteractionHeight[index] = value.Height;
+        auto& columns = mActiveColumns[index / mResolution];
+        const auto x = static_cast<uint32_t>(index % mResolution);
+        columns = columns[0] < columns[1]
+            ? std::array<uint32_t, 2>{std::min(columns[0], x), std::max(columns[1], x + 1U)}
+            : std::array<uint32_t, 2>{x, x + 1U};
+    }
 }
 
 void GrassInteractionField::Update(
@@ -125,10 +162,17 @@ void GrassInteractionField::UpdateActors(
         const auto snap = [cell](float value) {
             return std::round(value / cell) * cell;
         };
-        // Keep finite trail storage around motion, not the first (often static)
-        // scene object. Direct colliders remain active outside the trail field.
-        const auto focus = std::max_element(actors.begin(), actors.end(), [](const auto& a, const auto& b) {
-            return std::hypot(a.Velocity[0], a.Velocity[2]) < std::hypot(b.Velocity[0], b.Velocity[2]);
+        // Keep finite trail storage around Link, whose trail the camera follows;
+        // without him, around the fastest actor rather than the first (often
+        // static) scene object. Following whichever actor moved fastest moved
+        // the field away from a stopped Link and wiped his trail at once.
+        // Direct colliders remain active outside the trail field.
+        const auto rank = [](const GrassInteractor& actor) {
+            return std::pair(actor.Type == GrassInteractor::Kind::PlayerLink,
+                             std::hypot(actor.Velocity[0], actor.Velocity[2]));
+        };
+        const auto focus = std::max_element(actors.begin(), actors.end(), [&](const auto& a, const auto& b) {
+            return rank(a) < rank(b);
         });
         if (!mInitialized || std::hypot(focus->Velocity[0], focus->Velocity[2]) > 0.01F)
             ShiftTo({snap(focus->Position[0]), snap(focus->Position[2])});
@@ -142,27 +186,38 @@ void GrassInteractionField::UpdateActors(
     const uint32_t steps =
         std::max(1U, static_cast<uint32_t>(std::ceil(dt * 120.0F)));
     const float step = steps > 0U ? dt / static_cast<float>(steps) : 0.0F;
-    for (uint32_t substep = 0; substep < steps && step > 0.0F; ++substep) {
-        for (size_t index = 0; index < mDisplacement.size(); ++index) {
-            for (size_t axis = 0; axis < 2; ++axis) {
-                mVelocity[index][axis] +=
-                    (-spring * mDisplacement[index][axis] -
-                     damping * mVelocity[index][axis]) * step;
-                mDisplacement[index][axis] +=
-                    mVelocity[index][axis] * step;
+    // A cell at rest keeps its value, so only active cells are integrated;
+    // each row's columns then shrink to the cells still moving.
+    for (uint32_t y = 0; y < mResolution && step > 0.0F; ++y) {
+        auto& columns = mActiveColumns[y];
+        uint32_t first = columns[1];
+        uint32_t end = 0U;
+        for (uint32_t x = columns[0]; x < columns[1]; ++x) {
+            const size_t index = static_cast<size_t>(y) * mResolution + x;
+            for (uint32_t substep = 0; substep < steps; ++substep) {
+                for (size_t axis = 0; axis < 2; ++axis) {
+                    mVelocity[index][axis] +=
+                        (-spring * mDisplacement[index][axis] -
+                         damping * mVelocity[index][axis]) * step;
+                    mDisplacement[index][axis] +=
+                        mVelocity[index][axis] * step;
+                }
+                const float length = PlanarLength(mDisplacement[index][0],
+                                                  mDisplacement[index][1]);
+                if (length > settings.MaximumBend && length > 1.0e-6F) {
+                    ClampBend(mDisplacement[index], mVelocity[index], settings.MaximumBend);
+                } else if (length < 1.0e-4F &&
+                           PlanarLength(mVelocity[index][0],
+                                        mVelocity[index][1]) < 1.0e-4F) {
+                    mInteractionHeight[index] = kNoInteractionHeight;
+                }
             }
-            const float length = PlanarLength(mDisplacement[index][0],
-                                              mDisplacement[index][1]);
-            if (length > settings.MaximumBend && length > 1.0e-6F) {
-                const float scale = settings.MaximumBend / length;
-                mDisplacement[index][0] *= scale;
-                mDisplacement[index][1] *= scale;
-            } else if (length < 1.0e-4F &&
-                       PlanarLength(mVelocity[index][0],
-                                    mVelocity[index][1]) < 1.0e-4F) {
-                mInteractionHeight[index] = kNoInteractionHeight;
+            if (!AtRest(index)) {
+                first = std::min(first, x);
+                end = x + 1U;
             }
         }
+        columns = first < end ? std::array<uint32_t, 2>{first, end} : std::array<uint32_t, 2>{0U, 0U};
     }
 
     if (settings.CollisionPush > 0.0F) {
@@ -215,6 +270,14 @@ void GrassInteractionField::Stamp(const InteractiveGrassSettings& settings, cons
     const float velocityGain = 1.0F +
         std::clamp(speed / 300.0F, 0.0F, 2.0F) *
             settings.CollisionVelocityResponse;
+    for (int y = minY; y <= maxY && minX <= maxX; ++y) {
+        auto& columns = mActiveColumns[static_cast<size_t>(y)];
+        const auto first = static_cast<uint32_t>(minX);
+        const auto end = static_cast<uint32_t>(maxX) + 1U;
+        columns = columns[0] < columns[1]
+            ? std::array<uint32_t, 2>{std::min(columns[0], first), std::max(columns[1], end)}
+            : std::array<uint32_t, 2>{first, end};
+    }
     for (int y = minY; y <= maxY; ++y) {
         for (int x = minX; x <= maxX; ++x) {
             const float worldX = originX + (static_cast<float>(x) + 0.5F) * cell;
@@ -254,13 +317,7 @@ void GrassInteractionField::Stamp(const InteractiveGrassSettings& settings, cons
             mVelocity[index][1] += dz * impulse * (2.0F / recovery);
             mInteractionHeight[index] =
                 link->PreviousPosition[1] + segmentY * t;
-            const float bend = PlanarLength(mDisplacement[index][0],
-                                            mDisplacement[index][1]);
-            if (bend > settings.MaximumBend && bend > 1.0e-6F) {
-                const float scale = settings.MaximumBend / bend;
-                mDisplacement[index][0] *= scale;
-                mDisplacement[index][1] *= scale;
-            }
+            ClampBend(mDisplacement[index], mVelocity[index], settings.MaximumBend);
         }
     }
 }

@@ -1,4 +1,6 @@
 #include "fast/oot3d/pica_scanout_effects.h"
+
+#include "fast/renderer3ds/pica_geometry_guide.h"
 #include "fast/oot3d/pica_surface_coordinates.h"
 #include "fast/oot3d/pica_guide_diagnostics.h"
 #include "fast/oot3d/toon_outline_shader.h"
@@ -7,6 +9,7 @@
 #include "fast/oot3d/spatial_aa.h"
 
 #include <algorithm>
+#include <string_view>
 
 namespace Fast::Oot3d {
 
@@ -26,8 +29,12 @@ PicaScanoutPushConstants BuildPicaScanoutPushConstants(
     output.EncodeSrgb = static_cast<uint32_t>(
         inputLinear && !input.TargetSrgb);
     const bool effectsBaked = input.EffectsComposited;
-    output.Cacao =
-        static_cast<uint32_t>(input.CacaoAvailable && !effectsBaked);
+    // An MXAO debug view replaces the visibility; only the scene composite
+    // shows it, so scanout never applies it as occlusion.
+    const bool aoDebug = input.Effects.AmbientOcclusion == AmbientOcclusionMode::Mxao &&
+                         input.Effects.MxaoDebug != MxaoDebugView::Off;
+    output.AmbientOcclusion =
+        static_cast<uint32_t>(input.AmbientOcclusionAvailable && !effectsBaked && !aoDebug);
     output.Outline = static_cast<uint32_t>(
         input.OutlineAvailable && !effectsBaked);
     output.InvWidth =
@@ -81,11 +88,12 @@ void main() {
 }
 
 std::string BuildPicaScanoutFragmentShader(bool separateSampler,
-                                          std::optional<int> diagnosticMode) {
+                                          std::optional<int> diagnosticMode,
+                                          PicaScanoutOrientation orientation) {
     std::string source = R"glsl(
 #version 450
 layout(set = 0, binding = 0) uniform sampler2D physical_scanout;
-layout(set = 0, binding = 1) uniform sampler2D cacao_visibility;
+layout(set = 0, binding = 1) uniform sampler2D ao_visibility;
 layout(set = 0, binding = 2) uniform sampler2D scene_depth;
 layout(set = 0, binding = 3) uniform sampler2D normal_guide;
 layout(set = 0, binding = 4) uniform sampler2D hiz_depth;
@@ -94,9 +102,9 @@ layout(set = 0, binding = 6) uniform sampler2D filtered_reflection;
 layout(set = 0, binding = 7) uniform sampler2D ambient_guide;
 layout(set = 0, binding = 8) uniform sampler2D transparent_depth_guide;
 layout(set = 0, binding = 9) uniform sampler2D fog_guide;
-layout(set = 0, binding = 10) uniform sampler2D outline_geometry_guide;
+layout(set = 0, binding = 10) uniform usampler2D outline_geometry_guide;
 layout(push_constant) uniform ScanoutState {
-    uint flip_y; uint aa_mode; uint cacao; uint outline;
+    uint flip_y; uint aa_mode; uint ambient_occlusion; uint outline;
     vec2 inverse_size;
     float outline_width;
     float outline_depth_sensitivity;
@@ -142,6 +150,7 @@ vec3 oot3d_linear_to_srgb(vec3 value) {
     return mix(higher,lower,cutoff);
 }
 )glsl";
+    source += Renderer3ds::PicaGeometryGuideShaderLibrary();
     source += R"glsl(
 float oot3d_outline_sample_scene_depth(vec2 uv) {
     ivec2 size=textureSize(scene_depth,0);
@@ -153,7 +162,8 @@ vec4 oot3d_outline_sample_normal(vec2 uv) {
 }
 vec4 oot3d_outline_sample_geometry(vec2 uv) {
     ivec2 size=textureSize(outline_geometry_guide,0);
-    return texelFetch(outline_geometry_guide,clamp(ivec2(uv*vec2(size)),ivec2(0),size-1),0);
+    uvec4 geometry=texelFetch(outline_geometry_guide,clamp(ivec2(uv*vec2(size)),ivec2(0),size-1),0);
+    return vec4(pica_geometry_decode_normal(geometry.r),uintBitsToFloat(geometry.a));
 }
 float oot3d_outline_sample_occlusion(vec2 uv) {
     ivec2 size=textureSize(transparent_depth_guide,0);
@@ -167,11 +177,11 @@ float oot3d_outline_sample_occlusion(vec2 uv) {
 
 vec4 oot3d_compose_at(vec2 uv) {
     vec4 color = texture(physical_scanout, uv);
-    if (scanout.cacao != 0u) {
-        float cacao_value = texture(cacao_visibility, uv).r;
+    if (scanout.ambient_occlusion != 0u) {
+        float ao_value = texture(ao_visibility, uv).r;
         float scene_coverage = texture(ambient_guide, uv).a;
         color.rgb *= oot3d_scene_ambient_occlusion_visibility(
-            cacao_value, scene_coverage);
+            ao_value, scene_coverage);
     }
     if (scanout.reflections != 0u) {
         vec4 reflection = texture(filtered_reflection, uv);
@@ -204,9 +214,9 @@ vec4 oot3d_compose_at(vec2 uv) {
     source += R"glsl(
 
 void main() {
-    vec2 source_uv = vec2(1.0 - output_uv.y, output_uv.x);
-    if (scanout.flip_y != 0u) source_uv.y = 1.0 - source_uv.y;
-    if(oot3d_guide_diagnostic_mode!=0 && (scanout.cacao!=0u || scanout.outline!=0u)) {
+    vec2 source_uv = OOT3D_SCANOUT_SOURCE_UV;
+    if (OOT3D_SCANOUT_FLIP_Y) source_uv.y = 1.0 - source_uv.y;
+    if(oot3d_guide_diagnostic_mode!=0 && (scanout.ambient_occlusion!=0u || scanout.outline!=0u)) {
         output_color=vec4(oot3d_guide_diagnostic(source_uv),1.0);
         return;
     }
@@ -219,7 +229,7 @@ void main() {
 )glsl";
     if (separateSampler) {
         static constexpr std::array<const char*, 11> names{ "physical_scanout",
-                                                            "cacao_visibility",
+                                                            "ao_visibility",
                                                             "scene_depth",
                                                             "normal_guide",
                                                             "hiz_depth",
@@ -230,14 +240,19 @@ void main() {
                                                             "fog_guide",
                                                             "outline_geometry_guide" };
         for (const char* name : names) {
+            // The geometry guide is an unsigned-integer texture, fetched
+            // without the (linear) scanout sampler.
+            const bool integer = std::string_view(name) == "outline_geometry_guide";
+            const std::string kind = integer ? "u" : "";
             const std::string combined =
-                "uniform sampler2D " + std::string(name) + ";";
+                "uniform " + kind + "sampler2D " + std::string(name) + ";";
             const std::string texture =
-                "uniform texture2D " + std::string(name) + ";";
+                "uniform " + kind + "texture2D " + std::string(name) + ";";
             source.replace(source.find(combined), combined.size(), texture);
+            if (integer) continue;
             for (const std::string operation : {"texture", "textureSize", "texelFetch"}) {
                 const std::string sample = operation + "(" + name + ",";
-                const std::string separate = operation + "(sampler2D(" + name + ", scanout_sampler),";
+                const std::string separate = operation + "(" + kind + "sampler2D(" + name + ", scanout_sampler),";
                 size_t offset = 0;
                 while ((offset = source.find(sample, offset)) != std::string::npos) {
                     source.replace(offset, sample.size(), separate);
@@ -249,7 +264,22 @@ void main() {
             source.find("layout(push_constant)");
         source.insert(declarationEnd, "layout(set = 0, binding = 11) uniform sampler "
                                       "scanout_sampler;\n");
+        static constexpr std::string_view kVersion = "#version 450\n";
+        source.insert(source.find(kVersion) + kVersion.size(),
+                      "#extension GL_EXT_samplerless_texture_functions : require\n");
     }
+    // The source pixel domain is declared by the caller and baked here; an
+    // unreplaced marker fails shader compilation instead of sampling wrongly.
+    static constexpr std::string_view kSourceUvMarker =
+        "OOT3D_SCANOUT_SOURCE_UV";
+    const bool physical =
+        orientation == PicaScanoutOrientation::PhysicalScreen;
+    source.replace(
+        source.find(kSourceUvMarker), kSourceUvMarker.size(),
+        physical ? "vec2(1.0 - output_uv.y, output_uv.x)" : "output_uv");
+    static constexpr std::string_view kFlipMarker = "OOT3D_SCANOUT_FLIP_Y";
+    source.replace(source.find(kFlipMarker), kFlipMarker.size(),
+                   physical ? "scanout.flip_y != 0u" : "false");
     return source;
 }
 

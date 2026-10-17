@@ -16,9 +16,15 @@
 #include <cstdint>
 #include <array>
 #include <memory>
+#include <filesystem>
 #include <string>
 
+namespace Fast {
+class Oot3dVulkanGpuProfiler;
+}
 namespace Fast::Oot3d {
+
+struct NriDirectionalShadowHistorySnapshot;
 
 class InteractiveGrassPass final {
   public:
@@ -33,23 +39,22 @@ class InteractiveGrassPass final {
                     VkRenderPass instrumentedRenderPass,
                     VkSampleCountFlagBits sampleCount = VK_SAMPLE_COUNT_1_BIT,
                     bool dynamicRendering = false,
-                    VkFormat depthFormat = VK_FORMAT_UNDEFINED);
-    bool Prepare(VkCommandBuffer commandBuffer, uint32_t width,
-                 uint32_t height,
-                 const ::Fast::Renderer3ds::PicaPerspectiveCameraState& view,
-                 const InteractiveGrassSettings& settings,
-                 const ToonSurfaceParameters& toon,
-                 ::Fast::Renderer3ds::PicaResolvedDrawStreamView scene,
-                 uint64_t frameId, uint64_t renderTargetNamespace,
-                 uint32_t framebufferColorPhysicalAddress,
-                 uint32_t frameSlot,
-                 const EffectGeometryProviderPlan& providerPlan,
-                 const std::array<float, 2>& jitterPixels = {},
-                 bool temporalJitter = false);
+                    VkFormat depthFormat = VK_FORMAT_UNDEFINED,
+                    // The device's persisted pipeline cache (optional).
+                    VkPipelineCache pipelineCache = VK_NULL_HANDLE);
+    bool Prepare(VkCommandBuffer commandBuffer, uint32_t width, uint32_t height,
+                 const ::Fast::Renderer3ds::PicaPerspectiveCameraState& view, const InteractiveGrassSettings& settings,
+                 const ToonSurfaceParameters& toon, ::Fast::Renderer3ds::PicaResolvedDrawStreamView scene,
+                 uint64_t frameId, uint64_t renderTargetNamespace, uint32_t framebufferColorPhysicalAddress,
+                 uint32_t frameSlot, const EffectGeometryProviderPlan& providerPlan,
+                 const NriDirectionalShadowHistorySnapshot& shadowHistory,
+                 const std::array<float, 2>& jitterPixels = {}, bool temporalJitter = false,
+                 bool temporalMotion = false, Fast::Oot3dVulkanGpuProfiler* profiler = nullptr);
     bool DrawPrepared(VkCommandBuffer commandBuffer, uint32_t width,
                       uint32_t height,
                       const EffectGeometryProviderPlan& providerPlan,
                       const PicaAttachmentRequirements& attachments);
+    void SetCacheDirectory(std::filesystem::path directory);
     void ResetTemporalState();
     void Shutdown();
 

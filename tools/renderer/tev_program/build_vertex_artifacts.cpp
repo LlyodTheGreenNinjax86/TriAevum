@@ -1,39 +1,59 @@
 // Developer-only title build from original SHBIN output tables. No capture input.
 #include "oot3d_native_pica_shader_gen.h"
 #include "oot3d_native_vertex_binaries.h"
+#include "fast/oot3d/pica_directional_shadow_caster.h"
 #include "fast/oot3d/pica_rigid_motion.h"
+#include "fast/renderer/pass_shader_artifact.h"
+#include "fast/renderer3ds/pica_surface_lighting_shader.h"
+#include "spirv_pack_file.h"
 #include <shaderc/shaderc.hpp>
 #include <algorithm>
 #include <fstream>
 #include <iostream>
 #include <iterator>
 #include <memory>
-#include <sstream>
 #include <vector>
 
 using namespace Oot3dNativeGame;
 static void Check(bool ok, const std::string& message) { if (!ok) throw std::runtime_error(message); }
 
 int main(int argc, char** argv) try {
-    Check(argc >= 3, "usage: build_vertex_artifacts output.h|--check input.shbin [...]");
+    Check(argc >= 3, "usage: build_vertex_artifacts oot3d_native_vertex.spvpack|--check input.shbin [...]");
     const bool check = std::string_view(argv[1]) == "--check";
-    std::ostringstream output, table;
-    output << "// Generated translated OOT3D title vertex SPIR-V. Not title-neutral code.\n"
-              "// Source: original SHBIN interfaces + maintained GLSL wrapper and translated body.\n"
-              "// Citra/Azahar translator donor: GPL-2.0-or-later; preserve donor notices.\n"
-              "#pragma once\n#include \"fast/renderer3ds/pica_vertex_artifact.h\"\n"
-              "namespace Oot3dNativeGame {\n";
+    // Vertex programs first, then the pass programs, each in emission order.
+    SpirvPackFile vertexPack, passPack;
     shaderc::Compiler compiler;
     shaderc::CompileOptions options;
     options.SetTargetEnvironment(shaderc_target_env_vulkan, shaderc_env_version_vulkan_1_1);
     options.SetOptimizationLevel(shaderc_optimization_level_performance);
-    unsigned modules = 0;
+    unsigned modules = 0, passModules = 0;
+    // Pass programs derived from the title's vertex programs (shadow casters,
+    // surface lighting): the pass compiler's Vulkan 1.2 target.
+    const auto emitPass = [&](const std::string& source) {
+        shaderc::CompileOptions passOptions;
+        passOptions.SetTargetEnvironment(shaderc_target_env_vulkan, shaderc_env_version_vulkan_1_2);
+        passOptions.SetOptimizationLevel(shaderc_optimization_level_performance);
+        const auto spirv = compiler.CompileGlslToSpv(source, shaderc_vertex_shader, "title_pass", passOptions);
+        Check(spirv.GetCompilationStatus() == shaderc_compilation_status_success, spirv.GetErrorMessage());
+        if (check) {
+            const auto stored = Fast::Renderer::FindPassShaderArtifact(
+                TitlePassArtifacts(), source, Fast::Renderer::SpirvStage::Vertex, {});
+            Check(stored.size() == size_t(spirv.cend() - spirv.cbegin()) &&
+                      std::equal(stored.begin(), stored.end(), spirv.cbegin()),
+                  "missing/stale title pass program");
+        }
+        auto& entry = passPack.Add(Fast::Renderer::SpirvPackKind::Pass, {spirv.cbegin(), spirv.cend()});
+        entry.Stage = uint32_t(Fast::Renderer::SpirvStage::Vertex);
+        entry.VulkanMinor = 2;
+        entry.Source = passPack.Keep(source);
+        ++passModules;
+    };
     const auto emitVertex = [&](const std::string& source) {
         const auto spirv = compiler.CompileGlslToSpv(source, shaderc_vertex_shader, "native_vertex", options);
         Check(spirv.GetCompilationStatus() == shaderc_compilation_status_success, spirv.GetErrorMessage());
         const auto id = Fast::Renderer3ds::IdentifyPicaShaderSource(source);
         if (check) {
-            const auto artifact = Fast::Renderer3ds::FindPicaVertexArtifact(kTitleVertexArtifacts, source);
+            const auto artifact = Fast::Renderer3ds::FindPicaVertexArtifact(TitleVertexArtifacts(), source);
             Check(!artifact.Spirv.empty(), "missing/stale compiled vertex source identity");
             // Validate the stored module independently of compiler version and layout.
             bool vertexEntry = false;
@@ -49,15 +69,8 @@ int main(int argc, char** argv) try {
             }
             Check(vertexEntry, "compiled artifact has no vertex entry point");
         }
-        output << "inline constexpr uint32_t kTitleVertexSpirv" << modules << "[] = {\n";
-        unsigned column=0;
-        for (uint32_t w : spirv) {
-            output << "0x" << std::hex << w << "U,";
-            if (++column%12 == 0) output << '\n';
-        }
-        output << std::dec << "\n};\n";
-        table << "{{" << id.Id << "ULL," << id.SecondaryHash << "ULL," << id.Size
-              << "ULL},kTitleVertexSpirv" << modules << "},\n";
+        vertexPack.Add(Fast::Renderer::SpirvPackKind::PicaVertex, {spirv.cbegin(), spirv.cend()}).Identity =
+            {id.Id, id.SecondaryHash, id.Size};
         std::cout << "vertex_source=" << id.Id << '\n';
         ++modules;
     };
@@ -127,20 +140,44 @@ int main(int argc, char** argv) try {
             Check(translated.Source == reference.Source, "offline/native vertex source mismatch");
             emitVertex(translated.Source);
             const auto& temporalProgram = *translated.TemporalProgram;
-            const auto temporal = Fast::Oot3d::BuildPicaTemporalVertexInstrumentation(
-                translated.Source, translated.StateKey,
-                {temporalProgram.Hooks, temporalProgram.PreviousRegisterState, temporalProgram.PreviousMainBody});
+            const ::Oot3d::Renderer::PicaTemporalVertexProgramView view{
+                temporalProgram.Hooks, temporalProgram.PreviousRegisterState, temporalProgram.PreviousMainBody};
+            const auto temporal = Fast::Oot3d::BuildPicaVertexInstrumentation(
+                translated.Source, translated.StateKey, view, true, false);
             Check(temporal.Applied && temporal.UsedProvidedProgram, "typed temporal vertex emission failed");
             emitVertex(temporal.Source);
+            // Per-pixel lighting and typed normal guides read the authored
+            // surface normal and tint: the always-available programs pair
+            // with these exactly as draws request them.
+            for (bool temporalOutputs : {false, true}) {
+                const auto surface = Fast::Oot3d::BuildPicaVertexInstrumentation(
+                    translated.Source, translated.StateKey, view, temporalOutputs, true);
+                if (surface.Applied && surface.SurfaceApplied) emitVertex(surface.Source);
+            }
+            // The passes derive from the program and its typed hooks exactly
+            // as they do at draw time; a program a pass rejects at draw time
+            // (no caster or lighting contract) has none.
+            const auto directional = Fast::Oot3d::BuildPicaDirectionalShadowCasterShader(
+                translated.Source, translated.StateKey, temporalProgram.Hooks);
+            if (directional.Applied()) emitPass(directional.Source);
+            const auto point = Fast::Oot3d::BuildPicaPointShadowCasterShader(
+                translated.Source, translated.StateKey, temporalProgram.Hooks);
+            if (point.Applied()) emitPass(point.Source);
+            for (bool surfaceLighting : {false, true}) {
+                const auto lighting = Fast::Renderer3ds::BuildPicaSurfaceLightingVertexShader(
+                    translated.Source, temporalProgram.Hooks, surfaceLighting);
+                if (!lighting.empty()) emitPass(lighting);
+            }
+            std::cout << "title_pass_derivations directional=" << directional.Applied()
+                      << " point=" << point.Applied() << '\n';
         }
     }
-    output << "inline const Fast::Renderer3ds::PicaVertexArtifact kTitleVertexArtifacts[] = {\n"
-           << table.str() << "};\n} // namespace Oot3dNativeGame\n";
     if (check) {
-        Check(modules == std::size(kTitleVertexArtifacts), "compiled vertex family coverage changed");
+        Check(modules == TitleVertexArtifacts().size(), "compiled vertex family coverage changed");
+        Check(passModules == TitlePassArtifacts().size(), "title pass program coverage changed");
     } else {
-        std::ofstream file(argv[1],std::ios::binary|std::ios::trunc);
-        Check(bool(file) && bool(file << output.str()), "cannot write vertex artifacts");
+        vertexPack.Entries.insert(vertexPack.Entries.end(), passPack.Entries.begin(), passPack.Entries.end());
+        vertexPack.Write(argv[1]);
     }
-    std::cout << "native_vertex_artifacts=" << modules << '\n';
+    std::cout << "native_vertex_artifacts=" << modules << " title_pass_artifacts=" << passModules << '\n';
 } catch (const std::exception& e) { std::cerr << e.what() << '\n'; return 1; }

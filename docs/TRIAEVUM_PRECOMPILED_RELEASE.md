@@ -12,6 +12,20 @@ not permission to ship driver caches, ROMs, extracted assets, saves or captures.
 Forge prepares device-specific pipelines locally, without asking users to
 select or enable a cache. See [the verified contract](TRIAEVUM_BUNDLED_FORGE_SHADER_CORPUS.md).
 
+2026-10-13 amendment, at the maintainer's request (installation had to fit in
+about five minutes): the release also ships its own **analysis results** for
+the supported revision's rooms, so Forge does not repeat them on every machine.
+These are TriAevum's computations, not game content: per-triangle bits saying
+which triangles may stop casting toward each of 64 interior-sun directions,
+and scene-light placements (position, reach, gain, colour, category, and the
+content hashes and names of the textures they light). They carry no geometry,
+texture, text, audio or code, and each entry is keyed by a hash of one room's
+content, so it applies only where the user's own RomFS has exactly that room.
+Forge still reads every room from the user's RomFS (the interior sun welds the
+geometry from it) and computes locally any room the tables do not cover. Tests
+prove the installed result is byte-identical to local computation. See
+`tools/triaevum_release/precomputed_tables.py`.
+
 ## User contract
 
 Windows packages are portable ZIPs, with application-managed persistent data
@@ -32,6 +46,19 @@ decision and remaining work are in [desktop packaging](TRIAEVUM_DESKTOP_PACKAGIN
   and grass snapshot described in `TRIAEVUM_GRAPHICS_DEFAULTS_AND_GRASS_PERFORMANCE.md`.
   This is not a change to the shared renderer's Authentic preset.
 
+## Offline interior sun
+
+Forge runs the catalogued neutral runtime's `--prebuild-interior-sun` tool mode
+before activation, passing the user's RomFS, the installation renderer cache,
+the release's interior-sun mask table and an output manifest. This never boots
+a title or invokes a compiler/SDK. The room/setup caches hold welded geometry:
+they are local ROM-derived data and must not be included in a release package.
+Only the mask table (fingerprints, triangle counts and mask bits) is shipped.
+Receipts bind RomFS SHA-256, criterion version, runtime identity, mask table
+and output hashes; lazy runtime building handles a missing cache. See
+[Interior sun / offline](ROOM_SHADOW_SHELLS.md) for the command, format, bounds
+and fallback contract.
+
 ## Package boundary
 
 Ship the neutral runtime, explicitly identified translated title logic, Forge,
@@ -49,6 +76,16 @@ while equivalent ExHeader packaging and logical RomFS contents may differ in
 their complete-file identities. Prepared files retain their actual hashes and
 are revalidated against the module-bound family before activation.
 Hash validation is integrity checking, not cryptographic publisher authentication.
+
+Deferred device-owned memory and resource snapshots require the whole-AOT
+descriptor's `MemoryWriteObservationVersion` to equal **3**. Despite the
+historical field name, this covers compiled reads, writes, atomics, escaped
+pointers and native per-page write epochs. Version 3 changes the fast-page
+layout: rebuild every title shard, not just its wrapper or support archive.
+The runtime rejects older or truncated descriptors before title execution:
+publish a matching runtime/title-module pair and its corresponding source.
+Forge must not repair this package mismatch by generating IR or compiling.
+The developer ABI probe exercises an actual compiled read of deferred memory.
 
 The user requested this distribution policy after discussing the Xbox 360 model.
 The project's license does not grant or relicense original-game rights. Existing
@@ -98,6 +135,30 @@ source's `build_generated_cpp_archive` in `whole_aot_object_cache.py`, support
 library CMake target and wrapper/link flags in `whole_aot_plugin_backend.py`.
 The original `build-title` developer path remains the end-to-end rebuild recipe
 from ROM. Byte-identical builds across different toolchains are not promised.
+
+### Profile-guided title builds
+
+A title module may be built with LLVM instrumentation PGO:
+`build-title --profile-data <title.profdata>`. The merged profile is recorded by
+the developer with `tools/renderer/tev_program/collect_aot_profile.py` from
+real checkpoints; users never generate, download or apply it, and Forge's
+install path is unchanged. The profile is a code-generation input: its SHA-256
+joins the object, toolchain and plugin cache identities and is written to
+`whole-aot-plugin.json` as `profile_data_sha256`. Preserve the profile and its
+collection receipt with the title build snapshot and the generated C++, because
+they are needed to rebuild that module. The profile holds only counters for the
+generated title functions, not ROM bytes or assets.
+
+A profiled module is published with its profile: `prepare_release` takes it as
+`--title-profile <title.profdata>`, checks its SHA-256 against
+`profile_data_sha256` and stores it as `title.profdata` in the translated title
+source archive, recorded under `profile` in `TITLE_SOURCE_MANIFEST.json`.
+Promotion fails for a profiled build without its profile, for a different
+profile and for a profile given with an unprofiled build. The release audit
+rejects a profiled title whose translated source lacks that profile or holds
+another one. The collection receipt stays with the private build snapshot (it
+names local checkpoints). Measurements and qualification:
+`TRIAEVUM_AOT_LEVERS_RESULTS.md`.
 
 ## Qualification
 

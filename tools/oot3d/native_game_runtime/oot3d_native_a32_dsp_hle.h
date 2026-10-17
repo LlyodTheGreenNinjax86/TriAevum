@@ -22,7 +22,7 @@ struct NativeA32DspPhysicalRegion {
 struct NativeDspMemoryAccess {
     std::function<bool(uint32_t, std::span<uint8_t>)> Read;
     std::function<bool(uint32_t, std::span<const uint8_t>)> Write;
-    std::function<const uint8_t*(uint32_t)> ResolvePhysical;
+    std::function<const uint8_t*(uint32_t, size_t)> ResolvePhysical;
 };
 
 class NativeA32DspHle {
@@ -48,8 +48,11 @@ class NativeA32DspHle {
     bool RestoreState(const nlohmann::json& state,
                       std::string* error = nullptr);
 
-  private:
+    // The emulated memory's physical-to-virtual map (also used by savestates
+    // to place render targets in VRAM).
     std::span<const NativeA32DspPhysicalRegion> PhysicalRegions() const;
+
+  private:
     struct Impl;
     std::unique_ptr<Impl> mImpl;
 };

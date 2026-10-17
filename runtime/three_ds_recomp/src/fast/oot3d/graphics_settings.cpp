@@ -1,12 +1,74 @@
 #include "fast/oot3d/graphics_settings.h"
+#include "fast/oot3d/graphics_settings_persistence.h"
 #include "fast/oot3d/grass_blade_geometry.h"
 
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <initializer_list>
 #include <limits>
 
 namespace Fast::Oot3d {
+
+const GrassMaskRule* FindGrassMaskRule(const std::vector<GrassMaskRule>& rules, uint64_t hash, uint16_t width,
+                                       uint16_t height) {
+    const auto found = std::find_if(rules.begin(), rules.end(), [&](const auto& rule) {
+        const auto& target = rule.Coverage.Target;
+        return target.Rgba8Hash == hash && target.Width == width && target.Height == height;
+    });
+    return found == rules.end() ? nullptr : &*found;
+}
+
+void NormalizeGrassMaskRule(GrassMaskRule& mask) {
+    const auto finite = [](float x, float fallback, float low, float high) {
+        return std::clamp(std::isfinite(x) ? x : fallback, low, high);
+    };
+    if (mask.Mode > GrassMaskMode::Off)
+        mask.Mode = GrassMaskMode::Automatic;
+    mask.Strength = finite(mask.Strength, 1, 0, 1);
+    auto& rule = mask.Coverage;
+    if (rule.Channel > GrassSampleChannel::Luminance)
+        rule.Channel = GrassSampleChannel::Alpha;
+    if (rule.Wrap > GrassWrapOverride::Mirror)
+        rule.Wrap = GrassWrapOverride::Material;
+    rule.InputBlack = finite(rule.InputBlack, 0, 0, .999F);
+    rule.InputWhite = finite(rule.InputWhite, 1, rule.InputBlack + .001F, 1);
+    rule.OutputBlack = finite(rule.OutputBlack, 0, 0, 1);
+    rule.OutputWhite = finite(rule.OutputWhite, 1, 0, 1);
+    rule.ResponseExponent = finite(rule.ResponseExponent, 1, .05F, 8);
+    rule.SampleScale = 1;
+    rule.SampleOffset = 0;
+    rule.InheritedFrom = 0;
+    if (rule.ActiveRects.size() > kMaximumGrassMaskRects)
+        rule.ActiveRects.resize(kMaximumGrassMaskRects);
+    for (auto& rect : rule.ActiveRects) {
+        float a = finite(rect.MinU, 0, 0, 1), b = finite(rect.MaxU, 0, 0, 1);
+        float c = finite(rect.MinV, 0, 0, 1), d = finite(rect.MaxV, 0, 0, 1);
+        rect = { std::min(a, b), std::min(c, d), std::max(a, b), std::max(c, d) };
+    }
+    std::erase_if(rule.ActiveRects, [](const auto& r) { return r.MinU >= r.MaxU || r.MinV >= r.MaxV; });
+}
+
+GlobalIlluminationSourceMix ResolveGlobalIlluminationSources(const GlobalIlluminationSettings& settings) noexcept {
+    const auto gain = [](float value) { return std::isfinite(value) ? std::max(value, 0.0F) : 0.0F; };
+    const bool sky = settings.Mode != GlobalIlluminationMode::ScreenSpace;
+    const std::array<float, 4> gains{gain(settings.SceneLight), gain(settings.KeyLight),
+                                     gain(settings.DynamicLights), sky ? gain(settings.SkyLight) : 0.0F};
+    GlobalIlluminationSourceMix mix;
+    mix.Gain = std::max({gains[0], gains[1], gains[2], gains[3]});
+    if (mix.Gain > 0.0F)
+        for (size_t source = 0; source < gains.size(); ++source) mix.Weights[source] = gains[source] / mix.Gain;
+    return mix;
+}
+
+bool RestartsGlobalIlluminationHistory(const std::array<float, 4>& previous,
+                                       const std::array<float, 4>& next) noexcept {
+    if (previous == next) return false;
+    if (previous == std::array<float, 4>{}) return true;
+    for (size_t source = 0; source < previous.size(); ++source)
+        if (previous[source] > 0.0F && next[source] == 0.0F) return true;
+    return false;
+}
 namespace {
 
 void Correct(std::vector<GraphicsSettingsIssue>& issues, std::string field,
@@ -19,8 +81,7 @@ bool IsMsaaCount(uint8_t samples) {
 }
 
 bool IsDirectionalShadowResolution(uint32_t resolution) {
-    return resolution == 512U || resolution == 1024U ||
-           resolution == 2048U || resolution == 4096U;
+    return resolution == 2048U || resolution == 4096U;
 }
 
 } // namespace
@@ -135,20 +196,21 @@ GraphicsSettings GraphicsSettingsService::Preset(GraphicsPreset preset) {
     GraphicsSettings value;
     value.Preset = preset;
     if (preset == GraphicsPreset::Enhanced) {
+        // A tuned play configuration (EnhancedPresetDocument).
+        value = EnhancedPresetSettings();
+    } else if (preset == GraphicsPreset::Toon) {
+        // The toon look keeps its own base: FXAA, VSM, GTAO and Medium grass.
         value.AntiAliasing = AntiAliasingMode::Fxaa;
         value.FrameRate = FrameRateMode::Interpolated2x;
         value.Effects.DirectionalShadows.Mode =
-            DirectionalShadowMode::SingleCascade;
-        value.Effects.AmbientOcclusion = AmbientOcclusionMode::Cacao;
+            DirectionalShadowMode::VirtualShadowMaps;
+        value.Effects.AmbientOcclusion = AmbientOcclusionMode::Gtao;
         value.Effects.AoQuality = 1;
         ApplyGrassQualityPreset(
             value.Grass, GrassQuality::Medium);
         value.Grass.WindDirectionDegrees = 35.0F;
         value.Grass.WindStrength = 0.35F;
         value.Grass.WindSpeed = 1.2F;
-    } else if (preset == GraphicsPreset::Toon) {
-        value = Preset(GraphicsPreset::Enhanced);
-        value.Preset = GraphicsPreset::Toon;
         value.Effects.Toon = ToonMode::PostProcessPreview;
     } else if (preset == GraphicsPreset::Custom) {
         value.Preset = GraphicsPreset::Custom;
@@ -163,9 +225,12 @@ GraphicsSettings GraphicsSettingsService::PresetForCurrent(
         value.Preset = preset;
         return value;
     }
-    auto value = Preset(preset);
+    return KeepHostOwnedSettings(Preset(preset), current);
+}
 
-    // Presets select rendering behavior. Host presentation, camera preference
+GraphicsSettings GraphicsSettingsService::KeepHostOwnedSettings(
+    GraphicsSettings value, const GraphicsSettings& current) {
+    // Presets select rendering behavior, motion and camera. Host presentation
     // and content identities are independent user-owned state.
     value.Window = current.Window;
     value.DisplayIndex = current.DisplayIndex;
@@ -173,9 +238,9 @@ GraphicsSettings GraphicsSettingsService::PresetForCurrent(
     value.OutputHeight = current.OutputHeight;
     value.RefreshRate = current.RefreshRate;
     value.VSync = current.VSync;
-    value.FovMultiplier = current.FovMultiplier;
     value.TexturePacks = current.TexturePacks;
     value.Grass.Rules = current.Grass.Rules;
+    value.Grass.Masks = current.Grass.Masks;
     value.GrassSavedPreset = current.GrassSavedPreset;
     value.Effects.ReflectionMaterials =
         current.Effects.ReflectionMaterials;
@@ -198,38 +263,68 @@ GraphicsSettingsValidation GraphicsSettingsService::Validate(
     value.TaaSharpness = std::clamp(value.TaaSharpness, 0.0F, 1.0F);
     value.UpscalerSharpness =
         std::clamp(value.UpscalerSharpness, 0.0F, 1.0F);
+    if (value.UpscalerDlssModel > DlssModel::Cnn)
+        value.UpscalerDlssModel = DlssModel::Default;
+    // The selectable models are Native (native shading, PBR only on supported
+    // pack materials) and Modern (per-pixel + PBR). Per-pixel without PBR is
+    // Modern without a pack; plain native shading remains the capability
+    // fallback, the Authentic preset and the F2 override.
+    if (value.Effects.SurfaceLighting == SurfaceLightingMode::PerPixel)
+        value.Effects.SurfaceLighting = SurfaceLightingMode::PerPixelPbr;
+    if (value.Effects.SurfaceLighting == SurfaceLightingMode::Native &&
+        capabilities.Has(GraphicsCapability::NativeSurfaceLighting))
+        value.Effects.SurfaceLighting = SurfaceLightingMode::NativePbr;
+    if (value.Effects.SurfaceLighting != SurfaceLightingMode::Native &&
+        !capabilities.Has(GraphicsCapability::NativeSurfaceLighting)) {
+        value.Effects.SurfaceLighting = SurfaceLightingMode::Native;
+        Correct(result.Issues, "Graphics.Effects.SurfaceLighting",
+                capabilities.Get(GraphicsCapability::NativeSurfaceLighting).Reason);
+    }
     value.Effects.AoQuality = std::min<uint8_t>(value.Effects.AoQuality, 1U);
     value.Effects.AoRadius = std::clamp(value.Effects.AoRadius, 0.05F, 100.0F);
+    value.Effects.AoDetailRadius = std::isfinite(value.Effects.AoDetailRadius)
+        ? std::clamp(value.Effects.AoDetailRadius, 0.01F, value.Effects.AoRadius)
+        : std::min(0.25F, value.Effects.AoRadius);
     value.Effects.AoStrength = std::clamp(value.Effects.AoStrength, 0.0F, 10.0F);
     value.Effects.AoShadowPower =
         std::clamp(value.Effects.AoShadowPower, 0.1F, 10.0F);
     value.Effects.AoShadowClamp =
         std::clamp(value.Effects.AoShadowClamp, 0.0F, 1.0F);
-    value.Effects.AoHorizonAngleThreshold =
-        std::clamp(value.Effects.AoHorizonAngleThreshold, 0.0F, 1.0F);
+    value.Effects.AoHorizonAngleThreshold = std::isfinite(value.Effects.AoHorizonAngleThreshold)
+        ? std::clamp(value.Effects.AoHorizonAngleThreshold, 0.0F, 0.2F) : 0.06F;
+    value.Effects.AoBlurPassCount = std::min(value.Effects.AoBlurPassCount, 8U);
     value.Effects.AoFadeOutFrom =
         std::clamp(value.Effects.AoFadeOutFrom, 0.0F, 100000.0F);
     value.Effects.AoFadeOutTo =
         std::clamp(value.Effects.AoFadeOutTo,
                    value.Effects.AoFadeOutFrom + 0.01F, 100000.0F);
-    value.Effects.AoBlurPassCount =
-        std::min<uint8_t>(value.Effects.AoBlurPassCount, 8U);
     value.Effects.AoSharpness =
         std::clamp(value.Effects.AoSharpness, 0.0F, 1.0F);
     value.Effects.AoDetailStrength =
         std::clamp(value.Effects.AoDetailStrength, 0.0F, 10.0F);
+    if (value.Effects.MxaoMethod > MxaoEstimator::VisibilityBitmaskSolidAngle)
+        value.Effects.MxaoMethod = MxaoEstimator::VisibilityBitmask;
+    value.Effects.MxaoQuality = std::min<uint8_t>(value.Effects.MxaoQuality, 6U);
+    value.Effects.MxaoFilter = std::min<uint8_t>(value.Effects.MxaoFilter, 2U);
+    if (value.Effects.MxaoNormals > MxaoNormalSource::Geometry)
+        value.Effects.MxaoNormals = MxaoNormalSource::Geometry;
+    value.Effects.MxaoShadingRate = std::min<uint8_t>(value.Effects.MxaoShadingRate, 2U);
+    value.Effects.MxaoScreenRadius = std::isfinite(value.Effects.MxaoScreenRadius)
+        ? std::clamp(value.Effects.MxaoScreenRadius, 0.5F, 10.0F) : 2.5F;
+    value.Effects.MxaoFadeDistance = std::isfinite(value.Effects.MxaoFadeDistance)
+        ? std::clamp(value.Effects.MxaoFadeDistance, 0.0F, 1.0F) : 0.25F;
+    if (value.Effects.MxaoDebug > MxaoDebugView::FaceDisagreement)
+        value.Effects.MxaoDebug = MxaoDebugView::Off;
+    if (value.Effects.AoRelief > AoTextureRelief::Strong)
+        value.Effects.AoRelief = AoTextureRelief::Off;
     auto& directionalShadows = value.Effects.DirectionalShadows;
     if (!IsDirectionalShadowResolution(directionalShadows.Resolution)) {
-        directionalShadows.Resolution = 1024U;
+        directionalShadows.Resolution = 2048U;
     }
     directionalShadows.MaximumDistance =
         std::isfinite(directionalShadows.MaximumDistance)
-            ? std::clamp(directionalShadows.MaximumDistance, 50.0F, 20000.0F)
-            : 2400.0F;
-    directionalShadows.DepthPadding =
-        std::isfinite(directionalShadows.DepthPadding)
-            ? std::clamp(directionalShadows.DepthPadding, 0.0F, 5000.0F)
-            : 300.0F;
+            ? std::clamp(directionalShadows.MaximumDistance, 50.0F, 65536.0F)
+            : 65536.0F;
     directionalShadows.DepthBiasConstant =
         std::isfinite(directionalShadows.DepthBiasConstant)
             ? std::clamp(directionalShadows.DepthBiasConstant, 0.0F, 16.0F)
@@ -240,10 +335,24 @@ GraphicsSettingsValidation GraphicsSettingsService::Validate(
             : 1.75F;
     directionalShadows.Strength =
         std::isfinite(directionalShadows.Strength)
-            ? std::clamp(directionalShadows.Strength, 0.0F, 1.0F)
+            ? std::clamp(directionalShadows.Strength, 0.0F, 4.0F)
             : 0.80F;
+    directionalShadows.NormalBias =
+        std::isfinite(directionalShadows.NormalBias)
+            ? std::clamp(directionalShadows.NormalBias, 0.0F, 10.0F)
+            : DirectionalShadowSettings{}.NormalBias;
+    {
+        // Godot's ranges: thickness > 0, opacity 0..1, blur 0..10.
+        auto& contact = directionalShadows.ContactShadows;
+        const ContactShadowSettings defaults;
+        contact.Length = std::min<uint8_t>(contact.Length, 2U);
+        contact.SurfaceThickness = std::isfinite(contact.SurfaceThickness)
+            ? std::clamp(contact.SurfaceThickness, 0.001F, 0.1F) : defaults.SurfaceThickness;
+        contact.Opacity = std::isfinite(contact.Opacity) ? std::clamp(contact.Opacity, 0.0F, 1.0F) : defaults.Opacity;
+        contact.Blur = std::isfinite(contact.Blur) ? std::clamp(contact.Blur, 0.0F, 10.0F) : defaults.Blur;
+    }
     if (directionalShadows.Mode ==
-            DirectionalShadowMode::SingleCascade &&
+            DirectionalShadowMode::VirtualShadowMaps &&
         !capabilities.Has(GraphicsCapability::NriDirectionalShadows)) {
         directionalShadows.Mode = DirectionalShadowMode::Off;
         Correct(result.Issues,
@@ -253,6 +362,96 @@ GraphicsSettingsValidation GraphicsSettingsService::Validate(
     }
     directionalShadows.PcfRadius =
         std::min<uint8_t>(directionalShadows.PcfRadius, 2U);
+    auto& pointShadows = value.Effects.PointShadows;
+    if (!IsPointShadowResolution(pointShadows.Resolution)) {
+        pointShadows.Resolution = PointShadowSettings{}.Resolution;
+    }
+    pointShadows.MaxLights = std::clamp<uint8_t>(pointShadows.MaxLights, 1U, 8U);
+    pointShadows.Range = std::isfinite(pointShadows.Range)
+        ? std::clamp(pointShadows.Range, 0.25F, 1.0F) : 1.0F;
+    pointShadows.Strength = std::isfinite(pointShadows.Strength)
+        ? std::clamp(pointShadows.Strength, 0.0F, 1.0F) : 1.0F;
+    // The cube maps share the directional map's NRI shadow pass.
+    if (pointShadows.Mode == PointShadowMode::CubeMaps &&
+        !capabilities.Has(GraphicsCapability::NriDirectionalShadows)) {
+        pointShadows.Mode = PointShadowMode::Off;
+        Correct(result.Issues, "Graphics.Effects.PointShadows.Mode",
+                capabilities.Get(GraphicsCapability::NriDirectionalShadows).Reason);
+    }
+    auto& globalIllumination = value.Effects.GlobalIllumination;
+    globalIllumination.DiffuseIntensity =
+        std::isfinite(globalIllumination.DiffuseIntensity)
+            ? std::clamp(globalIllumination.DiffuseIntensity, 0.0F, 8.0F)
+            : 1.0F;
+    globalIllumination.SpecularIntensity =
+        std::isfinite(globalIllumination.SpecularIntensity)
+            ? std::clamp(globalIllumination.SpecularIntensity, 0.0F, 2.0F)
+            : 1.0F;
+    const auto clampOr = [](float value, float low, float high, float fallback) {
+        return std::isfinite(value) ? std::clamp(value, low, high) : fallback;
+    };
+    globalIllumination.SceneLight = clampOr(globalIllumination.SceneLight, 0.0F, 4.0F, 1.0F);
+    globalIllumination.KeyLight = clampOr(globalIllumination.KeyLight, 0.0F, 4.0F, 1.0F);
+    globalIllumination.DynamicLights = clampOr(globalIllumination.DynamicLights, 0.0F, 4.0F, 1.0F);
+    globalIllumination.SkyLight = clampOr(globalIllumination.SkyLight, 0.0F, 4.0F, 0.25F);
+    if (globalIllumination.Resolution > GlobalIlluminationResolution::Quarter)
+        globalIllumination.Resolution = GlobalIlluminationResolution::Half;
+    if (globalIllumination.Mode == GlobalIlluminationMode::BrixelizerGi &&
+        (!capabilities.Has(GraphicsCapability::NriInterop) ||
+         !capabilities.Has(GraphicsCapability::SampledDepth) ||
+         !capabilities.Has(GraphicsCapability::NormalGuide) ||
+         !capabilities.Has(GraphicsCapability::MaterialGuide) ||
+         !capabilities.Has(GraphicsCapability::MotionVectors) ||
+         !capabilities.Has(GraphicsCapability::ValidViewMetadata))) {
+        globalIllumination.Mode = GlobalIlluminationMode::Off;
+        Correct(result.Issues, "Graphics.Effects.GlobalIllumination.Mode",
+                "Global illumination requires NRI, sampled depth, normal/material guides, "
+                "motion vectors and view metadata");
+    } else if (globalIllumination.Mode == GlobalIlluminationMode::BrixelizerGi &&
+               !capabilities.Has(GraphicsCapability::BrixelizerGlobalIllumination)) {
+        globalIllumination.Mode = GlobalIlluminationMode::Off;
+        Correct(result.Issues, "Graphics.Effects.GlobalIllumination.Mode",
+                capabilities.Get(GraphicsCapability::BrixelizerGlobalIllumination).Reason);
+    }
+    // Screen-space GI: transport and quality on the pass's supported grid.
+    auto& screenSpace = globalIllumination.ScreenSpace;
+    const auto nearestOf = [](uint32_t value, std::initializer_list<uint32_t> allowed) {
+        uint32_t best = *allowed.begin();
+        for (const uint32_t candidate : allowed)
+            if ((candidate > value ? candidate - value : value - candidate) <
+                (best > value ? best - value : value - best))
+                best = candidate;
+        return best;
+    };
+    screenSpace.Sections = std::clamp<uint8_t>(screenSpace.Sections, 1U, 4U);
+    screenSpace.RadialCandidates = static_cast<uint16_t>(nearestOf(screenSpace.RadialCandidates, {8U, 16U, 20U, 24U, 32U}));
+    screenSpace.Sectors = static_cast<uint16_t>(nearestOf(screenSpace.Sectors, {32U, 64U, 128U}));
+    screenSpace.Radius = clampOr(screenSpace.Radius, 10.0F, 1000.0F, ScreenSpaceGiSettings{}.Radius);
+    screenSpace.Thickness = clampOr(screenSpace.Thickness, 1.0F, 200.0F, ScreenSpaceGiSettings{}.Thickness);
+    screenSpace.FilterLevels = std::min<uint8_t>(screenSpace.FilterLevels, 4U);
+    if (screenSpace.WorkScale > GlobalIlluminationResolution::Quarter)
+        screenSpace.WorkScale = ScreenSpaceGiSettings{}.WorkScale;
+    // 0 is off; otherwise the largest J per channel.
+    screenSpace.HighlightClamp = !std::isfinite(screenSpace.HighlightClamp) || screenSpace.HighlightClamp <= 0.0F
+        ? 0.0F
+        : std::clamp(screenSpace.HighlightClamp, 0.05F, 16.0F);
+    if (globalIllumination.Mode > GlobalIlluminationMode::ScreenSpace) {
+        globalIllumination.Mode = GlobalIlluminationMode::Off;
+        Correct(result.Issues, "Graphics.Effects.GlobalIllumination.Mode", "unknown global illumination mode");
+    } else if (globalIllumination.Mode == GlobalIlluminationMode::ScreenSpace &&
+               (!capabilities.Has(GraphicsCapability::NriInterop) ||
+                !capabilities.Has(GraphicsCapability::SampledDepth) ||
+                !capabilities.Has(GraphicsCapability::MotionVectors) ||
+                !capabilities.Has(GraphicsCapability::ValidViewMetadata))) {
+        globalIllumination.Mode = GlobalIlluminationMode::Off;
+        Correct(result.Issues, "Graphics.Effects.GlobalIllumination.Mode",
+                "Screen-space global illumination requires NRI, sampled depth, motion vectors and view metadata");
+    } else if (globalIllumination.Mode == GlobalIlluminationMode::ScreenSpace &&
+               !capabilities.Has(GraphicsCapability::ScreenSpaceGlobalIllumination)) {
+        globalIllumination.Mode = GlobalIlluminationMode::Off;
+        Correct(result.Issues, "Graphics.Effects.GlobalIllumination.Mode",
+                capabilities.Get(GraphicsCapability::ScreenSpaceGlobalIllumination).Reason);
+    }
     value.Effects.ReflectionStrength =
         std::clamp(value.Effects.ReflectionStrength, 0.0F, 2.0F);
     value.Effects.ReflectionMaxDistance =
@@ -521,10 +720,26 @@ GraphicsSettingsValidation GraphicsSettingsService::Validate(
     grassGeneration.BladeWidthMin =
         std::clamp(
             grassGeneration.BladeWidthMin, 0.01F, 500.0F);
-    grassGeneration.BladeWidthMax =
-        std::clamp(
-            grassGeneration.BladeWidthMax,
-            grassGeneration.BladeWidthMin, 500.0F);
+    grassGeneration.BladeWidthMax = std::clamp(grassGeneration.BladeWidthMax, grassGeneration.BladeWidthMin, 500.0F);
+    if (value.Grass.Masks.size() > 256U) {
+        value.Grass.Masks.resize(256U);
+        Correct(result.Issues, "Graphics.Grass.Masks", "mask rules truncated to 256 entries");
+    }
+    std::vector<GrassTextureSelector> maskTargets;
+    std::erase_if(value.Grass.Masks, [&](auto& mask) {
+        NormalizeGrassMaskRule(mask);
+        const auto& target = mask.Coverage.Target;
+        const bool invalid = !target.Rgba8Hash || !target.Width || !target.Height ||
+                             std::any_of(maskTargets.begin(), maskTargets.end(), [&](const auto& previous) {
+                                 return previous.Rgba8Hash == target.Rgba8Hash && previous.Width == target.Width &&
+                                        previous.Height == target.Height;
+                             });
+        if (invalid)
+            Correct(result.Issues, "Graphics.Grass.Masks", "invalid or duplicate mask target removed");
+        else
+            maskTargets.push_back(target);
+        return invalid;
+    });
     if (value.Grass.Rules.size() > 256U) {
         value.Grass.Rules.resize(256U);
         Correct(result.Issues, "Graphics.Grass.Rules",
@@ -578,6 +793,20 @@ GraphicsSettingsValidation GraphicsSettingsService::Validate(
             std::clamp(rule.MaximumSlopeDegrees, 0.0F, 90.0F);
         rule.NormalOffset =
             std::clamp(rule.NormalOffset, -1000.0F, 1000.0F);
+        // Active rectangles inside the mask, ordered corners, no empty ones.
+        if (rule.ActiveRects.size() > kMaximumGrassMaskRects) {
+            rule.ActiveRects.resize(kMaximumGrassMaskRects);
+        }
+        for (auto& rect : rule.ActiveRects) {
+            const auto unit = [](float value) {
+                return std::isfinite(value) ? std::clamp(value, 0.0F, 1.0F) : 0.0F;
+            };
+            rect = {unit(std::min(rect.MinU, rect.MaxU)), unit(std::min(rect.MinV, rect.MaxV)),
+                    unit(std::max(rect.MinU, rect.MaxU)), unit(std::max(rect.MinV, rect.MaxV))};
+        }
+        std::erase_if(rule.ActiveRects, [](const GrassMaskRect& rect) {
+            return !(rect.MaxU > rect.MinU) || !(rect.MaxV > rect.MinV);
+        });
     }
     if (value.AntiAliasing == AntiAliasingMode::Taa &&
         (!capabilities.Has(GraphicsCapability::MotionVectors) ||
@@ -656,13 +885,26 @@ GraphicsSettingsValidation GraphicsSettingsService::Validate(
         Correct(result.Issues, "Graphics.Presentation.VSync",
                 capabilities.Get(GraphicsCapability::PresentTearing).Reason);
     }
-    if (value.Effects.AmbientOcclusion == AmbientOcclusionMode::Cacao &&
+    if (value.Effects.AmbientOcclusion != AmbientOcclusionMode::Off &&
         (!capabilities.Has(GraphicsCapability::NriInterop) ||
          !capabilities.Has(GraphicsCapability::SampledDepth) ||
+         !capabilities.Has(GraphicsCapability::NormalGuide) ||
          !capabilities.Has(GraphicsCapability::ValidViewMetadata))) {
         value.Effects.AmbientOcclusion = AmbientOcclusionMode::Off;
         Correct(result.Issues, "Graphics.Effects.AO.Mode",
-                "CACAO requires NRI, sampled depth and valid view metadata");
+                "AO requires NRI, sampled depth, normals and valid view metadata");
+    }
+    if (value.Effects.AmbientOcclusion == AmbientOcclusionMode::Cacao &&
+        !capabilities.Has(GraphicsCapability::FidelityFxCacao)) {
+        value.Effects.AmbientOcclusion = AmbientOcclusionMode::Off;
+        Correct(result.Issues, "Graphics.Effects.AO.Mode",
+                capabilities.Get(GraphicsCapability::FidelityFxCacao).Reason);
+    }
+    if (value.Effects.AmbientOcclusion == AmbientOcclusionMode::Mxao &&
+        !capabilities.Has(GraphicsCapability::ImmerseMxao)) {
+        value.Effects.AmbientOcclusion = AmbientOcclusionMode::Off;
+        Correct(result.Issues, "Graphics.Effects.AO.Mode",
+                capabilities.Get(GraphicsCapability::ImmerseMxao).Reason);
     }
     if (value.Effects.Reflections != ReflectionMode::Off &&
         (!capabilities.Has(GraphicsCapability::NriInterop) ||
@@ -690,18 +932,19 @@ GraphicsSettingsValidation GraphicsSettingsService::Validate(
     }
     if (value.Preset == GraphicsPreset::Authentic) {
         auto grassRules = std::move(value.Grass.Rules);
-        auto reflectionMaterials =
-            std::move(value.Effects.ReflectionMaterials);
+        auto grassMasks = std::move(value.Grass.Masks);
+        auto reflectionMaterials = std::move(value.Effects.ReflectionMaterials);
         value.InternalResolutionScale = 1.0F;
         value.AntiAliasing = AntiAliasingMode::Off;
         value.MsaaSamples = 1;
         value.FrameRate = FrameRateMode::Original30;
         value.FovMultiplier = 1.0F;
+        value.ExtendedDrawDistance = false;
         value.Grass = {};
         value.Effects = {};
         value.Grass.Rules = std::move(grassRules);
-        value.Effects.ReflectionMaterials =
-            std::move(reflectionMaterials);
+        value.Grass.Masks = std::move(grassMasks);
+        value.Effects.ReflectionMaterials = std::move(reflectionMaterials);
     }
     result.Value = std::move(value);
     return result;

@@ -5,6 +5,7 @@
 #include "fast/oot3d/pica_uniform_layout.h"
 #include "fast/oot3d/title_render_backend.h"
 #include "fast/renderer3ds/pica_shader_hooks.h"
+#include "fast/renderer3ds/pica_room_shadow_selection.h"
 #include "oot3d/renderer/pica_render_backend.h"
 #include "oot3d/renderer/azahar_texture_pack.h"
 
@@ -13,6 +14,7 @@
 #include <array>
 #include <cstring>
 #include <initializer_list>
+#include <limits>
 #include <string>
 #include <type_traits>
 #include <vector>
@@ -227,6 +229,40 @@ Fast::Oot3d::PicaSceneDrawRecordDesc BuildDraw(
     return draw;
 }
 
+TEST(Oot3dPicaSceneFrame, ReportsTheColourTargetsTheFrameSceneDrewInto) {
+    using namespace Fast::Oot3d;
+    std::string shader = "#version 450\nvoid main(){}\n";
+    const std::array<PicaNriPackedVertexBinding, 1> layoutBindings{ {
+        { 0U, 16U, false },
+    } };
+    const std::array<PicaNriPackedVertexAttribute, 1> layoutAttributes{ {
+        { 0U, 0U, 0U, PicaNriVertexScalar::Float, 4U, 0U },
+    } };
+    std::array<PicaSceneVertexBufferBinding, 1> vertexBindings{ {
+        { 0U, 0U, 4096U, 16U },
+    } };
+
+    PicaSceneFrame frame;
+    frame.BeginFrame(1U, 9U);
+    ASSERT_EQ(frame.Record(BuildDraw(shader, layoutBindings, layoutAttributes,
+                                     vertexBindings)),
+              PicaSceneRecordStatus::Recorded);
+    auto uiDraw =
+        BuildDraw(shader, layoutBindings, layoutAttributes, vertexBindings);
+    uiDraw.CompositionDomain = Oot3d::Renderer::PicaCompositionDomain::Ui;
+    uiDraw.RenderTarget.ColorPhysicalAddress = 0x18300000U;
+    ASSERT_EQ(frame.Record(uiDraw), PicaSceneRecordStatus::Recorded);
+
+    // The target the frame's scene drew into is the evidence that separates
+    // full-screen frame content from a placed UI element on another surface.
+    EXPECT_TRUE(frame.HasSceneDrawOnColorTarget(0x18100000U));
+    EXPECT_FALSE(frame.HasSceneDrawOnColorTarget(0x18300000U));
+    EXPECT_FALSE(frame.HasSceneDrawOnColorTarget(0U));
+
+    frame.Reset();
+    EXPECT_FALSE(frame.HasSceneDrawOnColorTarget(0x18100000U));
+}
+
 TEST(Oot3dPicaSceneFrame, RecordsGpuResourcesWithoutGeometryPayloadCopies) {
     using namespace Fast::Oot3d;
     std::string shader = "#version 450\nvoid main(){}\n";
@@ -246,14 +282,31 @@ TEST(Oot3dPicaSceneFrame, RecordsGpuResourcesWithoutGeometryPayloadCopies) {
     const auto temporalSample =
         BuildNativeFrameTemporalSample(x3Policy, NativeFrameTemporalSampleKind::Transition, 40U, 41U, 3U, 1.0F / 3.0F);
     ASSERT_TRUE(frame.SetTemporalSample(temporalSample));
-    EXPECT_EQ(frame.Record(BuildDraw(shader, layoutBindings, layoutAttributes,
-                                     vertexBindings)),
+    auto submitted = BuildDraw(shader, layoutBindings, layoutAttributes, vertexBindings);
+    auto shells = std::make_shared<Fast::Renderer3ds::RoomShadowShellScene>();
+    shells->ScopeIdentity = 123;
+    const std::array<Fast::Renderer3ds::RoomShadowTriangle, 1> triangles{ {
+        { { { { 0, 0, 0 }, { 1, 0, 0 }, { 0, 0, 1 } } } },
+    } };
+    const auto mesh = Fast::Renderer3ds::BuildRoomShadowShell(456, triangles, 32);
+    ASSERT_TRUE(mesh);
+    shells->Rooms.push_back({456, std::make_shared<const Fast::Renderer3ds::RoomShadowShell>(*mesh)});
+    submitted.RoomShadows = shells;
+    submitted.Material.Blend.Enabled = true; // Native opaque ONE/ZERO.
+    EXPECT_EQ(frame.Record(submitted),
               PicaSceneRecordStatus::Recorded);
+    submitted.RoomShadows.reset();
     shader[0] = '!';
     vertexBindings[0].Offset = 128U;
 
     ASSERT_EQ(frame.Draws().size(), 1U);
     const auto& draw = frame.Draws().front();
+    EXPECT_EQ(draw.RoomShadows, shells);
+    EXPECT_EQ(draw.RoomShadows->Rooms.front().Fingerprint, 456U);
+    const std::array<const PicaSceneDrawRecord*, 1> casters{ &draw };
+    const auto selection = Fast::Renderer3ds::SelectPicaRoomShadowScene(casters);
+    EXPECT_EQ(selection.ReplacementScene, shells.get());
+    EXPECT_STREQ(selection.Status, "ready");
     ASSERT_NE(draw.VertexShader, nullptr);
     ASSERT_NE(draw.VertexLayout, nullptr);
     EXPECT_EQ(draw.VertexShader->Source, "#version 450\nvoid main(){}\n");
@@ -419,7 +472,7 @@ TEST(Oot3dPicaSceneFrame, InternsShaderAndLayoutAcrossFrames) {
 }
 
 TEST(Oot3dPicaSceneFrame,
-     DecodesNativeLightOnlyForDynamicPerspectiveShadowCasters) {
+     IncludesRigidAndSkinnedPerspectiveShadowCasters) {
     using namespace Fast::Oot3d;
     constexpr size_t floatOffset = 80U;
     constexpr size_t vec4Bytes = 4U * sizeof(float);
@@ -478,10 +531,17 @@ TEST(Oot3dPicaSceneFrame,
     EXPECT_EQ(frame.Stats().DirectionalShadowCasterCount, 1U);
     EXPECT_EQ(frame.Stats().DirectionalShadowNativeLightCasterCount, 1U);
 
+    const uint32_t rigidLights = enabledLights & ~(1U << 2U);
+    std::memcpy(uniforms.data(), &rigidLights, sizeof(rigidLights));
+    ASSERT_EQ(frame.Record(draw), PicaSceneRecordStatus::Recorded);
+    EXPECT_FALSE(frame.Draws()[1].NativeTransform.CurrentUsesSkeleton);
+    EXPECT_TRUE(frame.DirectionalShadowCaster(1U));
+    EXPECT_EQ(frame.Stats().DirectionalShadowCasterCount, 2U);
+
     draw.PerspectiveProjection = false;
     ASSERT_EQ(frame.Record(draw), PicaSceneRecordStatus::Recorded);
-    EXPECT_FALSE(frame.DirectionalShadowCaster(1U));
-    EXPECT_EQ(frame.Stats().DirectionalShadowCasterCount, 1U);
+    EXPECT_FALSE(frame.DirectionalShadowCaster(2U));
+    EXPECT_EQ(frame.Stats().DirectionalShadowCasterCount, 2U);
 }
 
 TEST(Oot3dPicaSceneFrame, RetainsCanonicalMaterialAndResolvedTextureBindings) {
@@ -594,6 +654,70 @@ TEST(Oot3dPicaSceneFrame, RetainsCanonicalMaterialAndResolvedTextureBindings) {
     EXPECT_EQ(frame.Stats().CanonicalPipelineEntries, 1U);
     EXPECT_EQ(frame.Stats().CanonicalFullRegisterStateEntries, 1U);
     EXPECT_EQ(frame.Stats().ResolvedMaterialStateCount, 1U);
+}
+
+TEST(Oot3dPicaSceneFrame, RetainsFragmentHooksAndTheNativeLightingLut) {
+    using namespace Fast::Oot3d;
+    using Oot3d::Renderer::PicaShaderHook;
+    const std::array<PicaNriPackedVertexBinding, 1> layoutBindings{ {
+        { 0U, 16U, false },
+    } };
+    const std::array<PicaNriPackedVertexAttribute, 1> layoutAttributes{ {
+        { 0U, 0U, 0U, PicaNriVertexScalar::Float, 4U, 0U },
+    } };
+    const std::array<PicaSceneVertexBufferBinding, 1> vertexBindings{ {
+        { 0U, 0U, 4096U, 16U },
+    } };
+    constexpr std::string_view kFragment = "void main() { // TEV\n // DEPTH\n}\n";
+    Oot3d::Renderer::PicaShaderHookLayout hooks;
+    hooks.SchemaVersion = Oot3d::Renderer::kPicaShaderHookSchemaVersion;
+    hooks.SourceSize = kFragment.size();
+    hooks.Outputs = {Oot3d::Renderer::kPicaFragmentOutputContractSchemaVersion, 1U, 0U,
+                     Oot3d::Renderer::PicaFragmentDepthOutput::ExplicitNative, false, false};
+    hooks.Offsets[static_cast<size_t>(PicaShaderHook::GlobalDeclarations)] = 0U;
+    hooks.Offsets[static_cast<size_t>(PicaShaderHook::AfterNativeTev)] = kFragment.find("// TEV");
+    hooks.Offsets[static_cast<size_t>(PicaShaderHook::BeforeDepth)] = kFragment.find(" // DEPTH");
+    hooks.Offsets[static_cast<size_t>(PicaShaderHook::MainEpilogue)] = kFragment.find('}');
+    ASSERT_TRUE(hooks.ValidFor(kFragment));
+
+    PicaSceneFrame frame;
+    frame.BeginFrame(0U, 15U);
+    auto draw = BuildDraw("native vertex", layoutBindings, layoutAttributes, vertexBindings);
+    draw.FragmentShaderSource = kFragment;
+    draw.EffectiveFragmentShaderSource = kFragment;
+    draw.FragmentShaderHooks = hooks;
+    draw.LightingLut = {
+        .NativeImageHandle = 0x4000U,
+        .ImageWidth = 256U,
+        .ImageHeight = 24U,
+        .MipLevels = 1U,
+        .ImageFormat = PicaSceneTextureImageFormat::R32Uint,
+        .Bound = true,
+    };
+    ASSERT_EQ(frame.Record(draw), PicaSceneRecordStatus::Recorded);
+    const auto& recorded = frame.Draws().front();
+    ASSERT_NE(recorded.FragmentShader, nullptr);
+    EXPECT_TRUE(recorded.FragmentShader->FragmentHooksAvailable());
+    EXPECT_EQ(recorded.FragmentShader->FragmentHooks, hooks);
+    EXPECT_FALSE(recorded.FragmentShader->VertexHooksAvailable());
+    EXPECT_TRUE(recorded.LightingLut.Bound);
+    EXPECT_EQ(recorded.LightingLut.NativeImageHandle, 0x4000U);
+
+    // The same program with different published offsets is a conflict, and a
+    // LUT must be a complete integer image.
+    auto conflicting = draw;
+    conflicting.SubmissionId = 18U;
+    ++conflicting.FragmentShaderHooks.Offsets[static_cast<size_t>(PicaShaderHook::BeforeDepth)];
+    EXPECT_EQ(frame.Record(conflicting), PicaSceneRecordStatus::ShaderIdentityConflict);
+    auto missingLut = draw;
+    missingLut.SubmissionId = 19U;
+    missingLut.LightingLut.NativeImageHandle = 0U;
+    EXPECT_EQ(frame.Record(missingLut), PicaSceneRecordStatus::InvalidTextureBinding);
+    auto colourLut = draw;
+    colourLut.SubmissionId = 20U;
+    colourLut.LightingLut.ImageFormat = PicaSceneTextureImageFormat::Rgba8;
+    EXPECT_EQ(frame.Record(colourLut), PicaSceneRecordStatus::InvalidTextureBinding);
+    EXPECT_EQ(frame.Draws().size(), 1U);
 }
 
 TEST(Oot3dPicaSceneFrame,
@@ -716,6 +840,9 @@ TEST(Oot3dPicaSceneFrame,
     draw.FragmentUniformOffset =
         draw.VertexUniformOffset + draw.VertexUniformSize;
     draw.FragmentUniformSize = fragmentUniforms.size();
+    // The frame validates the declared slices against the declared buffer, so
+    // the buffer has to cover both packed blocks.
+    draw.UniformBuffer.Size = draw.FragmentUniformOffset + draw.FragmentUniformSize;
     ASSERT_EQ(frame.Record(draw), PicaSceneRecordStatus::Recorded);
     ASSERT_EQ(frame.Draws().size(), 1U);
     const auto& recorded = frame.Draws().front();
@@ -897,6 +1024,12 @@ TEST(Oot3dPicaSceneFrame, RejectsConflictingShaderIdentityAndInvalidRanges) {
     EXPECT_EQ(frame.Record(draw), PicaSceneRecordStatus::FrameNotActive);
     frame.BeginFrame(0U, 13U);
     ASSERT_EQ(frame.Record(draw), PicaSceneRecordStatus::Recorded);
+    draw.SurfaceLightingUniformOffset = draw.UniformBuffer.Size - 1;
+    draw.SurfaceLightingUniformSize = 2;
+    EXPECT_EQ(frame.Record(draw), PicaSceneRecordStatus::InvalidUniformRange);
+    draw.SurfaceLightingUniformOffset = std::numeric_limits<uint64_t>::max();
+    EXPECT_EQ(frame.Record(draw), PicaSceneRecordStatus::InvalidUniformRange);
+    draw.SurfaceLightingUniformOffset = draw.SurfaceLightingUniformSize = 0;
     draw.VertexShaderSource = "different source with the same key";
     EXPECT_EQ(frame.Record(draw),
               PicaSceneRecordStatus::ShaderIdentityConflict);
@@ -913,7 +1046,7 @@ TEST(Oot3dPicaSceneFrame, RejectsConflictingShaderIdentityAndInvalidRanges) {
         kPicaSceneRenderTargetStateSchemaVersion;
     draw.Material.SchemaVersion = 0U;
     EXPECT_EQ(frame.Record(draw), PicaSceneRecordStatus::InvalidMaterialState);
-    EXPECT_EQ(frame.Stats().RejectedDrawCount, 5U);
+    EXPECT_EQ(frame.Stats().RejectedDrawCount, 7U);
 }
 
 TEST(Oot3dNativeSceneView, ReferencesFrameAndTracksCameraHistory) {
@@ -1229,6 +1362,33 @@ TEST(Oot3dDirectionalShadowSemantics,
     EXPECT_NEAR(selection.WorldDirectionTowardSource[0], 0.0F, 1.0e-5F);
     EXPECT_NEAR(selection.WorldDirectionTowardSource[1], 1.0F, 1.0e-5F);
     EXPECT_NEAR(selection.WorldDirectionTowardSource[2], 0.0F, 1.0e-5F);
+}
+
+TEST(Oot3dDirectionalShadowSemantics, NativeEnvironmentCastsFromStrongestSourceAboveHorizon) {
+    using namespace Fast::Oot3d;
+    // The brighter source lights from below the horizon: it lights, but the
+    // shadow comes from the source above.
+    auto sources = std::make_shared<Fast::Renderer3ds::PicaSceneDirectionalLights>();
+    sources->Count = 2;
+    sources->Lights[0] = {51, {0,1,0}, {1,0,0}};
+    sources->Lights[1] = {52, {0,-1,0}, {0,1,0}};
+    PicaSceneDrawRecord world;
+    world.SceneDirectionals = sources;
+    const std::array<const PicaSceneDrawRecord*, 1> draws{&world};
+    const auto selected = ResolvePicaDirectionalShadowLightSelection(draws);
+    ASSERT_TRUE(selected.Valid());
+    EXPECT_EQ(selected.WorldDirectionTowardSource, (DirectionalShadowVector{0,1,0}));
+    EXPECT_EQ(selected.ShadowStrength, 1.0F);
+    const std::array<PicaSurfaceShadowLight, 2> receiverLights{{
+        {{0,1,0}, 10, true, false},
+        {{0,-1,0}, 11, true, false},
+    }};
+    EXPECT_EQ(ResolvePicaSurfaceDirectionalShadowMask(receiverLights, IdentityDirectionalShadowMatrix(),
+                  selected.WorldDirectionTowardSource), 1U << 10U);
+    // A published decision carries its strength.
+    sources->ShadowCasterIdentity = 51;
+    sources->ShadowStrength = 0.5F;
+    EXPECT_EQ(ResolvePicaDirectionalShadowLightSelection(draws).ShadowStrength, 0.5F);
 }
 
 TEST(Oot3dDirectionalShadowSemantics,

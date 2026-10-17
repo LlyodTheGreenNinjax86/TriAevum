@@ -25,6 +25,12 @@ bool GraphicsSettingsPanel::DrawReflectionSettings(GraphicsSettings& settings, c
         "Reflection provider", settings, capabilities, reflectionModes,
         [](auto& value, auto mode) { value.Effects.Reflections = mode; },
         [](const auto& value) { return value.Effects.Reflections; });
+    if (settings.Effects.Reflections == ReflectionMode::Off) {
+        ImGui::BeginDisabled(!reflectionReady);
+        changed |= ImGui::Checkbox("Water reflections", &settings.Effects.WaterReflections);
+        ImGui::EndDisabled();
+        ImGui::SetItemTooltip("Hi-Z reflections on water only, in the per-pixel lighting models.");
+    }
     if (settings.Effects.Reflections != ReflectionMode::Off) {
         ImGui::BeginDisabled(!reflectionReady);
         changed |= ImGui::SliderFloat("Reflection strength",
@@ -51,7 +57,7 @@ bool GraphicsSettingsPanel::DrawReflectionSettings(GraphicsSettings& settings, c
         changed |= ImGui::SliderFloat("Roughness bias",
             &settings.Effects.ReflectionRoughnessBias, -0.5F, 0.5F, "%.2f");
         const char* const reflectionDebugViews[] = {
-            "Off", "Material reflectivity/class", "Roughness proxy",
+            "Off", "Material reflectivity/weight", "Roughness proxy",
             "Filtered hit color", "Hit confidence"};
         int reflectionDebug = settings.Effects.ReflectionDebugView;
         if (ImGui::Combo("Reflection debug", &reflectionDebug,
@@ -66,8 +72,16 @@ bool GraphicsSettingsPanel::DrawReflectionSettings(GraphicsSettings& settings, c
     if (!reflectionReady) {
         ImGui::TextWrapped("SSR unavailable: depth, normal, material or camera metadata missing.");
     }
+    ImGui::TextWrapped("Which textures reflect, and how, is set in Materials > Reflection materials.");
+    return changed;
+}
 
-    if (ImGui::CollapsingHeader("Reflection material assignments")) {
+bool GraphicsSettingsPanel::DrawReflectionMaterialSettings(GraphicsSettings& settings, const GraphicsCapabilities&) {
+    bool changed = false;
+    ImGui::SeparatorText("Reflection material assignments");
+    if (settings.Effects.Reflections == ReflectionMode::Off)
+        ImGui::TextWrapped("Screen-space reflections are off (Lighting > Reflections); assignments are kept.");
+    {
         std::vector<TextureCatalogTag> textureTags;
         textureTags.reserve(
             settings.Effects.ReflectionMaterials.size());

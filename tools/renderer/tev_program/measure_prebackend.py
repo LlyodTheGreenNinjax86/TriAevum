@@ -31,19 +31,25 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--runs", type=int, default=3)
     parser.add_argument("--frames", type=int, default=900)
+    parser.add_argument("--timeout-seconds", type=int, default=120)
     parser.add_argument("--allow-legacy", action="store_true", help="Control run without the new phase accounting")
     parser.add_argument("--profile-runtime", action="store_true", help="Diagnostic attribution run, not a clean performance comparison")
     parser.add_argument("--thread-cpu-ledger", action="store_true", help="Diagnostic main-thread CPU/wall split; Windows, not clean A/B timing")
     parser.add_argument("--diagnostic-plugin", type=Path, help="Symbol-bearing diagnostic module; not a performance baseline")
     parser.add_argument("--comparison-plugin", type=Path, help="Unsampled baseline/candidate ABBA runs, sharing a private cache")
+    parser.add_argument("--comparison-executable", type=Path, help="Unsampled host-runtime ABBA comparison")
     parser.add_argument("--baseline-plugin", type=Path, help="Explicit control module for matched-source comparisons")
     parser.add_argument("--sample-map", type=Path, help="Link map belonging exactly to diagnostic-plugin")
     parser.add_argument("--stack-sampler", type=Path, help="External Windows stack sampler (diagnostic only)")
+    parser.add_argument("--no-present", action="store_true",
+                        help="Developer throughput mode: render but never present, so display refresh cannot pace frames")
     parser.add_argument("--sample-delay", type=float, default=10, help="Seconds before diagnostic sampling")
     args = parser.parse_args()
+    if not 40 <= args.timeout_seconds <= 1800:
+        parser.error("Timeout must be between 40 and 1800 seconds")
     if args.sample_map and (not args.diagnostic_plugin or not 0 <= args.sample_delay <= 60):
         parser.error("Sampling requires --diagnostic-plugin and a delay between 0 and 60 seconds")
-    if args.comparison_plugin and (args.diagnostic_plugin or args.sample_map or args.profile_runtime or args.thread_cpu_ledger):
+    if (args.comparison_plugin or args.comparison_executable) and (args.diagnostic_plugin or args.sample_map or args.profile_runtime or args.thread_cpu_ledger):
         parser.error("A/B timing must not be combined with diagnostics")
     if args.thread_cpu_ledger and (args.sample_map or args.profile_runtime):
         parser.error("Thread CPU accounting must run without other intrusive profilers")
@@ -57,7 +63,9 @@ def main():
     for run in range(args.runs):
         root = args.output / str(run)
         root.mkdir(exist_ok=False)
-        command = [str(args.executable)]
+        selected_executable = (args.comparison_executable
+            if args.comparison_executable and run % 4 in (1, 2) else args.executable)
+        command = [str(selected_executable)]
         selected_plugin = args.diagnostic_plugin or (
             args.comparison_plugin if args.comparison_plugin and run % 4 in (1, 2)
             else args.baseline_plugin)
@@ -90,7 +98,7 @@ def main():
                 continue
             command.append(key)
             i += 1
-        command.extend(("--frames", str(args.frames), "--max-seconds", "90",
+        command.extend(("--frames", str(args.frames), "--max-seconds", str(args.timeout_seconds - 30),
                         "--output", str(root / "runtime.json"),
                         "--renderer-cache-directory", str(args.output / "cache")))
         if args.profile_runtime and "--profile-a32-runtime" not in command:
@@ -101,6 +109,9 @@ def main():
         env.pop("TRIAEVUM_PROFILE_CPU_LEDGER", None)
         if args.thread_cpu_ledger:
             env["TRIAEVUM_PROFILE_CPU_LEDGER"] = "1"
+        env.pop("TRIAEVUM_BENCHMARK_NO_PRESENT", None)
+        if args.no_present:
+            env["TRIAEVUM_BENCHMARK_NO_PRESENT"] = "1"
         with (root / "stdout.log").open("w") as out, (root / "stderr.log").open("w") as err:
             process = subprocess.Popen(command, cwd=root, env=env, stdout=out, stderr=err)
             try:
@@ -113,7 +124,7 @@ def main():
                                     "--output", str(root / "native-samples.json"),
                                     "--module", str(args.diagnostic_plugin), "--map", str(args.sample_map)])
                     subprocess.run(sampling, timeout=60, check=True)
-                code = process.wait(timeout=120)
+                code = process.wait(timeout=args.timeout_seconds)
                 cpu_seconds = windows_process_cpu_seconds(process)
             finally:
                 if process.poll() is None:
@@ -137,11 +148,13 @@ def main():
                 or data["run_frames"] != args.frames or (budget and budget["samples"] != window["measured_frames"])):
             raise RuntimeError(f"Invalid timing conditions: {root}")
         results.append({"run": run, "benchmark": window,
+                        "executable": str(selected_executable),
                         "title_plugin": command[command.index("--title-plugin") + 1],
                         "process_cpu_seconds_including_startup": cpu_seconds,
                         "diagnostic_plugin": str(args.diagnostic_plugin) if args.diagnostic_plugin else None,
                         "intrusive_native_sampling": args.sample_map is not None,
                         "thread_cpu_ledger": args.thread_cpu_ledger,
+                        "no_present": args.no_present,
                         "memory_fingerprint": data["memory_content_fingerprint"]})
         (args.output / "measurements.json").write_text(json.dumps(results, indent=2))
         print(json.dumps({"run": run, "whole_fps": window["frames_per_second"], "pre_backend": budget}), flush=True)

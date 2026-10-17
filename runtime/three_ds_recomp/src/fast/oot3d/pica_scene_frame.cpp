@@ -137,6 +137,7 @@ struct PicaSceneFrame::Impl {
                                                  ::Fast::Renderer3ds::PicaShaderSourceIdentity sourceIdentity,
                                                  const ::Fast::Renderer3ds::PicaVertexShaderHookLayout*
                                                      vertexHooks,
+                                                 const ::Fast::Renderer3ds::PicaShaderHookLayout* fragmentHooks,
                                                  PicaSceneRecordStatus& status) {
         const ShaderIdentity identity{stage, key};
         const auto found = Shaders.find(identity);
@@ -162,6 +163,17 @@ struct PicaSceneFrame::Impl {
                     found->second.Program->VertexHooks = *vertexHooks;
                 }
             }
+            if (stage == PicaSceneShaderStage::Fragment &&
+                fragmentHooks != nullptr && fragmentHooks->ValidFor(source)) {
+                if (found->second.Program->FragmentHooksAvailable() &&
+                    found->second.Program->FragmentHooks != *fragmentHooks) {
+                    status = PicaSceneRecordStatus::ShaderIdentityConflict;
+                    return nullptr;
+                }
+                if (!found->second.Program->FragmentHooksAvailable()) {
+                    found->second.Program->FragmentHooks = *fragmentHooks;
+                }
+            }
             return found->second.Program.get();
         }
         const auto actualIdentity = ::Fast::Renderer3ds::IdentifyPicaShaderSource(source);
@@ -176,6 +188,10 @@ struct PicaSceneFrame::Impl {
         if (stage == PicaSceneShaderStage::Vertex &&
             vertexHooks != nullptr && vertexHooks->ValidFor(source)) {
             shader->VertexHooks = *vertexHooks;
+        }
+        if (stage == PicaSceneShaderStage::Fragment &&
+            fragmentHooks != nullptr && fragmentHooks->ValidFor(source)) {
+            shader->FragmentHooks = *fragmentHooks;
         }
         const auto* result = shader.get();
         Shaders.emplace(identity, CachedShader{std::move(shader), actualIdentity});
@@ -287,6 +303,11 @@ PicaSceneRecordStatus PicaSceneFrame::Record(
              desc.UniformBuffer.Size - desc.FragmentUniformOffset)) {
         return mImpl->Reject(PicaSceneRecordStatus::InvalidUniformRange);
     }
+    if (desc.SurfaceLightingUniformSize != 0U &&
+        (desc.SurfaceLightingUniformOffset > desc.UniformBuffer.Size ||
+         desc.SurfaceLightingUniformSize > desc.UniformBuffer.Size - desc.SurfaceLightingUniformOffset)) {
+        return mImpl->Reject(PicaSceneRecordStatus::InvalidUniformRange);
+    }
     if (desc.GeometryBuffer.NativeHandle == 0U ||
         desc.VertexBindings.empty() || desc.VertexOrIndexCount == 0U) {
         return mImpl->Reject(PicaSceneRecordStatus::InvalidGeometryRange);
@@ -329,21 +350,27 @@ PicaSceneRecordStatus PicaSceneFrame::Record(
             textureMask |= static_cast<uint8_t>(1U << texture.Slot);
         }
     }
+    if (desc.LightingLut.Bound &&
+        (desc.LightingLut.NativeImageHandle == 0U || desc.LightingLut.ImageWidth == 0U ||
+         desc.LightingLut.ImageHeight == 0U || desc.LightingLut.MipLevels == 0U ||
+         desc.LightingLut.ImageFormat != ::Fast::Renderer3ds::PicaSceneTextureImageFormat::R32Uint)) {
+        return mImpl->Reject(PicaSceneRecordStatus::InvalidTextureBinding);
+    }
 
     PicaSceneRecordStatus status = PicaSceneRecordStatus::Recorded;
     const auto* shader = mImpl->ResolveShader(
         PicaSceneShaderStage::Vertex, desc.VertexShaderKey,
-        desc.VertexShaderSource, desc.VertexSourceIdentity, &desc.VertexShaderHooks, status);
+        desc.VertexShaderSource, desc.VertexSourceIdentity, &desc.VertexShaderHooks, nullptr, status);
     const auto* fragmentShader = mImpl->ResolveShader(
         PicaSceneShaderStage::Fragment, desc.FragmentShaderKey,
-        desc.FragmentShaderSource, desc.FragmentSourceIdentity, nullptr, status);
+        desc.FragmentShaderSource, desc.FragmentSourceIdentity, nullptr, &desc.FragmentShaderHooks, status);
     const auto* effectiveVertexShader = mImpl->ResolveShader(
         PicaSceneShaderStage::Vertex, desc.EffectiveVertexShaderKey,
-        desc.EffectiveVertexShaderSource, desc.EffectiveVertexSourceIdentity, nullptr, status);
+        desc.EffectiveVertexShaderSource, desc.EffectiveVertexSourceIdentity, nullptr, nullptr, status);
     const auto* effectiveFragmentShader = mImpl->ResolveShader(
         PicaSceneShaderStage::Fragment,
         desc.EffectiveFragmentShaderKey,
-        desc.EffectiveFragmentShaderSource, desc.EffectiveFragmentSourceIdentity, nullptr, status);
+        desc.EffectiveFragmentShaderSource, desc.EffectiveFragmentSourceIdentity, nullptr, nullptr, status);
     if (shader == nullptr || fragmentShader == nullptr ||
         effectiveVertexShader == nullptr ||
         effectiveFragmentShader == nullptr) {
@@ -358,6 +385,12 @@ PicaSceneRecordStatus PicaSceneFrame::Record(
     record.CommandListOffsetWords = desc.CommandListOffsetWords;
     record.CompositionDomain = desc.CompositionDomain;
     record.Composition = desc.Composition;
+    record.LightingWorldToView = desc.LightingWorldToView;
+    record.SceneDirectionals = desc.SceneDirectionals;
+    record.ScenePoints = desc.ScenePoints;
+    record.RoomShadows = desc.RoomShadows;
+    record.NativeLightSources = desc.NativeLightSources;
+    record.ShadowCaster = desc.ShadowCaster;
     record.Raster = desc.Raster;
     record.RenderTarget = desc.RenderTarget;
     record.CanonicalDescriptorSchemaVersion =
@@ -391,6 +424,8 @@ PicaSceneRecordStatus PicaSceneFrame::Record(
     record.FragmentUniformSize = desc.FragmentUniformSize;
     record.FragmentUniformContentVersion =
         HashPicaUniformBytes(desc.PackedFragmentUniforms);
+    record.SurfaceLightingUniformOffset = desc.SurfaceLightingUniformOffset;
+    record.SurfaceLightingUniformSize = desc.SurfaceLightingUniformSize;
     record.GeometryBuffer = desc.GeometryBuffer;
     record.FirstVertexBinding =
         static_cast<uint32_t>(mImpl->DrawVertexBindings.size());
@@ -406,6 +441,9 @@ PicaSceneRecordStatus PicaSceneFrame::Record(
         if (texture.Bound) {
             ++mImpl->BoundTextures;
         }
+    }
+    if (desc.LightingLut.Bound) {
+        record.LightingLut = desc.LightingLut;
     }
     record.PerspectiveProjection = desc.PerspectiveProjection;
     const auto nativeEnvironment = DecodePicaNativeDrawEnvironment(
@@ -452,8 +490,7 @@ PicaSceneRecordStatus PicaSceneFrame::Record(
         record.VertexShader->VertexHooks.Has(
             ::Fast::Renderer3ds::PicaVertexShaderSemantic::
                 ViewPositionOutput) &&
-        record.NativeTransform.CurrentViewToWorldAvailable &&
-        record.NativeTransform.CurrentUsesSkeleton;
+        record.NativeTransform.CurrentViewToWorldAvailable;
     if (directionalShadowCaster) {
         ++mImpl->DirectionalShadowCasters;
         if (record.NativeLighting.Available &&
@@ -553,6 +590,21 @@ bool PicaSceneFrame::DirectionalShadowCaster(
            mImpl->DirectionalShadowCasterFlags[drawIndex] != 0U;
 }
 
+bool PicaSceneFrame::HasSceneDrawOnColorTarget(
+    uint32_t colorPhysicalAddress) const noexcept {
+    if (colorPhysicalAddress == 0U) {
+        return false;
+    }
+    for (const auto& draw : mImpl->DrawRecords) {
+        if (draw.CompositionDomain ==
+                ::Fast::Renderer3ds::PicaCompositionDomain::Scene &&
+            draw.RenderTarget.ColorPhysicalAddress == colorPhysicalAddress) {
+            return true;
+        }
+    }
+    return false;
+}
+
 PicaSceneFrameStats PicaSceneFrame::Stats() const noexcept {
     PicaSceneFrameStats stats;
     stats.DrawCount = static_cast<uint32_t>(std::min<size_t>(
@@ -571,6 +623,9 @@ PicaSceneFrameStats PicaSceneFrame::Stats() const noexcept {
             break;
         case ::Fast::Renderer3ds::PicaCompositionDomain::Ui:
             ++stats.UiDomainDrawCount;
+            break;
+        case ::Fast::Renderer3ds::PicaCompositionDomain::Screen:
+            ++stats.ScreenDomainDrawCount;
             break;
         case ::Fast::Renderer3ds::PicaCompositionDomain::Unknown:
             ++stats.UnknownDomainDrawCount;

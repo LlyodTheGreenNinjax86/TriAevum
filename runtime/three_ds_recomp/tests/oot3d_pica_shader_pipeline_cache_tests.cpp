@@ -4,6 +4,9 @@
 #include "fast/oot3d/pica_reactive_mask.h"
 #include "fast/oot3d/pica_rigid_motion.h"
 #include "fast/oot3d/pica_shader_pipeline_cache.h"
+#include "fast/oot3d/pica_rim_light.h"
+#include "fast/oot3d/pica_uber_effect_program.h"
+#include "fast/renderer3ds/pica_surface_lighting.h"
 
 #include <gtest/gtest.h>
 #ifdef OOT3D_PIPELINE_CACHE_HAS_SHADERC
@@ -11,8 +14,109 @@
 #endif
 
 #include <stdexcept>
+#include <cmath>
+#include <limits>
 
 namespace {
+
+TEST(Oot3dRimLight, ScopeUsesNativeActorOwnershipAndRejectsNonOpaquePasses) {
+    using namespace Fast::Renderer3ds;
+    PicaEnvironmentLighting environment;
+    environment.Enabled = environment.Rim.Enabled = true;
+    PicaCompositionAttribution composition;
+    composition.Layer = PicaCompositionLayer::OpaqueWorld;
+    NativeBlendState blend;
+    auto domain = PicaCompositionDomain::Scene;
+    auto appearance = PicaSurfaceAppearance::Relightable;
+    bool depthTest = true, depthWrite = true;
+    uint8_t operation = 0;
+    const auto eligible = [&] { return Fast::Oot3d::PicaDrawReceivesRimLight(
+        environment, domain, composition, blend, appearance, depthTest, depthWrite, operation); };
+    EXPECT_FALSE(eligible()); // A room material is not an actor, even with the same shader.
+    composition.NativeActorGeometry = true;
+    EXPECT_TRUE(eligible()); // Rigid props and skinned characters use the same ownership.
+    composition.NativeActorGeometry = false;
+    environment.Rim.Scope = PicaRimLightScope::ActorsAndWorld;
+    EXPECT_TRUE(eligible());
+    for (auto layer : {PicaCompositionLayer::Unknown, PicaCompositionLayer::TransparentWorld,
+                       PicaCompositionLayer::Atmosphere, PicaCompositionLayer::Ui}) {
+        composition.Layer = layer;
+        EXPECT_FALSE(eligible());
+    }
+    composition.Layer = PicaCompositionLayer::OpaqueWorld;
+    for (auto excluded : {PicaCompositionDomain::Unknown, PicaCompositionDomain::Ui, PicaCompositionDomain::Screen}) {
+        domain = excluded;
+        EXPECT_FALSE(eligible());
+    }
+    domain = PicaCompositionDomain::Scene;
+    blend.Enabled = true;
+    EXPECT_TRUE(eligible()); // Native ONE/ZERO replacement blending.
+    blend.SourceRgb = NativeBlendFactor::SourceAlpha;
+    blend.DestRgb = NativeBlendFactor::OneMinusSourceAlpha;
+    EXPECT_FALSE(eligible()); // Fades are excluded even if they write depth.
+    blend.DestRgb = NativeBlendFactor::One;
+    EXPECT_FALSE(eligible());
+    blend = {};
+    composition.IsolatedLighting = true; EXPECT_FALSE(eligible()); composition.IsolatedLighting = false;
+    composition.NativeProjectedShadow = true; EXPECT_FALSE(eligible()); composition.NativeProjectedShadow = false;
+    appearance = PicaSurfaceAppearance::Unlit; EXPECT_FALSE(eligible());
+    appearance = PicaSurfaceAppearance::AdditiveComposition; EXPECT_FALSE(eligible());
+    appearance = PicaSurfaceAppearance::Relightable;
+    depthTest = false; EXPECT_FALSE(eligible()); depthTest = true;
+    depthWrite = false; EXPECT_FALSE(eligible()); depthWrite = true;
+    operation = 3; EXPECT_FALSE(eligible()); operation = 0;
+    environment.Enabled = false; EXPECT_FALSE(eligible()); environment.Enabled = true;
+    environment.Rim.Enabled = false; EXPECT_FALSE(eligible());
+}
+
+TEST(Oot3dRimLight, DisabledAndInvalidSettingsPublishCanonicalZeroUniforms) {
+    using namespace Fast::Renderer3ds;
+    PicaSurfaceLightingUniforms uniforms;
+    PicaRimLightSettings rim;
+    AssignPicaSurfaceRim(uniforms, rim);
+    EXPECT_EQ(uniforms.Rim, (std::array<float, 4>{}));
+    rim.Enabled = true;
+    AssignPicaSurfaceRim(uniforms, rim);
+    EXPECT_EQ(uniforms.Rim, (std::array<float, 4>{1.0F, 4.0F, 1.0F, 0.25F}));
+    EXPECT_EQ(uniforms.RimColor, (std::array<float, 4>{1.0F, 0.96F, 0.9F, 0.0F}));
+    EXPECT_EQ(uniforms.RimDirection, (std::array<float, 4>{0, 1, 0, 0}));
+    rim.Intensity = kMaximumPicaRimIntensity; rim.Azimuth = 90;
+    AssignPicaSurfaceRim(uniforms, rim);
+    EXPECT_FLOAT_EQ(uniforms.Rim[0], 8.0F);
+    EXPECT_NEAR(uniforms.RimDirection[0], 1.0F, 1.e-6F);
+    EXPECT_NEAR(uniforms.RimDirection[1], 0.0F, 1.e-6F);
+    rim.Source = PicaRimLightSource::SceneLights;
+    AssignPicaSurfaceRim(uniforms, rim);
+    EXPECT_EQ(uniforms.Rim, (std::array<float, 4>{8, 4, 2, 0}));
+    EXPECT_EQ(uniforms.RimColor, (std::array<float, 4>{}));
+    EXPECT_EQ(uniforms.RimDirection, (std::array<float, 4>{}));
+    rim.Enabled = false; rim.Intensity = 1; rim.Sharpness = 16; rim.Coverage = 0.7F;
+    AssignPicaSurfaceRim(uniforms, rim);
+    EXPECT_EQ(uniforms.Rim, (std::array<float, 4>{}));
+    EXPECT_EQ(uniforms.RimColor, (std::array<float, 4>{}));
+    EXPECT_EQ(uniforms.RimDirection, (std::array<float, 4>{}));
+    rim.Enabled = true;
+    for (float bad : {std::numeric_limits<float>::quiet_NaN(), std::numeric_limits<float>::infinity(), -1.0F, 17.0F}) {
+        auto invalid = rim; invalid.Sharpness = bad;
+        AssignPicaSurfaceRim(uniforms, invalid);
+        EXPECT_EQ(uniforms.Rim, (std::array<float, 4>{}));
+    }
+    for (auto member : {&PicaRimLightSettings::Intensity, &PicaRimLightSettings::Azimuth,
+                        &PicaRimLightSettings::Coverage}) {
+        auto invalid = rim; invalid.*member = std::numeric_limits<float>::quiet_NaN();
+        AssignPicaSurfaceRim(uniforms, invalid);
+        EXPECT_EQ(uniforms.Rim, (std::array<float, 4>{}));
+    }
+    auto invalid = rim; invalid.Color[1] = 1.1F;
+    AssignPicaSurfaceRim(uniforms, invalid);
+    EXPECT_EQ(uniforms.Rim, (std::array<float, 4>{}));
+    invalid = rim; invalid.Source = static_cast<PicaRimLightSource>(2);
+    AssignPicaSurfaceRim(uniforms, invalid);
+    EXPECT_EQ(uniforms.Rim, (std::array<float, 4>{}));
+    rim.Intensity = 0;
+    AssignPicaSurfaceRim(uniforms, rim);
+    EXPECT_EQ(uniforms.Rim, (std::array<float, 4>{}));
+}
 
 Oot3d::Renderer::PicaTemporalVertexProgramView
 BaseTemporalVertexProgram();
@@ -103,6 +207,7 @@ Fast::Oot3d::PicaShaderPipelineRequest BaseRequest() {
     request.Draw.PerspectiveProjection = true;
     request.Draw.CompositionDomain =
         Oot3d::Renderer::PicaCompositionDomain::Scene;
+    request.Draw.CompositionLayer = Fast::Renderer3ds::PicaCompositionLayer::OpaqueWorld;
     request.TemporalVertexProgram = BaseTemporalVertexProgram();
     request.FragmentShaderHooks =
         Fast::Oot3d::AnalyzePicaFragmentShaderHooks(kFragmentShader);
@@ -206,6 +311,134 @@ TEST(Oot3dPicaDirectionalShadowCaster,
                   InvalidHookContract);
 }
 
+// Canonical-shaped fragment program: native samplers and fragment uniforms,
+// TEV, the native alpha test, then depth and colour after BeforeDepth.
+constexpr std::string_view kAlphaCasterFragmentShader =
+    "#version 450\n"
+    "layout(location=1) in vec2 pica_texcoord0;\n"
+    "layout(set=0,binding=1) uniform sampler2D pica_texture0;\n"
+    "layout(set=0,binding=2) uniform sampler2D pica_texture1;\n"
+    "layout(set=0,binding=3) uniform sampler2D pica_texture2;\n"
+    "layout(set=0,binding=4,std140) uniform PicaFragmentUniforms {\n"
+    "    vec4 tev_constants[6];\n"
+    "    int alpha_reference;\n"
+    "    float depth_scale;\n"
+    "} fragment_uniforms;\n"
+    "layout(location=0) out vec4 pica_color;\n"
+    "void main() {\n"
+    "    vec4 combiner_output = texture(pica_texture0, pica_texcoord0);\n"
+    "    // AFTER_TEV\n"
+    "    int alpha_byte = int(combiner_output.a * 255.0);\n"
+    "    if (alpha_byte < fragment_uniforms.alpha_reference) discard;\n"
+    "    // BEFORE_DEPTH\n"
+    "    gl_FragDepth = gl_FragCoord.z * fragment_uniforms.depth_scale;\n"
+    "    // BEFORE_COLOR\n"
+    "    pica_color = combiner_output + texture(pica_texture1, pica_texcoord0) +\n"
+    "        texture(pica_texture2, pica_texcoord0);\n"
+    "    // EPILOGUE\n"
+    "}\n";
+
+Oot3d::Renderer::PicaShaderHookLayout AlphaCasterFragmentHooks(std::string_view source) {
+    using Oot3d::Renderer::PicaShaderHook;
+    Oot3d::Renderer::PicaShaderHookLayout hooks;
+    hooks.SchemaVersion = Oot3d::Renderer::kPicaShaderHookSchemaVersion;
+    hooks.SourceSize = source.size();
+    hooks.Outputs = {Oot3d::Renderer::kPicaFragmentOutputContractSchemaVersion, 1U, 0U,
+                     Oot3d::Renderer::PicaFragmentDepthOutput::ExplicitNative, false, false};
+    const auto at = [&](PicaShaderHook hook, std::string_view marker) {
+        hooks.Offsets[static_cast<size_t>(hook)] = source.find(marker);
+    };
+    at(PicaShaderHook::GlobalDeclarations, "void main()");
+    at(PicaShaderHook::MainPrologue, "    vec4 combiner_output");
+    at(PicaShaderHook::AfterNativeTev, "    // AFTER_TEV");
+    at(PicaShaderHook::BeforeDepth, "    // BEFORE_DEPTH");
+    at(PicaShaderHook::BeforeNativeColor, "    // BEFORE_COLOR");
+    at(PicaShaderHook::MainEpilogue, "    // EPILOGUE");
+    return hooks;
+}
+
+TEST(Oot3dPicaDirectionalShadowCaster, CasterTransformLeavesTheNativeBindingsFree) {
+    using namespace Fast::Oot3d;
+    const auto result = BuildPicaDirectionalShadowCasterShader(
+        kShadowCasterVertexShader, 0x1234U, ShadowCasterHooks());
+    ASSERT_TRUE(result.Applied());
+    EXPECT_EQ(kPicaShadowCasterTransformBinding, 30U);
+    EXPECT_NE(result.Source.find("layout(set=0,binding=30,std140) uniform Oot3dDirectionalShadowTransform"),
+              std::string::npos);
+    EXPECT_EQ(result.Source.find("binding=1,std140"), std::string::npos);
+}
+
+TEST(Oot3dPicaDirectionalShadowCaster, AlphaCasterRunsTheNativeProgramUpToItsAlphaTest) {
+    using namespace Fast::Oot3d;
+    const auto hooks = AlphaCasterFragmentHooks(kAlphaCasterFragmentShader);
+    ASSERT_TRUE(hooks.ValidFor(kAlphaCasterFragmentShader));
+    const auto result = BuildPicaShadowCasterAlphaFragmentShader(kAlphaCasterFragmentShader, 0x77U, hooks);
+    ASSERT_TRUE(result.Applied());
+    EXPECT_NE(result.Key, 0x77U);
+    // TEV and alpha test kept; nothing from the depth hook on.
+    EXPECT_NE(result.Source.find("if (alpha_byte < fragment_uniforms.alpha_reference) discard;"),
+              std::string::npos);
+    EXPECT_EQ(result.Source.find("gl_FragDepth"), std::string::npos);
+    EXPECT_EQ(result.Source.find("pica_color ="), std::string::npos);
+    EXPECT_EQ(result.Source.find("BEFORE_DEPTH"), std::string::npos);
+    EXPECT_TRUE(result.Source.ends_with("}\n"));
+    // The map has no colour attachment: the native output is not exported.
+    EXPECT_EQ(result.Source.find("out vec4 pica_color"), std::string::npos);
+    EXPECT_NE(result.Source.find("\nvec4 pica_color;"), std::string::npos);
+    // Native samplers follow the NRI split: textures 1-3, samplers 7-9.
+    EXPECT_EQ(result.Source.find("uniform sampler2D pica_texture0;"), std::string::npos);
+    EXPECT_NE(result.Source.find("binding=7"), std::string::npos);
+    EXPECT_NE(result.Source.find("layout(set=0,binding=4,std140) uniform PicaFragmentUniforms"),
+              std::string::npos);
+#ifdef OOT3D_PIPELINE_CACHE_HAS_SHADERC
+    shaderc::Compiler compiler;
+    const auto compiled = compiler.CompileGlslToSpv(
+        result.Source, shaderc_fragment_shader, "alpha_shadow_caster.frag");
+    EXPECT_EQ(compiled.GetCompilationStatus(), shaderc_compilation_status_success)
+        << compiled.GetErrorMessage();
+#endif
+}
+
+TEST(Oot3dPicaDirectionalShadowCaster, AlphaCasterRequiresPublishedHooks) {
+    using namespace Fast::Oot3d;
+    using Oot3d::Renderer::PicaShaderHook;
+    const std::string_view source = kAlphaCasterFragmentShader;
+    auto hooks = AlphaCasterFragmentHooks(source);
+    hooks.Offsets[static_cast<size_t>(PicaShaderHook::BeforeDepth)] =
+        Oot3d::Renderer::PicaShaderHookLayout::Unavailable;
+    EXPECT_EQ(BuildPicaShadowCasterAlphaFragmentShader(source, 1U, hooks).Status,
+              PicaDirectionalShadowCasterShaderStatus::MissingAlphaTest);
+
+    hooks = AlphaCasterFragmentHooks(source);
+    ++hooks.SourceSize;
+    EXPECT_EQ(BuildPicaShadowCasterAlphaFragmentShader(source, 1U, hooks).Status,
+              PicaDirectionalShadowCasterShaderStatus::InvalidHookContract);
+
+    hooks = AlphaCasterFragmentHooks(source);
+    std::swap(hooks.Offsets[static_cast<size_t>(PicaShaderHook::AfterNativeTev)],
+              hooks.Offsets[static_cast<size_t>(PicaShaderHook::BeforeDepth)]);
+    EXPECT_EQ(BuildPicaShadowCasterAlphaFragmentShader(source, 1U, hooks).Status,
+              PicaDirectionalShadowCasterShaderStatus::InvalidHookContract);
+
+    // Only the canonical native colour output can stay unexported.
+    hooks = AlphaCasterFragmentHooks(source);
+    hooks.Outputs.ColorLocationMask = 3U;
+    EXPECT_EQ(BuildPicaShadowCasterAlphaFragmentShader(source, 1U, hooks).Status,
+              PicaDirectionalShadowCasterShaderStatus::OutputContract);
+    constexpr std::string_view kOutput = "layout(location=0) out vec4 pica_color;\n";
+    std::string undeclared(source);
+    undeclared.erase(undeclared.find(kOutput), kOutput.size());
+    EXPECT_EQ(BuildPicaShadowCasterAlphaFragmentShader(undeclared, 1U, AlphaCasterFragmentHooks(undeclared)).Status,
+              PicaDirectionalShadowCasterShaderStatus::OutputContract);
+
+    // Without a native sampler the NRI binding contract cannot be met.
+    constexpr std::string_view kTexture2 = "layout(set=0,binding=3) uniform sampler2D pica_texture2;\n";
+    std::string unsampled(source);
+    unsampled.erase(unsampled.find(kTexture2), kTexture2.size());
+    EXPECT_EQ(BuildPicaShadowCasterAlphaFragmentShader(unsampled, 1U, AlphaCasterFragmentHooks(unsampled)).Status,
+              PicaDirectionalShadowCasterShaderStatus::SamplerContract);
+}
+
 TEST(Oot3dPicaAttachmentContract, CanonicalRenderingDeclaresOnlyNativeColor) {
     const Fast::Oot3d::PicaAttachmentRequirements requirements;
     EXPECT_TRUE(requirements.NativeColorOnly());
@@ -225,7 +458,12 @@ TEST(Oot3dPicaAttachmentContract,
         PicaAuxiliaryOutput::RigidMotionGuide));
     EXPECT_FALSE(requirements.Requires(PicaAuxiliaryOutput::AmbientGuide));
     EXPECT_EQ(requirements.ColorAttachmentCount(),
-              Fast::Oot3d::kPicaColorAttachmentCount);
+              Fast::Oot3d::kPicaBaseInstrumentedColorAttachmentCount);
+    // The GI albedo guide extends the layout only while requested.
+    const Fast::Oot3d::PicaAttachmentRequirements withAlbedo{
+        PicaAuxiliaryOutput::NormalGuide | PicaAuxiliaryOutput::DiffuseAlbedoGuide};
+    EXPECT_EQ(withAlbedo.ColorAttachmentCount(), Fast::Oot3d::kPicaColorAttachmentCount);
+    EXPECT_EQ(withAlbedo.BaseGuides(), requirements);
 }
 
 TEST(Oot3dPicaAttachmentContract,
@@ -449,7 +687,45 @@ TEST(Oot3dPicaShaderPipelineCache,
 }
 
 TEST(Oot3dPicaShaderPipelineCache,
-     RejectsTemporalInstrumentationWithoutTypedFrontendProgram) {
+     LiveTypedContractSupersedesReplayInferenceAndCachedVariants) {
+    using namespace Fast::Oot3d;
+    constexpr std::string_view source = R"glsl(#version 450
+layout(location=0) out vec4 pica_color;
+void main() {
+    vec3 normal = vec3(0.25, 0.5, 1.0);
+    pica_color = vec4(normal, 1.0);
+}
+)glsl";
+    auto request = BaseRequest();
+    request.FragmentShaderSource = source;
+    request.FragmentShaderHooks = {};
+    EffectsSettings effects;
+    effects.AmbientOcclusion = AmbientOcclusionMode::Cacao;
+    PicaShaderPipelineCache cache;
+    cache.BeginFrame(1U);
+    const auto& replay = cache.Resolve(request, effects);
+    ASSERT_TRUE(HasPicaShaderInstrumentationFeature(
+        replay.AppliedFeatures, PicaShaderInstrumentationFeature::NormalGuide));
+
+    // This native program uses "normal" as a color, not a surface normal.
+    // The frontend contract is authoritative over legacy source inference.
+    request.FragmentShaderHooks = AnalyzePicaFragmentShaderHooks(source);
+    request.FragmentShaderHooks.Semantics = static_cast<PicaShaderSemantic>(
+        static_cast<uint32_t>(request.FragmentShaderHooks.Semantics) &
+        ~static_cast<uint32_t>(PicaShaderSemantic::MaterialNormal));
+    const auto& live = cache.Resolve(request, effects);
+    EXPECT_FALSE(HasPicaShaderInstrumentationFeature(
+        live.AppliedFeatures, PicaShaderInstrumentationFeature::NormalGuide));
+    // Earlier recorded draws retain their variant until the frame boundary.
+    EXPECT_TRUE(HasPicaShaderInstrumentationFeature(
+        replay.AppliedFeatures, PicaShaderInstrumentationFeature::NormalGuide));
+    EXPECT_FALSE(HasPicaShaderInstrumentationFeature(
+        cache.Resolve(request, effects).AppliedFeatures,
+        PicaShaderInstrumentationFeature::NormalGuide));
+}
+
+TEST(Oot3dPicaShaderPipelineCache,
+     PublishesFallbackProvenanceWithoutTypedFrontendProgram) {
     Fast::Oot3d::PicaShaderPipelineCache cache;
     Fast::Oot3d::EffectsSettings effects;
     auto request = BaseRequest();
@@ -457,13 +733,18 @@ TEST(Oot3dPicaShaderPipelineCache,
     request.TemporalVertexProgram = {};
     cache.BeginFrame(1U);
 
-    EXPECT_THROW((void)cache.Resolve(request, effects),
-                 std::logic_error);
+    const auto& result = cache.Resolve(request, effects);
+    EXPECT_FALSE(Fast::Oot3d::HasPicaShaderInstrumentationFeature(
+        result.AppliedFeatures, Fast::Oot3d::PicaShaderInstrumentationFeature::TemporalVertex));
+    EXPECT_TRUE(Fast::Oot3d::HasPicaShaderInstrumentationFeature(
+        result.AppliedFeatures, Fast::Oot3d::PicaShaderInstrumentationFeature::RigidMotionGuide));
+    EXPECT_EQ(result.FragmentShaderSource.find("layout(location=7) in"), std::string::npos);
+    EXPECT_NE(result.FragmentShaderSource.find("vec4(oot3d_draw.rigid_motion.xyz, 0.0)"), std::string::npos);
     EXPECT_EQ(cache.Stats().TypedInstrumentationContractRejects, 1U);
 }
 
 TEST(Oot3dPicaShaderPipelineCache,
-     DirectionalShadowLightingFollowsCompiledPassRequest) {
+     NativeLightingRejectsDirectionalShadowsEvenWhenRequested) {
     using namespace Fast::Oot3d;
 
     EffectsSettings disabledSettings;
@@ -473,13 +754,14 @@ TEST(Oot3dPicaShaderPipelineCache,
     enabledCache.BeginFrame(1U);
     const auto& enabled = enabledCache.Resolve(
         enabledRequest, disabledSettings);
-    EXPECT_TRUE(HasPicaShaderInstrumentationFeature(
+    EXPECT_FALSE(HasPicaShaderInstrumentationFeature(
         enabled.RequestedFeatures,
         PicaShaderInstrumentationFeature::DirectionalShadowLighting));
+    EXPECT_EQ(enabled.FragmentShaderKey, enabledRequest.FragmentShaderKey);
 
     EffectsSettings enabledSettings;
     enabledSettings.DirectionalShadows.Mode =
-        DirectionalShadowMode::SingleCascade;
+        DirectionalShadowMode::VirtualShadowMaps;
     auto disabledRequest = BaseRequest();
     disabledRequest.Draw.DirectionalShadowReceiver = false;
     PicaShaderPipelineCache disabledCache;
@@ -522,7 +804,7 @@ void main() {
 
     PicaShaderPipelineCache cache;
     EffectsSettings effects;
-    effects.AmbientOcclusion = AmbientOcclusionMode::Cacao;
+    effects.AmbientOcclusion = AmbientOcclusionMode::Gtao;
     auto request = BaseRequest();
     request.FragmentShaderSource = kFragmentShader;
     request.FragmentShaderHooks =
@@ -553,6 +835,288 @@ void main() {
               shaderc_compilation_status_success)
         << compiled.GetErrorMessage();
 #endif
+}
+
+// A typed CMB-like program: the transform and surface layouts name the normal
+// input and the uniforms the native program transforms it with.
+constexpr std::string_view kTypedVertexShader = R"glsl(#version 450
+layout(location=0) in vec4 pica_input0;
+layout(location=1) in vec4 pica_input1;
+layout(location=2) in vec4 pica_input2;
+layout(set=0,binding=0,std140) uniform PicaVertexUniforms {
+    uint b; int flip_viewport; uvec4 i[4]; vec4 f[96];
+} uniforms;
+vec4 pica_output0 = vec4(0.0);
+void main() { pica_output0 = pica_input0; gl_Position = pica_output0; }
+)glsl";
+
+Oot3d::Renderer::PicaTemporalVertexProgramView TypedVertexProgram() {
+    using namespace Oot3d::Renderer;
+    const size_t state = kTypedVertexShader.find("vec4 pica_output0 =");
+    const size_t main = kTypedVertexShader.find("void main()");
+    PicaVertexShaderHookLayout hooks;
+    hooks.SchemaVersion = kPicaShaderHookSchemaVersion;
+    hooks.SourceSize = kTypedVertexShader.size();
+    hooks.Offsets[static_cast<size_t>(PicaVertexShaderHook::GlobalDeclarations)] = state;
+    hooks.Offsets[static_cast<size_t>(PicaVertexShaderHook::RegisterStateBegin)] = state;
+    hooks.Offsets[static_cast<size_t>(PicaVertexShaderHook::RegisterStateEnd)] = main;
+    hooks.Offsets[static_cast<size_t>(PicaVertexShaderHook::MainBodyBegin)] = kTypedVertexShader.find('{', main) + 1U;
+    hooks.Offsets[static_cast<size_t>(PicaVertexShaderHook::MainBodyEnd)] = kTypedVertexShader.find_last_of('}');
+    hooks.Semantics = PicaVertexShaderSemantic::PicaRegisterState | PicaVertexShaderSemantic::VertexUniformState |
+                      PicaVertexShaderSemantic::ClipPositionOutput | PicaVertexShaderSemantic::TransformProgram |
+                      PicaVertexShaderSemantic::SurfaceProgram;
+    hooks.Transform = {PicaVertexTransformOperation::ModelViewProjection3x4, 0, 4, 4, 3, 20, 3, 0, 1};
+    hooks.Surface.ViewNormalTemporary = 14;
+    hooks.Surface.LightingBooleanUniform = 9;
+    hooks.Surface.DiffuseUniform = 8;
+    hooks.Surface.AmbientUniform = 9;
+    hooks.Surface.TintBooleanUniform = 5;
+    hooks.Surface.TintInputRegister = 2;
+    hooks.Surface.TintScale = {90, 2};
+    hooks.Surface.LightEnabledValue = {93, 1};
+    hooks.Surface.LightDirectionUniforms = {80, 83, 86};
+    return {hooks, "vec4 pica_output0_previous = vec4(0.0);\n", " gl_Position = pica_output0_previous; "};
+}
+
+// A vertex-lit world material: one colour texture, native LOD sampling, the
+// quaternion and view inputs every frontend program declares.
+constexpr std::string_view kVertexLitFragmentShader = R"glsl(#version 450
+layout(location=0) in vec4 pica_primary_color;
+layout(location=1) in vec2 pica_texcoord0;
+layout(location=5) in vec4 pica_normquat;
+layout(location=6) in vec3 pica_view;
+layout(set=0,binding=1) uniform sampler2D pica_texture0;
+layout(set=0,binding=4,std140) uniform PicaFragmentUniforms { vec4 texture_lod_bias; } fragment_uniforms;
+layout(location=0) out vec4 pica_color;
+float pica_texture_lod(vec2 coord, vec2 size) {
+    vec2 scaled = coord * size;
+    vec2 delta = max(abs(dFdx(scaled)), abs(dFdy(scaled)));
+    return log2(max(delta.x, delta.y));
+}
+vec4 pica_sample_texture0(vec2 coord) {
+    float lod = pica_texture_lod(coord, vec2(textureSize(pica_texture0, 0)));
+    return textureLod(pica_texture0, coord, lod + fragment_uniforms.texture_lod_bias[0]);
+}
+void main() {
+    vec4 combiner_output = pica_sample_texture0(vec2(pica_texcoord0.x, 1.0 - pica_texcoord0.y)) * pica_primary_color;
+    if (combiner_output.a < 0.5) discard;
+    pica_color = combiner_output;
+}
+)glsl";
+
+Fast::Oot3d::PicaShaderPipelineRequest VertexLitWorldRequest() {
+    auto request = BaseRequest();
+    request.VertexShaderSource = kTypedVertexShader;
+    request.TemporalVertexProgram = TypedVertexProgram();
+    request.FragmentShaderSource = kVertexLitFragmentShader;
+    request.FragmentShaderHooks = Fast::Oot3d::AnalyzePicaFragmentShaderHooks(kVertexLitFragmentShader);
+    return request;
+}
+
+#ifdef OOT3D_PIPELINE_CACHE_HAS_SHADERC
+void ExpectCompiles(const std::string& source, shaderc_shader_kind kind, const char* name) {
+    shaderc::Compiler compiler;
+    const auto compiled = compiler.CompileGlslToSpv(source, kind, name);
+    EXPECT_EQ(compiled.GetCompilationStatus(), shaderc_compilation_status_success) << compiled.GetErrorMessage();
+}
+#endif
+
+TEST(Oot3dPicaUberEffectProgram, DecisionFieldsDecodeIndependently) {
+    using namespace Fast::Oot3d;
+    using Decision = PicaEffectDecisions;
+    const auto decode = [](uint32_t packed, unsigned shift) {
+        return (packed >> shift) & ((1U << kPicaUberFieldBits) - 1U);
+    };
+    // Every field at its largest value next to neighbours at theirs: a field
+    // that read its neighbour's bits would not round-trip.
+    Decision decisions;
+    decisions.Bits = Decision::NormalGuide | Decision::Reactive;
+    decisions.Normal = Decision::NormalPath::NativeRotate;
+    decisions.NormalAt = Decision::NormalWriter::Outline;
+    decisions.MaterialAt = Decision::MaterialWriter::Baseline;
+    decisions.AlbedoCoverage = Decision::Coverage::Alpha;
+    decisions.Albedo = Decision::AlbedoPath::Surface;
+    decisions.Ambient = Decision::AmbientPath::Fallback;
+    decisions.ReactiveKind = Decision::ReactiveCoverage::Full;
+    const auto block = PackPicaUberEffectBlock(decisions, {});
+    EXPECT_EQ(block.Control[0], decisions.Bits);
+    const uint32_t y = block.Control[1];
+    EXPECT_EQ(decode(y, kPicaUberNormalShift), static_cast<uint32_t>(decisions.Normal));
+    EXPECT_EQ(decode(y, kPicaUberNormalAtShift), static_cast<uint32_t>(decisions.NormalAt));
+    EXPECT_EQ(decode(y, kPicaUberMaterialAtShift), static_cast<uint32_t>(decisions.MaterialAt));
+    EXPECT_EQ(decode(y, kPicaUberCoverageShift), static_cast<uint32_t>(decisions.AlbedoCoverage));
+    EXPECT_EQ(decode(y, kPicaUberAlbedoShift), static_cast<uint32_t>(decisions.Albedo));
+    EXPECT_EQ(decode(y, kPicaUberAmbientShift), static_cast<uint32_t>(decisions.Ambient));
+    EXPECT_EQ(decode(y, kPicaUberReactiveShift), static_cast<uint32_t>(decisions.ReactiveKind));
+    static_assert(sizeof(PicaUberEffectBlock) == 160U);
+}
+
+TEST(Oot3dPicaUberEffectProgram, DecisionsRecordTheDeclaredGuideOutputs) {
+    using namespace Fast::Oot3d;
+    PicaShaderPipelineCache cache;
+    EffectsSettings effects;
+    effects.AmbientOcclusion = AmbientOcclusionMode::Mxao;
+    auto request = VertexLitWorldRequest();
+    cache.BeginFrame(1U);
+    const auto& variant = cache.Resolve(request, effects);
+    ASSERT_FALSE(variant.IsCanonical());
+    // The superset program declares every guide; its pipeline writes only
+    // the attachments the specialized program declares.
+    for (uint32_t location = 1U; location < 8U; ++location) {
+        const bool declared = variant.FragmentShaderSource.find(
+            "layout(location=" + std::to_string(location) + ") out") != std::string_view::npos;
+        EXPECT_EQ((variant.Decisions.Outputs & (1U << location)) != 0U, declared) << location;
+    }
+    EXPECT_NE(variant.Decisions.Outputs & (1U << 1U), 0U);
+}
+
+TEST(Oot3dPicaShaderPipelineCache, NormalGuideReadsTheAuthoredVertexNormalInEveryLightingMode) {
+    using namespace Fast::Oot3d;
+    PicaShaderPipelineCache cache;
+    EffectsSettings effects;
+    effects.AmbientOcclusion = AmbientOcclusionMode::Mxao;
+    auto request = VertexLitWorldRequest();
+    cache.BeginFrame(1U);
+    const auto typed = cache.Resolve(request, effects);
+    // Native lighting: no per-pixel relighting, yet the guide no longer falls
+    // back to the geometric normal of the depth derivatives.
+    EXPECT_FALSE(HasPicaShaderInstrumentationFeature(typed.AppliedFeatures,
+                                                     PicaShaderInstrumentationFeature::NativePerPixelLighting));
+    EXPECT_TRUE(typed.TypedNormalGuide);
+    EXPECT_NE(typed.VertexShaderSource.find("layout(location=9) out vec3 pica_surface_normal"), std::string::npos);
+    EXPECT_NE(typed.FragmentShaderSource.find("layout(location=9) in vec3 pica_surface_normal"), std::string::npos);
+    EXPECT_NE(typed.FragmentShaderSource.find(
+                  "oot3d_normal_guide_typed(pica_surface_normal, oot3d_normal_guide_surface(pica_normquat, pica_view, "
+                  "oot3d_view_dx, oot3d_view_dy))"),
+              std::string::npos);
+    // The native colour path is untouched.
+    EXPECT_NE(typed.FragmentShaderSource.find("pica_color = combiner_output;"), std::string::npos);
+#ifdef OOT3D_PIPELINE_CACHE_HAS_SHADERC
+    ExpectCompiles(typed.VertexShaderSource, shaderc_vertex_shader, "typed_normal_guide.vert");
+    ExpectCompiles(typed.FragmentShaderSource, shaderc_fragment_shader, "typed_normal_guide.frag");
+#endif
+
+    // An untyped program keeps the quaternion/geometric guide and its key.
+    auto untyped = request;
+    untyped.TemporalVertexProgram = BaseTemporalVertexProgram();
+    untyped.VertexShaderSource = BaseRequest().VertexShaderSource;
+    const auto& fallback = cache.Resolve(untyped, effects);
+    EXPECT_FALSE(fallback.TypedNormalGuide);
+    EXPECT_NE(fallback.FragmentShaderSource.find(
+                  "pica_normal_guide = vec4(oot3d_normal_guide_surface(pica_normquat, pica_view, oot3d_view_dx, "
+                  "oot3d_view_dy) * 0.5 + 0.5, 1.0);"),
+              std::string::npos);
+    EXPECT_EQ(fallback.FragmentShaderSource.find("pica_surface_normal"), std::string::npos);
+    const size_t derivatives = fallback.FragmentShaderSource.find(kViewDerivativesPrologue);
+    ASSERT_NE(derivatives, std::string::npos);
+    EXPECT_LT(derivatives, fallback.FragmentShaderSource.find("combiner_output"));
+    EXPECT_EQ(fallback.FragmentShaderSource.find("dFdx(to_eye)"), std::string::npos);
+    EXPECT_NE(fallback.FragmentShaderKey, typed.FragmentShaderKey);
+
+    // Without a normal-guide reader the program stays canonical.
+    effects.AmbientOcclusion = AmbientOcclusionMode::Off;
+    cache.BeginFrame(2U);
+    const auto& canonical = cache.Resolve(request, effects);
+    EXPECT_TRUE(canonical.IsCanonical());
+    EXPECT_EQ(canonical.VertexShaderSource, kTypedVertexShader);
+}
+
+TEST(Oot3dPicaShaderPipelineCache, FaceNormalReadersRequestTheGeometryGuide) {
+    using namespace Fast::Oot3d;
+    PicaShaderPipelineCache cache;
+    EffectsSettings effects;
+    effects.AmbientOcclusion = AmbientOcclusionMode::Mxao;
+    effects.MxaoNormals = MxaoNormalSource::Depth;
+    const auto request = VertexLitWorldRequest();
+    cache.BeginFrame(1U);
+    const auto depth = cache.Resolve(request, effects);
+    EXPECT_FALSE(HasPicaShaderInstrumentationFeature(depth.RequestedFeatures,
+                                                     PicaShaderInstrumentationFeature::FaceNormalGuide));
+    const auto depthKey = depth.FragmentShaderKey;
+
+    effects.MxaoNormals = MxaoNormalSource::Geometry;
+    cache.BeginFrame(2U);
+    const auto face = cache.Resolve(request, effects);
+    EXPECT_TRUE(HasPicaShaderInstrumentationFeature(face.RequestedFeatures,
+                                                    PicaShaderInstrumentationFeature::FaceNormalGuide));
+    EXPECT_NE(face.FragmentShaderKey, depthKey);
+
+    // The debug views that show face normals read them too; MXAO is their
+    // only reader.
+    effects.MxaoNormals = MxaoNormalSource::Depth;
+    effects.MxaoDebug = MxaoDebugView::FaceDisagreement;
+    EXPECT_TRUE(EffectsReadFaceNormal(effects));
+    effects.MxaoDebug = MxaoDebugView::FaceNormals;
+    EXPECT_TRUE(EffectsReadFaceNormal(effects));
+    effects.MxaoDebug = MxaoDebugView::DepthNormals;
+    EXPECT_FALSE(EffectsReadFaceNormal(effects));
+    effects.MxaoNormals = MxaoNormalSource::Geometry;
+    effects.AmbientOcclusion = AmbientOcclusionMode::Gtao;
+    EXPECT_FALSE(EffectsReadFaceNormal(effects));
+}
+
+TEST(Oot3dPicaShaderPipelineCache, AoTextureReliefBendsTheGuideFromTheColourTexture) {
+    using namespace Fast::Oot3d;
+    PicaShaderPipelineCache cache;
+    EffectsSettings effects;
+    effects.AmbientOcclusion = AmbientOcclusionMode::Gtao;
+    effects.AoRelief = AoTextureRelief::Medium;
+    auto request = VertexLitWorldRequest();
+    request.ReliefTexture = 0U;
+    cache.BeginFrame(1U);
+    const auto relief = cache.Resolve(request, effects);
+    ASSERT_TRUE(HasPicaShaderInstrumentationFeature(relief.AppliedFeatures,
+                                                    PicaShaderInstrumentationFeature::NormalGuideTextureRelief));
+    const auto& source = relief.FragmentShaderSource;
+    const size_t taps = source.find("// OOT3D_AO_TEXTURE_RELIEF");
+    const size_t alphaTest = source.find("discard;");
+    const size_t bend = source.find("pica_normal_guide.rgb = oot3d_relief_normal(");
+    ASSERT_NE(taps, std::string::npos);
+    ASSERT_NE(bend, std::string::npos);
+    // Taps and derivatives precede the native alpha test; the bend follows
+    // the guide assignment it modifies.
+    EXPECT_LT(taps, alphaTest);
+    EXPECT_LT(source.find("pica_normal_guide = vec4("), bend);
+    EXPECT_NE(source.find("fragment_uniforms.texture_lod_bias[0]"), std::string::npos);
+    EXPECT_NE(source.find("2.000000 *"), std::string::npos);
+#ifdef OOT3D_PIPELINE_CACHE_HAS_SHADERC
+    ExpectCompiles(source, shaderc_fragment_shader, "ao_texture_relief.frag");
+#endif
+
+    // Each level is its own variant; Off, no colour texture, a disabled AO,
+    // a blended surface or an integer texture add nothing.
+    effects.AoRelief = AoTextureRelief::Strong;
+    cache.BeginFrame(2U);
+    const auto strongKey = cache.Resolve(request, effects).FragmentShaderKey;
+    EXPECT_NE(strongKey, relief.FragmentShaderKey);
+    effects.AoRelief = AoTextureRelief::Off;
+    cache.BeginFrame(3U);
+    const auto off = cache.Resolve(request, effects);
+    EXPECT_FALSE(HasPicaShaderInstrumentationFeature(off.RequestedFeatures,
+                                                     PicaShaderInstrumentationFeature::NormalGuideTextureRelief));
+    EXPECT_EQ(off.FragmentShaderSource.find("oot3d_relief"), std::string::npos);
+    effects.AoRelief = AoTextureRelief::Medium;
+    cache.BeginFrame(4U);
+    auto without = request;
+    without.ReliefTexture = 0xffU;
+    EXPECT_EQ(cache.Resolve(without, effects).FragmentShaderSource, off.FragmentShaderSource);
+    auto blended = request;
+    blended.Draw.DepthWriteEnabled = false;
+    blended.Draw.Blend = SourceAlphaBlend();
+    EXPECT_FALSE(HasPicaShaderInstrumentationFeature(cache.Resolve(blended, effects).RequestedFeatures,
+                                                     PicaShaderInstrumentationFeature::NormalGuideTextureRelief));
+    auto integer = request;
+    std::string integerSource(kVertexLitFragmentShader);
+    integerSource.replace(integerSource.find("uniform sampler2D pica_texture0"), 31, "uniform usampler2D pica_texture0");
+    integer.FragmentShaderSource = integerSource;
+    integer.FragmentShaderHooks = AnalyzePicaFragmentShaderHooks(integerSource);
+    EXPECT_FALSE(HasPicaShaderInstrumentationFeature(cache.Resolve(integer, effects).AppliedFeatures,
+                                                     PicaShaderInstrumentationFeature::NormalGuideTextureRelief));
+    effects.AmbientOcclusion = AmbientOcclusionMode::Off;
+    effects.Reflections = ReflectionMode::HiZ;
+    cache.BeginFrame(5U);
+    EXPECT_FALSE(HasPicaShaderInstrumentationFeature(cache.Resolve(request, effects).RequestedFeatures,
+                                                     PicaShaderInstrumentationFeature::NormalGuideTextureRelief));
 }
 
 TEST(Oot3dPicaShaderPipelineCache,
@@ -876,6 +1440,46 @@ TEST(Oot3dPicaShaderPipelineCache,
 }
 
 TEST(Oot3dPicaShaderPipelineCache,
+     OpaqueGuideWritersOverwriteTheMaterialGuide) {
+    // The material attachment is in every opaque guide writer's write mask;
+    // a draw without reflectivity must still overwrite it, or an earlier
+    // presented sample's values survive where it draws.
+    using namespace Fast::Oot3d;
+    PicaShaderPipelineCache cache;
+    EffectsSettings effects;
+    effects.Reflections = ReflectionMode::HiZ;
+    auto request = BaseRequest();
+    // A typed fragment whose TEV never reads the specular colour.
+    static constexpr std::string_view kFragment =
+        "#version 450\n"
+        "layout(location=0) out vec4 pica_color;\n"
+        "void main() {\n"
+        "    vec4 secondary_fragment_color = vec4(0.25);\n"
+        "    vec4 combiner_output = vec4(0.5);\n"
+        "    pica_color = combiner_output;\n"
+        "}\n";
+    request.FragmentShaderSource = kFragment;
+    request.FragmentShaderHooks = AnalyzePicaFragmentShaderHooks(kFragment);
+    cache.BeginFrame(18U);
+    const auto& opaque = cache.Resolve(request, effects);
+    EXPECT_NE(opaque.ReflectionEligibility, PicaReflectionMaterialEligibility::Eligible);
+    EXPECT_NE(opaque.FragmentShaderSource.find("layout(location=2) out vec4 pica_material_guide"),
+              std::string::npos);
+    EXPECT_NE(opaque.FragmentShaderSource.find("OOT3D material guide baseline"), std::string::npos);
+    const uint64_t opaqueKey = opaque.FragmentShaderKey;
+
+    // Nothing to overwrite without depth writes; no material consumer, no output.
+    request.Draw.DepthWriteEnabled = false;
+    EXPECT_EQ(cache.Resolve(request, effects).FragmentShaderSource.find("pica_material_guide"),
+              std::string::npos);
+    request.Draw.DepthWriteEnabled = true;
+    effects.Reflections = ReflectionMode::Off;
+    const auto& plain = cache.Resolve(request, effects);
+    EXPECT_EQ(plain.FragmentShaderSource.find("pica_material_guide"), std::string::npos);
+    EXPECT_NE(plain.FragmentShaderKey, opaqueKey);
+}
+
+TEST(Oot3dPicaShaderPipelineCache,
      ExplicitReflectionProfileDoesNotRequireTevSpecular) {
     using namespace Fast::Oot3d;
     PicaShaderPipelineCache cache;
@@ -883,7 +1487,7 @@ TEST(Oot3dPicaShaderPipelineCache,
     effects.Reflections = ReflectionMode::HiZ;
     auto request = BaseRequest();
     request.ReflectionProfile =
-        ReflectionMaterialParameters{0.78F, 0.10F, 0.75F};
+        ReflectionMaterialParameters{0.78F, 0.10F};
     cache.BeginFrame(17U);
 
     const auto& reflected = cache.Resolve(request, effects);
@@ -1004,67 +1608,48 @@ TEST(Oot3dPicaShaderInstrumentation,
 }
 
 TEST(Oot3dPicaShaderInstrumentation,
-     TypedComposerMatchesTheSupportedLegacyFragmentSequence) {
+     OverlaysAttenuateTheGlobalIlluminationCoverage) {
     using namespace Fast::Oot3d;
     static constexpr std::string_view kFragmentShader = R"glsl(#version 450
-layout(location=5) in vec4 pica_normquat;
 layout(location=0) out vec4 pica_color;
-layout(location=2) out vec4 pica_material_guide;
 void main() {
-    vec4 primary_fragment_color = vec4(0.75);
-    vec4 secondary_fragment_color = vec4(0.25);
+    vec3 normal = vec3(0.0, 0.0, 1.0);
     // OOT3D_PICA_MATERIAL_TOON_POINT
-    secondary_fragment_color.rgb *= vec3(1.0);
-    float oot3d_specular_signal = clamp(max(max(secondary_fragment_color.r, secondary_fragment_color.g), secondary_fragment_color.b) * 4.0, 0.0, 1.0);
-    pica_material_guide = vec4(oot3d_specular_signal, clamp(1.0 - oot3d_specular_signal * 0.75, 0.08, 1.0), 1.0, 0.0);
-    vec3 oot3d_ao_response_rgb = vec3(0.75);
-    // OOT3D_PICA_AMBIENT_OCCLUSION_GUIDE_READY
-    pica_color = vec4(1.0);
+    pica_color = vec4(1.0, 1.0, 1.0, 0.5);
 }
 )glsl";
-
-    const auto composed = BuildPicaFragmentInstrumentationVariant({
+    const auto hooks = AnalyzePicaFragmentShaderHooks(kFragmentShader);
+    PicaFragmentInstrumentationRequest request{
         kFragmentShader,
-        71U,
-        PicaShaderInstrumentationFeature::DirectionalShadowLighting |
-            PicaShaderInstrumentationFeature::AmbientOcclusionGuide |
-            PicaShaderInstrumentationFeature::SceneDomainGuide |
-            PicaShaderInstrumentationFeature::ReflectionMaterialGuide |
-            PicaShaderInstrumentationFeature::ReactiveMask |
-            PicaShaderInstrumentationFeature::RigidMotionGuide,
-        {400U, 240U, 0U, true, true, SourceAlphaBlend(), 0xFU,
+        92U,
+        PicaShaderInstrumentationFeature::SceneDomainGuide,
+        {320U, 240U, 0U, true, false, SourceAlphaBlend(), 0x0fU,
          Oot3d::Renderer::PicaCompositionDomain::Scene},
-        {true, false},
+        {false, false, true},
         nullptr,
-    });
+        &hooks,
+    };
+    const auto blended = BuildPicaFragmentInstrumentationVariant(request);
+    ASSERT_TRUE(blended.Applied());
+    EXPECT_TRUE(blended.Outputs.SceneDomainAlbedoOverlay);
+    EXPECT_FALSE(blended.Outputs.SceneDomainAmbientOverlay);
+    EXPECT_NE(blended.Source.find("layout(location=7) out vec4 pica_diffuse_albedo_guide"), std::string::npos);
+    EXPECT_NE(blended.Source.find("pica_diffuse_albedo_guide = vec4(0.0, 0.0, 0.0, pica_color.a)"),
+              std::string::npos);
 
-    ASSERT_TRUE(composed.Applied());
-    EXPECT_NE(composed.Source.find(
-                  "uniform sampler2D oot3d_directional_shadow_map"),
-              std::string::npos);
-    EXPECT_NE(composed.Source.find(
-                  "primary_fragment_color.rgb *= "
-                  "oot3d_directional_shadow_visibility()"),
-              std::string::npos);
-    EXPECT_NE(composed.Source.find("pica_ambient_guide"),
-              std::string::npos);
-    EXPECT_NE(composed.Source.find("pica_material_guide"),
-              std::string::npos);
-    EXPECT_NE(composed.Source.find("pica_rigid_motion_guide"),
-              std::string::npos);
-    EXPECT_NE(composed.FragmentKey, 71U);
-    EXPECT_EQ(composed.DirectionalShadowEligibility,
-              PicaDirectionalShadowLightingEligibility::FragmentPrimary);
-    EXPECT_EQ(composed.AmbientGuideEligibility,
-              PicaAmbientOcclusionGuideEligibility::AppliedExact);
-    EXPECT_EQ(composed.ReflectionEligibility,
-              PicaReflectionMaterialEligibility::Eligible);
-    EXPECT_EQ(composed.ReactiveCoverage,
-              PicaReactiveCoverage::SourceAlpha);
-    EXPECT_TRUE(composed.Reactive);
-    EXPECT_TRUE(composed.RigidMotionApplied);
-    EXPECT_TRUE(composed.Outputs.WritesAmbientGuide);
-    EXPECT_FALSE(composed.Outputs.SceneDomainBlendedOverlay);
+    // An opaque overlay (no depth write) replaces the surface: coverage 0.
+    request.Draw.Blend = {};
+    const auto opaque = BuildPicaFragmentInstrumentationVariant(request);
+    EXPECT_TRUE(opaque.Outputs.SceneDomainAlbedoOverlay);
+    EXPECT_NE(opaque.Source.find("pica_diffuse_albedo_guide = vec4(0.0, 0.0, 0.0, 0.0)"), std::string::npos);
+    EXPECT_NE(opaque.FragmentKey, blended.FragmentKey);
+
+    // Without GI the overlay leaves the albedo guide alone.
+    request.SceneDomainFeatures = {true, false, false};
+    request.Draw.Blend = SourceAlphaBlend();
+    const auto ambientOnly = BuildPicaFragmentInstrumentationVariant(request);
+    EXPECT_FALSE(ambientOnly.Outputs.SceneDomainAlbedoOverlay);
+    EXPECT_EQ(ambientOnly.Source.find("pica_diffuse_albedo_guide"), std::string::npos);
 }
 
 TEST(Oot3dPicaShaderInstrumentation,
@@ -1158,7 +1743,7 @@ void main() {
                                  firstLocation + 1U),
               std::string::npos);
     const size_t motionWrite = result.Source.find(
-        "pica_rigid_motion_guide = vec4(oot3d_motion.xy");
+        "pica_rigid_motion_guide = oot3d_motion");
     const size_t depthWrite = result.Source.find(
         "pica_rigid_motion_guide.a = pica_color.a");
     ASSERT_NE(motionWrite, std::string::npos);
@@ -1232,7 +1817,7 @@ TEST(Oot3dPicaShaderPipelineCache,
     EffectsSettings effects;
     effects.Toon = ToonMode::PicaMaterial;
     effects.ToonStyle.OutlineEnabled = true;
-    effects.AmbientOcclusion = AmbientOcclusionMode::Cacao;
+    effects.AmbientOcclusion = AmbientOcclusionMode::Gtao;
     effects.Reflections = ReflectionMode::FidelityFxSssr;
     auto request = BaseRequest();
     request.Draw.CompositionDomain =
@@ -1258,8 +1843,9 @@ TEST(Oot3dPicaShaderInstrumentation,
     EffectsSettings effects;
     effects.Toon = ToonMode::PicaMaterial;
     effects.ToonStyle.OutlineEnabled = true;
-    effects.AmbientOcclusion = AmbientOcclusionMode::Cacao;
+    effects.AmbientOcclusion = AmbientOcclusionMode::Gtao;
     effects.Reflections = ReflectionMode::FidelityFxSssr;
+    effects.SurfaceLighting = SurfaceLightingMode::PerPixel;
     const auto features = ResolvePicaShaderProfileFeatures(
         effects, true, true);
 
@@ -1319,8 +1905,46 @@ void helper() { }
     EXPECT_LT(assignment, composedHelper);
 }
 
+TEST(Oot3dPicaShaderPipelineCache, AtmosphereDoesNotInheritWorldRelightingFromSharedPrograms) {
+    using namespace Fast::Oot3d;
+    using namespace Fast::Renderer3ds;
+    auto request = BaseRequest();
+    request.SurfaceLightingAvailable = true;
+    request.Draw.DirectionalShadowReceiver = true;
+    request.Pbr.TextureSlot = 0;
+    auto& surface = request.TemporalVertexProgram.Hooks.Surface;
+    surface.ViewNormalTemporary = 14;
+    surface.LightingBooleanUniform = 9;
+    surface.DiffuseUniform = 8;
+    surface.AmbientUniform = 9;
+    surface.TintBooleanUniform = 5;
+    surface.TintInputRegister = 2;
+    surface.TintScale = {90, 2};
+    surface.LightEnabledValue = {93, 1};
+    surface.LightDirectionUniforms = {80, 83, 86};
+    request.FragmentShaderHooks.Offsets[static_cast<size_t>(PicaShaderHook::PicaLighting)] = 0;
+    request.FragmentShaderHooks.Offsets[static_cast<size_t>(PicaShaderHook::AfterNativeTev)] = 0;
+    request.FragmentShaderHooks.Semantics |= PicaShaderSemantic::PrimaryColorInput | PicaShaderSemantic::ViewVector;
+    EffectsSettings effects;
+    effects.SurfaceLighting = SurfaceLightingMode::PerPixelPbr;
+    const auto relights = [&] {
+        return HasPicaShaderInstrumentationFeature(ResolvePicaDrawInstrumentationFeatures(request, effects),
+                                                   PicaShaderInstrumentationFeature::NativePerPixelLighting);
+    };
+    ASSERT_TRUE(relights());
+    request.Draw.CompositionLayer = PicaCompositionLayer::Atmosphere;
+    const auto atmosphere = ResolvePicaDrawInstrumentationFeatures(request, effects);
+    EXPECT_FALSE(HasPicaShaderInstrumentationFeature(atmosphere, PicaShaderInstrumentationFeature::NativePerPixelLighting));
+    EXPECT_FALSE(HasPicaShaderInstrumentationFeature(atmosphere, PicaShaderInstrumentationFeature::PbrMaterial));
+    EXPECT_FALSE(HasPicaShaderInstrumentationFeature(atmosphere, PicaShaderInstrumentationFeature::DirectionalShadowLighting));
+    request.Draw.CompositionLayer = PicaCompositionLayer::TransparentWorld;
+    EXPECT_TRUE(relights());
+    request.Draw.CompositionLayer = PicaCompositionLayer::Unknown;
+    EXPECT_FALSE(relights());
+}
+
 TEST(Oot3dPicaShaderInstrumentation,
-     DirectionalShadowLightingRequiresATypedLightingHook) {
+     DirectionalShadowLightingCannotModifyBakedLighting) {
     using namespace Fast::Oot3d;
     static constexpr std::string_view kFragmentShader = R"glsl(#version 450
 layout(location=5) in vec4 pica_normquat;
@@ -1340,117 +1964,144 @@ void main() { pica_color = vec4(1.0); }
     EXPECT_TRUE(composed.Source.empty());
     EXPECT_EQ(composed.FragmentKey, 79U);
     EXPECT_EQ(composed.DirectionalShadowEligibility,
-              PicaDirectionalShadowLightingEligibility::UnsupportedShader);
+              PicaDirectionalShadowLightingEligibility::Disabled);
 }
 
-TEST(Oot3dPicaShaderInstrumentation,
-     DirectionalShadowLightingModulatesVertexPrimaryBeforeTev) {
+
+
+TEST(Oot3dPicaShaderInstrumentation, SurfaceShadowsExcludePointsAndPreserveSelectedLightSlots) {
     using namespace Fast::Oot3d;
-    static constexpr std::string_view kFragmentShader = R"glsl(#version 450
-layout(location=0) in vec4 pica_primary_color;
-layout(location=0) out vec4 pica_color;
-void main() {
-    vec4 rounded_primary_color = pica_primary_color;
-    vec4 combiner_output = rounded_primary_color;
-    pica_color = combiner_output;
-}
-)glsl";
-    const auto hooks = AnalyzePicaFragmentShaderHooks(kFragmentShader);
-    ASSERT_TRUE(hooks.Valid());
-    EXPECT_TRUE(hooks.Supports(PicaShaderHook::PicaLighting));
-    EXPECT_TRUE(hooks.Has(PicaShaderSemantic::VertexLightingPoint));
-
-    const auto composed = BuildPicaFragmentInstrumentationVariant({
-        kFragmentShader,
-        83U,
-        PicaShaderInstrumentationFeature::DirectionalShadowLighting,
-        {},
-        {},
-        nullptr,
-    });
-    ASSERT_TRUE(composed.Applied());
-    EXPECT_EQ(composed.DirectionalShadowEligibility,
-              PicaDirectionalShadowLightingEligibility::VertexPrimary);
-    const size_t shadow = composed.Source.find(
-        "rounded_primary_color.rgb *= "
-        "oot3d_directional_shadow_visibility()");
-    const size_t tev = composed.Source.find(
-        "vec4 combiner_output = rounded_primary_color");
-    ASSERT_NE(shadow, std::string::npos);
-    ASSERT_NE(tev, std::string::npos);
-    EXPECT_LT(shadow, tev);
-    EXPECT_NE(composed.Source.find(
-                  "oot3d_directional_shadow_axis_weight"),
-              std::string::npos);
-    EXPECT_NE(composed.Source.find("weighted_occlusion"),
-              std::string::npos);
-    EXPECT_EQ(composed.Source.find("samples += 1.0"),
-              std::string::npos);
-    EXPECT_EQ(composed.Source.find("pica_normal_guide"),
-              std::string::npos);
-}
-
-TEST(Oot3dPicaShaderInstrumentation,
-     DirectionalShadowReceiverUsesTypedHistoryAndCurrentView) {
-    using namespace Fast::Oot3d;
-    auto currentViewToWorld = IdentityDirectionalShadowMatrix();
-    currentViewToWorld[12] = 5.0F;
+    auto view = IdentityDirectionalShadowMatrix();
+    view[0] = view[5] = 0.0F;
+    view[1] = 1.0F;
+    view[4] = -1.0F;
     PicaDirectionalShadowHistoryState history;
-    history.WorldToShadowTexture = IdentityDirectionalShadowMatrix();
-    history.ProducedFrameId = 7U;
-    history.Resolution = 1024U;
-    history.Strength = 0.8F;
-    history.DepthBias = 0.002F;
-    history.PcfRadius = 4U;
+    history.ProducedFrameId = 1U;
+    history.Virtual = Fast::Renderer3ds::BuildVirtualShadowLayout({}, {0, 1, 0}, 2048, 65536);
     history.WorldLightDirectionTowardSource = {0.0F, 1.0F, 0.0F};
-    PicaNativeLightingState lighting;
-    lighting.Available = true;
-    lighting.Enabled = true;
-    lighting.ActiveLightCount = 1U;
-    lighting.Lights[0].Valid = true;
-    lighting.Lights[0].DirectionViewTowardSource = {0.0F, 1.0F, 0.0F};
-    lighting.Lights[0].Diffuse = {};
-    lighting.Lights[0].Ambient = {0.25F, 0.50F, 0.75F};
-
-    const auto binding = BuildPicaDirectionalShadowReceiverBinding(
-        currentViewToWorld, lighting, false, history);
+    history.NormalBias = 1.5F;
+    std::array<PicaSurfaceShadowLight, 4> lights{{
+        {{1.0F, 0.0F, 0.0F}, 0U, true, true},
+        {{1.0F, 0.0F, 0.0F}, 2U, true, false},
+        {{1.0F, 0.0F, 0.0F}, 5U, false, false},
+        {{0.0F, 1.0F, 0.0F}, 7U, true, false},
+    }};
+    const auto binding = BuildPicaSurfaceShadowReceiverBinding(view, lights, history);
     ASSERT_TRUE(binding.Bound());
-    EXPECT_EQ(binding.Classification,
-              PicaDirectionalShadowReceiverClass::AmbientOnly);
-    EXPECT_EQ(binding.Contribution,
-              PicaDirectionalShadowReceiverContribution::BakedRigidMaterial);
-    const auto& uniforms = binding.Uniforms;
-    EXPECT_FLOAT_EQ(uniforms.ViewToShadowTexture[12], 5.0F);
-    EXPECT_FLOAT_EQ(uniforms.ShadowState[0], 0.8F);
-    EXPECT_FLOAT_EQ(uniforms.ShadowState[1], 1.0F / 1024.0F);
-    EXPECT_FLOAT_EQ(uniforms.ShadowState[2], 0.0F);
-    EXPECT_FLOAT_EQ(uniforms.ShadowState[3], 0.002F);
-    EXPECT_FLOAT_EQ(uniforms.ShadowedDirectFraction[0], 1.0F);
-    EXPECT_FLOAT_EQ(uniforms.ShadowedDirectFraction[1], 1.0F);
-    EXPECT_FLOAT_EQ(uniforms.ShadowedDirectFraction[2], 1.0F);
-    EXPECT_EQ(uniforms.Extent[0], 1024U);
-    EXPECT_EQ(uniforms.Extent[1], 1024U);
-    EXPECT_EQ(uniforms.Extent[2], 2U);
-    EXPECT_EQ(uniforms.Extent[3], 1U);
+    EXPECT_EQ(binding.Uniforms.Receiver[3], 4.0F);
+    // The smooth receivers' normal bias.
+    EXPECT_EQ(binding.Uniforms.Receiver[0], 1.5F);
+    lights[1].Enabled = false;
+    EXPECT_FALSE(BuildPicaSurfaceShadowReceiverBinding(view, lights, history).Bound());
+}
 
-    const auto skinned = BuildPicaDirectionalShadowReceiverBinding(
-        currentViewToWorld, lighting, true, history);
-    EXPECT_FALSE(skinned.Bound());
-    EXPECT_EQ(skinned.Classification,
-              PicaDirectionalShadowReceiverClass::AmbientOnly);
+TEST(Oot3dPicaShaderInstrumentation, AuthoredLightStaysWorldFixedWithCameraFoldedIntoBones) {
+    using namespace Fast::Renderer3ds;
+    auto hooks = ShadowCasterHooks();
+    hooks.Transform = {PicaVertexTransformOperation::ModelViewProjection3x4,
+                       0, 4, 4, 3, 20, 3, 0, 1};
+    hooks.Surface.ViewNormalTemporary = 14;
+    hooks.Surface.LightingBooleanUniform = 9;
+    hooks.Surface.DiffuseUniform = 8;
+    hooks.Surface.AmbientUniform = 9;
+    hooks.Surface.TintBooleanUniform = 5;
+    hooks.Surface.TintInputRegister = 2;
+    hooks.Surface.TintScale = {90, 2};
+    hooks.Surface.LightEnabledValue = {93, 1};
+    hooks.Surface.LightDirectionUniforms = {80, 83, 86};
+    std::array<std::array<float, 4>, 96> uniforms{};
+    uniforms[4][0] = uniforms[5][1] = uniforms[6][2] = 1.0F;
+    uniforms[93][1] = 1.0F;
+    const std::span<const uint8_t> bytes{
+        reinterpret_cast<const uint8_t*>(uniforms.data()), sizeof(uniforms)};
+    PicaEnvironmentLighting environment;
+    environment.Enabled = true;
+    environment.Lights[0].DirectionTowardSource = {1, 0, 0};
+    environment.Lights[0].Intensity = 1;
+    // The native post-transform stays identity while the camera is baked into
+    // the model/bone palette. A +X world-facing surface must remain fully lit.
+    for (float yaw : {0.0F, 1.57079632679F, 3.14159265359F}) {
+        auto camera = Fast::Oot3d::IdentityDirectionalShadowMatrix();
+        const float c = std::cos(yaw), s = std::sin(yaw);
+        camera[0] = camera[10] = c;
+        camera[2] = -s;
+        camera[8] = s;
+        const auto view = BuildPicaSurfaceLightingView(camera);
+        ASSERT_TRUE(view);
+        const auto light = BuildPicaSurfaceLightingUniforms(hooks, 0, bytes, {}, environment, &*view);
+        ASSERT_TRUE(light);
+        const auto& direction = light->EnvironmentDirections[0];
+        const float diffuse = c * direction[0] - s * direction[2];
+        EXPECT_NEAR(diffuse, 1.0F, 1.0e-6F);
+        // Shadow matching must recover the same world-space key, not a
+        // camera-relative direction that changes with the actor's view.
+        Fast::Oot3d::DirectionalShadowMatrix inverse{};
+        ASSERT_TRUE(Fast::Oot3d::InvertDirectionalShadowMatrix(camera, inverse));
+        const std::array<Fast::Oot3d::PicaSurfaceShadowLight, 1> sources{{
+            {{direction[0], direction[1], direction[2]}, 8, true, false}}};
+        Fast::Oot3d::PicaDirectionalShadowHistoryState history;
+        history.ProducedFrameId = 1;
+        history.Virtual = Fast::Renderer3ds::BuildVirtualShadowLayout({}, {1, 0, 0}, 2048, 65536);
+        history.WorldLightDirectionTowardSource = {1, 0, 0};
+        EXPECT_TRUE(Fast::Oot3d::BuildPicaSurfaceShadowReceiverBinding(inverse, sources, history).Bound());
+    }
+    EXPECT_FALSE(BuildPicaSurfaceLightingUniforms(hooks, 0, bytes, {}, environment, nullptr));
+    environment.Enabled = false;
+    EXPECT_TRUE(BuildPicaSurfaceLightingUniforms(hooks, 0, bytes, {}, environment, nullptr));
+}
 
-    lighting.Lights[0].Diffuse = {0.75F, 0.50F, 0.25F};
-    const auto nativeDirect = BuildPicaDirectionalShadowReceiverBinding(
-        currentViewToWorld, lighting, false, history);
-    EXPECT_FALSE(nativeDirect.Bound());
-    EXPECT_EQ(nativeDirect.Classification,
-              PicaDirectionalShadowReceiverClass::DirectMatched);
-
-    history = {};
-    const auto neutral = BuildPicaDirectionalShadowReceiverBinding(
-        currentViewToWorld, lighting, false, history);
-    EXPECT_FALSE(neutral.Bound());
-    EXPECT_EQ(neutral.Uniforms.Extent[3], 0U);
+TEST(Oot3dPicaShaderInstrumentation, AuthoredLightingPreservesNativeMaterialReflectance) {
+    using namespace Fast::Renderer3ds;
+    auto hooks = ShadowCasterHooks();
+    hooks.Transform = {PicaVertexTransformOperation::ModelViewProjection3x4,
+                       0, 4, 4, 3, 20, 3, 0, 1};
+    hooks.Surface.ViewNormalTemporary = 14;
+    hooks.Surface.LightingBooleanUniform = 9;
+    hooks.Surface.DiffuseUniform = 8;
+    hooks.Surface.AmbientUniform = 9;
+    hooks.Surface.TintBooleanUniform = 5;
+    hooks.Surface.TintInputRegister = 2;
+    hooks.Surface.TintScale = {90, 2};
+    hooks.Surface.LightEnabledValue = {93, 1};
+    hooks.Surface.LightDirectionUniforms = {80, 83, 86};
+    std::array<std::array<float, 4>, 96> uniforms{};
+    uniforms[8] = {0.5F, 0.25F, 0.0F, 1.0F};
+    uniforms[9] = {0.4F, 0.4F, 0.4F, 0.0F};
+    uniforms[93][1] = 1.0F;
+    const std::span<const uint8_t> bytes{
+        reinterpret_cast<const uint8_t*>(uniforms.data()), sizeof(uniforms)};
+    PicaEnvironmentLighting environment;
+    environment.Enabled = true;
+    environment.AmbientIntensity = 0.2F;
+    environment.Lights[0].DirectionTowardSource = {1, 0, 0};
+    environment.Lights[0].Color = {1.0F, 0.8F, 0.6F};
+    environment.Lights[0].Intensity = 1.0F;
+    const auto view = BuildPicaSurfaceLightingView(Fast::Oot3d::IdentityDirectionalShadowMatrix());
+    ASSERT_TRUE(view);
+    const auto evaluate = [&] {
+        const auto light = BuildPicaSurfaceLightingUniforms(hooks, 512U, bytes, {}, environment, &*view);
+        EXPECT_TRUE(light);
+        std::array<float, 3> color{};
+        if (light) {
+            for (size_t channel = 0; channel < color.size(); ++channel)
+                // Facing the key, texture 0.25, native TEV gain 2.
+                color[channel] = 0.5F * (light->EnvironmentColors[0][channel] *
+                    light->EnvironmentDirections[0][3] + light->EnvironmentAmbient[channel]);
+        }
+        return color;
+    };
+    const auto lit = evaluate();
+    EXPECT_NEAR(lit[0], 0.29F, 1.0e-6F);
+    EXPECT_NEAR(lit[1], 0.14F, 1.0e-6F);
+    EXPECT_NEAR(lit[2], 0.04F, 1.0e-6F); // A black diffuse channel must not become white.
+    uniforms[8] = {};
+    uniforms[9] = {1.0F, 1.0F, 1.0F, 0.0F};
+    const auto ambientOnly = evaluate();
+    EXPECT_NEAR(ambientOnly[0], 0.6F, 1.0e-6F);
+    EXPECT_NEAR(ambientOnly[1], 0.5F, 1.0e-6F);
+    EXPECT_NEAR(ambientOnly[2], 0.4F, 1.0e-6F);
+    uniforms[9] = {};
+    EXPECT_EQ(evaluate(), (std::array<float, 3>{}));
 }
 
 } // namespace

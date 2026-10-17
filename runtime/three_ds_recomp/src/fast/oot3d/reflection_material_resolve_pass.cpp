@@ -4,6 +4,7 @@
 
 #include "fast/oot3d/nri_interop_context.h"
 #include "fast/oot3d/nri_effect_graph_transient_image_arena.h"
+#include "fast/oot3d/nri_storage_clear_binding.h"
 #include "fast/oot3d/reflection_ibl.h"
 #include "fast/oot3d/reflection_ibl_pass.h"
 #include "fast/oot3d/resource_state_tracker.h"
@@ -29,8 +30,12 @@ struct ResolvePush {
     uint32_t Height = 0;
     float RoughnessBias = 0.0F;
     uint32_t SurfaceOrientation = 0;
+    uint32_t FillScreenSpaceMisses = 0;
+    float FallbackScale = 1.0F;
+    uint32_t OutputSrgb = 0;
+    uint32_t Reserved = 0;
 };
-static_assert(sizeof(ResolvePush) == 80U);
+static_assert(sizeof(ResolvePush) == 96U);
 
 std::vector<uint32_t> Compile(Renderer::CachedPassShaderCompiler& shaders) {
     return shaders.Resolve(BuildReflectionMaterialResolveComputeShader(), Renderer::SpirvStage::Compute, "oot3d_reflection_material_resolve.comp");
@@ -51,6 +56,7 @@ struct ReflectionMaterialResolvePass::Impl {
 #endif
     NriOwnedTexture2D Output{};
     ResourceStateTracker* States = nullptr;
+    NriStorageClearBinding Clear;
     uint32_t Width = 0;
     uint32_t Height = 0;
     bool Ready = false;
@@ -137,6 +143,7 @@ bool ReflectionMaterialResolvePass::Initialize(
         pipeline.shader.stage = nri::StageBits::COMPUTE_SHADER;
         pipeline.shader.bytecode = shader.data();
         pipeline.shader.size = shader.size() * sizeof(uint32_t);
+        pipeline.cache = NriInteropAccess::PipelineCache(interop);
         if (mImpl->Core->CreateComputePipeline(
                 *nriDevice, pipeline, mImpl->Pipeline) !=
             nri::Result::SUCCESS)
@@ -156,6 +163,8 @@ bool ReflectionMaterialResolvePass::Initialize(
             nri::Result::SUCCESS)
             throw std::runtime_error(
                 "reflection material resolve sampler creation failed");
+        if (!mImpl->Clear.Initialize(interop))
+            throw std::runtime_error(mImpl->Clear.UnavailableReason());
         mImpl->Ready = true;
         mImpl->Reason.clear();
         return true;
@@ -189,7 +198,7 @@ bool ReflectionMaterialResolvePass::Configure(
     return false;
 #else
     if (mImpl->Width != 0U &&
-        vkDeviceWaitIdle(mImpl->Device) != VK_SUCCESS) {
+        !mImpl->Interop->CompleteRecordedWork()) {
         mImpl->Reason =
             "reflection material resolve resize wait failed";
         return false;
@@ -242,7 +251,8 @@ bool ReflectionMaterialResolvePass::Execute(
     VkImage brdfImage, VkFormat brdfFormat,
     const PerspectiveViewState& view, float roughnessBias,
     const EffectPassBarrierPlan& barrierPlan,
-    std::optional<PicaSurfaceCoordinates> coordinates) {
+    std::optional<PicaSurfaceCoordinates> coordinates,
+    ReflectionResolveLayering layering) {
     const auto* outputBarrier = barrierPlan.Find(
         EffectResource::ReflectionColor);
     if (mImpl->Width == 0U || mImpl->States == nullptr ||
@@ -340,6 +350,9 @@ bool ReflectionMaterialResolvePass::Execute(
     push.Width = mImpl->Width;
     push.Height = mImpl->Height;
     push.RoughnessBias = roughnessBias;
+    push.FillScreenSpaceMisses = layering.FillScreenSpaceMisses ? 1U : 0U;
+    push.FallbackScale = layering.FallbackScale;
+    push.OutputSrgb = layering.OutputSrgb ? 1U : 0U;
     mImpl->Core->CmdSetDescriptorPool(*command, *mImpl->Pool);
     mImpl->Core->CmdSetPipelineLayout(
         *command, nri::BindPoint::COMPUTE, *mImpl->Layout);
@@ -372,6 +385,49 @@ bool ReflectionMaterialResolvePass::Execute(
 #endif
 }
 
+bool ReflectionMaterialResolvePass::ClearOutput(
+    uint32_t frameIndex, const EffectPassBarrierPlan& barrierPlan) {
+    const auto* outputBarrier = barrierPlan.Find(
+        EffectResource::ReflectionColor);
+    if (mImpl->Width == 0U || mImpl->States == nullptr ||
+        !barrierPlan.Valid() || outputBarrier == nullptr ||
+        !outputBarrier->Managed()) {
+        mImpl->Reason =
+            "reflection material resolve output is not configured";
+        return false;
+    }
+#ifndef ENABLE_OOT3D_NRI
+    (void)frameIndex;
+    return false;
+#else
+    mImpl->BarriersUsed = false;
+    mImpl->LastBarrierExecution = barrierPlan.BeginOutputExecution(
+        EffectResource::ReflectionColor);
+    const auto transition = [&](ResourceAccess access) {
+        const auto change = mImpl->States->PlanTransition(
+            reinterpret_cast<uintptr_t>(mImpl->Output.Image),
+            {access, 0});
+        if (!NriInteropAccess::CmdTextureBarrier(
+                *mImpl->Interop, frameIndex, mImpl->Output.Image,
+                change))
+            return false;
+        mImpl->LastBarrierExecution.RecordGraphTransition(change);
+        mImpl->States->Commit(change);
+        return true;
+    };
+    if (!transition(ResourceAccess::StorageClear) ||
+        !mImpl->Clear.ClearUint32(frameIndex, mImpl->Output.Image, 0U) ||
+        !transition(outputBarrier->CompletionAccess)) {
+        mImpl->Reason =
+            "reflection material resolve output clear failed";
+        return false;
+    }
+    mImpl->BarriersUsed = true;
+    mImpl->Reason.clear();
+    return true;
+#endif
+}
+
 void ReflectionMaterialResolvePass::InvalidateScreenResources() {
 #ifdef ENABLE_OOT3D_NRI
     if (mImpl->Core != nullptr && mImpl->Pool != nullptr)
@@ -389,6 +445,7 @@ void ReflectionMaterialResolvePass::InvalidateScreenResources() {
 
 void ReflectionMaterialResolvePass::Shutdown() {
     InvalidateScreenResources();
+    mImpl->Clear.Shutdown();
 #ifdef ENABLE_OOT3D_NRI
     if (mImpl->Core != nullptr) {
         if (mImpl->Sampler != nullptr)

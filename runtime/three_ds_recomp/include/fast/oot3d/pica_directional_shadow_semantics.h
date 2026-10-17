@@ -16,6 +16,8 @@ struct PicaDirectionalShadowLightSelection {
     uint32_t ClusterCount = 0U;
     uint8_t ReferenceLightIndex = 0U;
     float GeometryLightWeight = 0.0F;
+    // The scene's decision for its caster (0-1): horizon and handover fades.
+    float ShadowStrength = 1.0F;
 
     [[nodiscard]] bool Valid() const noexcept {
         return ReferenceDraw != nullptr && GeometryLightWeight > 0.0F;
@@ -41,6 +43,18 @@ struct PicaDirectionalShadowReceiverLight {
                PicaDirectionalShadowReceiverClass::DirectMatched;
     }
 };
+
+struct PicaSurfaceShadowLight {
+    DirectionalShadowVector DirectionViewTowardSource{};
+    uint8_t ShaderSlot = 0;
+    bool Enabled = false;
+    bool Point = false;
+};
+
+[[nodiscard]] uint16_t ResolvePicaSurfaceDirectionalShadowMask(
+    std::span<const PicaSurfaceShadowLight> lights,
+    const DirectionalShadowMatrix& viewToWorld,
+    const DirectionalShadowVector& worldDirectionTowardSource) noexcept;
 
 [[nodiscard]] PicaDirectionalShadowLightSelection
 ResolvePicaDirectionalShadowLightSelection(

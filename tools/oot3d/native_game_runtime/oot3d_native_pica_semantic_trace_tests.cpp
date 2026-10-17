@@ -74,6 +74,14 @@ int main() {
         };
         plan.VertexShader.TemporalProgram = temporalProgram;
         plan.VertexShader.Uniforms.BooleanMask = (1U << 2U) | (1U << 3U);
+        Oot3dPicaVulkanTextureBinding tracedTexture;
+        tracedTexture.Slot = 0U;
+        tracedTexture.State.Enabled = true;
+        tracedTexture.State.Width = 8U;
+        tracedTexture.State.Height = 8U;
+        tracedTexture.NativeBytes.assign(256U, 0x2AU);
+        tracedTexture.CopyReferences = {{8U, 4U, 0x1F200000U, 256U}};
+        plan.Textures.push_back(std::move(tracedTexture));
         writer.RecordDraw(3U, 2U, draw, plan, false, false, false);
 
         Oot3dPicaDisplayTransferSubmission transfer;
@@ -147,7 +155,59 @@ int main() {
                 drawEvent->at("vertex_program_state").at("skeleton").at("multiple_influences").get<bool>() &&
                 drawEvent->at("vertex_program_state").at("skeleton").at("influence_count") == 4U,
             "draw-local vertex program state is missing");
+    Require(drawEvent->at("textures").size() == 1U &&
+                drawEvent->at("textures")[0].at("copy_references").size() ==
+                    1U &&
+                drawEvent->at("textures")[0]
+                        .at("copy_references")[0]
+                        .at("completion_id") == 8U &&
+                drawEvent->at("textures")[0]
+                        .at("copy_references")[0]
+                        .at("after_draw_submission_id") == 4U &&
+                drawEvent->at("textures")[0]
+                        .at("copy_references")[0]
+                        .at("physical_address") == 0x1F200000U &&
+                drawEvent->at("textures")[0]
+                        .at("copy_references")[0]
+                        .at("byte_count") == 256U,
+            "sampled texture copy provenance is missing from the trace");
+    const auto transferEvent = std::find_if(
+        events.begin(), events.end(), [](const auto& event) {
+            return event.at("event") == "display_transfer";
+        });
+    Require(transferEvent != events.end() &&
+                transferEvent->contains("texture_copy_bytes") &&
+                transferEvent->at("texture_copy_bytes") == 0U &&
+                transferEvent->at("signal_interrupt").get<bool>(),
+            "display transfer must record its raw-copy marker");
     stream.close();
+    const auto rawCopyPath = std::filesystem::temp_directory_path() /
+                             "oot3d_native_pica_semantic_trace_raw_copy_test.jsonl";
+    std::filesystem::remove(rawCopyPath, removeError);
+    {
+        Oot3dPicaDisplayTransferSubmission rawCopy;
+        rawCopy.CompletionId = 8U;
+        rawCopy.Transfer.OutputAddress = 0x1F200000U;
+        rawCopy.Transfer.TextureCopyBytes = 768000U;
+        Oot3dPicaSemanticTraceWriter rawWriter(rawCopyPath);
+        rawWriter.BeginSession("nri", "native30_no_interpolation", "topscreen");
+        rawWriter.RecordDisplayTransfer(4U, 3U, rawCopy, false, false);
+        rawWriter.Finish();
+        std::ifstream rawStream(rawCopyPath);
+        Require(static_cast<bool>(rawStream), "raw-copy trace was not created");
+        bool found = false;
+        for (std::string line; std::getline(rawStream, line);) {
+            const auto event = nlohmann::json::parse(line);
+            if (event.at("event") != "display_transfer") {
+                continue;
+            }
+            found = true;
+            Require(event.at("texture_copy_bytes") == 768000U,
+                    "raw TextureCopy must be identifiable in the transfer history");
+        }
+        Require(found, "raw-copy trace lost its transfer event");
+    }
+    std::filesystem::remove(rawCopyPath, removeError);
     std::filesystem::remove(path, removeError);
     std::cout << "oot3d_native_pica_semantic_trace_tests: ok\n";
     return 0;

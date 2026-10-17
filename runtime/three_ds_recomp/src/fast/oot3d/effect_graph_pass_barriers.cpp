@@ -16,16 +16,23 @@ namespace {
         case EffectResource::AmbientGuide:
         case EffectResource::FogGuide:
         case EffectResource::OutlineGeometryGuide:
+        case EffectResource::DiffuseAlbedoGuide:
             return ResourceAccess::ColorAttachment;
         case EffectResource::NativeDepth:
         case EffectResource::NativeShadow2D:
-        case EffectResource::DirectionalShadowMap:
+        case EffectResource::DirectionalShadowStaticCache:
+        case EffectResource::PointShadowMap:
             return ResourceAccess::DepthAttachment;
+        case EffectResource::DirectionalShadowMap:
+            return ResourceAccess::TransferWrite;
         case EffectResource::PresentationOutput:
+        case EffectResource::SceneComposition:
             return ResourceAccess::ColorAttachment;
         case EffectResource::PicaSceneFrame:
         case EffectResource::NativeSceneView:
+        case EffectResource::PreparedShadowCasters:
         case EffectResource::ExtensionGeometry:
+        case EffectResource::SceneDistanceField:
         case EffectResource::Count:
             return ResourceAccess::Undefined;
         default:
@@ -56,8 +63,17 @@ namespace {
 [[nodiscard]] ResourceAccess CompletionAccessFor(
     EffectResource resource, ResourceAccess dispatchAccess,
     bool downstreamRead) noexcept {
+    // The static casters' depth is copied into the composed map, then left
+    // readable by the receivers that leave the actors out.
+    if (resource == EffectResource::DirectionalShadowStaticCache)
+        return ResourceAccess::ShaderRead;
     if (resource == EffectResource::PresentationOutput) {
         return ResourceAccess::Present;
+    }
+    // A boundary composition is the sampled source of a native consumer, not a
+    // presented image, so it always retires readable.
+    if (resource == EffectResource::SceneComposition) {
+        return ResourceAccess::ShaderRead;
     }
     if (downstreamRead) {
         return ResourceAccess::ShaderRead;
@@ -66,9 +82,8 @@ namespace {
 }
 
 [[nodiscard]] uint32_t PlannedTransitionCount(
-    uint32_t outputCount, uint32_t physicalMultiplicity) noexcept {
-    const uint64_t count = static_cast<uint64_t>(outputCount) * 2U *
-                           physicalMultiplicity;
+    uint32_t transitionCount, uint32_t physicalMultiplicity) noexcept {
+    const uint64_t count = static_cast<uint64_t>(transitionCount) * physicalMultiplicity;
     return static_cast<uint32_t>(std::min<uint64_t>(
         count, std::numeric_limits<uint32_t>::max()));
 }
@@ -161,7 +176,7 @@ EffectPassBarrierExecution EffectPassBarrierPlan::BeginExecution(
     EffectPassBarrierExecution execution;
     if (mValid) {
         execution.mPlannedGraphTransitions = PlannedTransitionCount(
-            mManagedOutputCount, physicalMultiplicity);
+            mGraphTransitionCount, physicalMultiplicity);
     }
     return execution;
 }
@@ -172,7 +187,7 @@ EffectPassBarrierExecution EffectPassBarrierPlan::BeginOutputExecution(
     const auto* output = Find(resource);
     if (mValid && output != nullptr && output->Managed()) {
         execution.mPlannedGraphTransitions = PlannedTransitionCount(
-            1U, physicalMultiplicity);
+            2U + (output->IntermediateAccess != ResourceAccess::Undefined), physicalMultiplicity);
     }
     return execution;
 }
@@ -205,12 +220,17 @@ EffectPassBarrierPlan BuildEffectPassBarrierPlan(
             graph, passIndex, use.Resource);
         const ResourceAccess completion = CompletionAccessFor(
             use.Resource, dispatch, downstreamRead);
+        const ResourceAccess intermediate = use.Resource == EffectResource::DirectionalShadowMap
+            ? ResourceAccess::DepthAttachment
+            : use.Resource == EffectResource::DirectionalShadowStaticCache ? ResourceAccess::TransferRead
+                                                                          : ResourceAccess::Undefined;
         plan.mOutputs[plan.mOutputCount++] = {
-            use.Resource, dispatch, completion, downstreamRead};
+            use.Resource, dispatch, completion, downstreamRead, intermediate};
         if (dispatch == ResourceAccess::Undefined) {
             continue;
         }
         ++plan.mManagedOutputCount;
+        plan.mGraphTransitionCount += 2U + (intermediate != ResourceAccess::Undefined);
         if (completion == ResourceAccess::ShaderRead) {
             ++plan.mShaderReadableOutputCount;
         } else if (completion == dispatch) {
