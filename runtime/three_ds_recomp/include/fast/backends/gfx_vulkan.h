@@ -87,6 +87,13 @@ namespace Fast {
 
 class GfxWindowBackendSDL2;
 
+// HARDENED: Custom hash function for std::pair<uint64_t, uint32_t> cache key
+struct VulkanCommandBufferCacheKeyHash {
+  std::size_t operator()(const std::pair<uint64_t, uint32_t>& key) const {
+    return std::hash<uint64_t>{}(key.first) ^ (std::hash<uint32_t>{}(key.second) << 1);
+  }
+};
+
 struct VulkanShaderProgram {
     static constexpr uint32_t kAbsentAttribute = UINT32_MAX;
 
@@ -303,6 +310,28 @@ class GfxRenderingAPIVulkan final : public GfxRenderingAPI,
     };
 
     static constexpr uint32_t kFramesInFlight = 2;
+
+    // HARDENED: Level 2 Vulkan Command Buffer Cache for high-rate presentation
+    struct VulkanCommandBufferCache {
+      struct CachedBuffer {
+        VkCommandBuffer BufferHandle = VK_NULL_HANDLE;
+        uint64_t CompositionSequenceId = 0U;
+        uint32_t SwapchainImageIndex = ~0U;
+        VkPipelineLayout PipelineLayoutUsed = VK_NULL_HANDLE;
+        VkCommandPool SourceCommandPool = VK_NULL_HANDLE;
+        float LastRecordedAlpha = 1.0F;
+        bool Valid = false;
+      };
+
+      std::unordered_map<std::pair<uint64_t, uint32_t>, CachedBuffer, VulkanCommandBufferCacheKeyHash> 
+        BuffersByCompositionAndSwapchain;
+      std::mutex AccessLock;
+      uint64_t CacheHits = 0U;
+      uint64_t CacheMisses = 0U;
+      uint64_t SwapchainImageMismatches = 0U;
+      uint64_t PipelineLayoutMismatches = 0U;
+      double PushConstantUpdateSeconds = 0.0;
+    };
 
     struct TextureDescriptorKey {
         std::array<VkSampler, 4> Samplers{};
@@ -854,6 +883,16 @@ class GfxRenderingAPIVulkan final : public GfxRenderingAPI,
     uint32_t mRequestedHeight = 0;
     int mCurrentFramebuffer = 0;
     float mCurrentNoiseScale = 1.0f;
+
+    // HARDENED: Level 2 Cache and temporal state tracking
+    VulkanCommandBufferCache mCommandBufferCache;
+    uint64_t mCurrentCompositionSequenceId = 0U;
+    uint32_t mCurrentSwapchainImageIndex = 0U;
+    uint8_t mCurrentFixedSampleMultiplier = 1U;
+    float mCurrentAlpha = 1.0F;
+    VkPipelineLayout mCurrentPipelineLayout = VK_NULL_HANDLE;
+    bool mFrameUseCachedCommandBuffer = false;
+    VkCommandBuffer mCachedCommandBuffer = VK_NULL_HANDLE;
     bool mInitialized = false;
     bool mSwapchainDirty = false;
     bool mFrameActive = false;
@@ -986,6 +1025,13 @@ class GfxRenderingAPIVulkan final : public GfxRenderingAPI,
         Oot3d::SceneColorEncoding::Unknown;
     bool mTaaOutputValid = false;
     bool mTaaExecutedThisFrame = false;
+
+    // HARDENED: Phase 2 - Determine whether to skip post-processing on this frame
+    // Returns true if CACAO and Toon outline passes should be skipped this frame
+    bool ShouldSkipPostProcessingThisFrame() const;
+
+    // HARDENED: Helper method for safe command buffer reset
+    void SafeResetCommandBuffer(uint32_t frameIndex);
     Oot3d::SceneColorEncoding mTaaOutputEncodingThisFrame =
         Oot3d::SceneColorEncoding::Unknown;
     bool mTaaEffectsCompositedThisFrame = false;

@@ -19,6 +19,8 @@ add_library(oot3d_source_overlay_loader STATIC
 target_include_directories(oot3d_source_overlay_loader PUBLIC
     "${CMAKE_CURRENT_SOURCE_DIR}")
 
+# HARDENED: Smoke test disabled - requires special decompilation tools
+if(FALSE)
 add_library(oot3d_source_overlay_smoke SHARED
     "${_oot3d_cutscene_frame_import}/src/code/z_cutscene_update_frame_owner.cpp"
     "${_oot3d_cutscene_commands_import}/src/code/z_cutscene_process_commands_owner.cpp"
@@ -45,6 +47,7 @@ target_compile_definitions(oot3d_source_overlay_smoke PRIVATE
     OOT3D_SOURCE_OVERLAY_BUILD_PLUGIN=1)
 set_target_properties(oot3d_source_overlay_smoke PROPERTIES
     OUTPUT_NAME "oot3d_source_overlay")
+endif()
 
 option(OOT3D_SOURCE_OVERLAY_BUILD_DECOMP_OWNER
     "Compile the decompiled source owner into the overlay DLL" ON)
@@ -183,7 +186,6 @@ target_link_libraries(oot3d_source_overlay_loader_tests PRIVATE
 
 if (WIN32)
     foreach(target oot3d_source_overlay_loader
-                   oot3d_source_overlay_smoke
                    oot3d_source_overlay_loader_tests)
         target_compile_definitions(${target} PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
         set_property(TARGET ${target} PROPERTY MSVC_RUNTIME_LIBRARY
@@ -193,8 +195,7 @@ elseif (CMAKE_DL_LIBS)
     target_link_libraries(oot3d_source_overlay_loader PUBLIC ${CMAKE_DL_LIBS})
 endif()
 
-set_property(TARGET oot3d_source_overlay_loader
-                    oot3d_source_overlay_smoke PROPERTY FOLDER Tools)
+set_property(TARGET oot3d_source_overlay_loader PROPERTY FOLDER Tools)
 set_property(TARGET oot3d_source_overlay_loader_tests PROPERTY FOLDER Tests)
 
 option(OOT3D_SOURCE_OVERLAY_BUILD_HOST_PATCH

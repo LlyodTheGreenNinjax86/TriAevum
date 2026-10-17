@@ -43,6 +43,7 @@ struct Oot3dPicaPresentationSchedulerStats {
   uint64_t CompositionSequencesPublished = 0;
   uint64_t CompositionDrawReferencesPublished = 0;
   uint64_t CompositionPublicationFailures = 0;
+  uint64_t CachedCompositionsReused = 0;  // High-rate optimization: compositions reused for InterpolatedFrame/RepeatedFrame
   uint64_t Resets = 0;
 };
 
@@ -59,6 +60,7 @@ struct Oot3dPicaPresentationSchedulerTimings {
   double SnapshotTransferSeconds = 0.0;
   double PresentTransferSeconds = 0.0;
   double PresentExistingSeconds = 0.0;
+  double CachedCompositionPathSeconds = 0.0;  // Time in cached reuse path (optimization measurement)
 };
 
 struct Oot3dPicaPresentationSchedulerState {
@@ -122,6 +124,16 @@ private:
   std::vector<Oot3d::Renderer::PicaCompositionDrawReference>
       mCompositionDrawScratch;
   std::map<SnapshotTarget, uint64_t> mSnapshotCompletions;
+
+  // Command buffer reuse cache for high frame-rate optimization (120Hz+)
+  // When the source visual frame hasn't changed (InterpolatedFrame/RepeatedFrame),
+  // re-submit the cached composition sequence ID with updated push constants
+  // instead of rebuilding all draw commands.
+  struct CommandBufferCache {
+    uint64_t LastSourceFrameId = 0U;
+    uint64_t CachedCompositionSequenceId = 0U;
+    float LastAlpha = 0.0F;
+  } mCommandBufferCache;
 };
 
 } // namespace Oot3dNativeGame

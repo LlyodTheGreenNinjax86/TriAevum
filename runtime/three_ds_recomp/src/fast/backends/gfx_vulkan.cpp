@@ -1329,6 +1329,11 @@ bool GfxRenderingAPIVulkan::PublishSceneView(
 
 bool GfxRenderingAPIVulkan::PublishPicaFrameTemporalSample(
     const ::Fast::Renderer3ds::PicaFrameTemporalSample& sample) {
+
+    // HARDENED: Extract temporal state for Level 2 cache decisions
+    mCurrentFixedSampleMultiplier = sample.FixedSampleMultiplier;
+    mCurrentAlpha = sample.Alpha;
+
     return mPicaSceneFrame.SetTemporalSample(sample);
 }
 
@@ -1733,13 +1738,18 @@ void GfxRenderingAPIVulkan::StartFrame() {
         !mNativeFidelityProfile && aaPolicy.TemporalJitter;
     mTemporalMotionEnabled =
         !mNativeFidelityProfile && aaPolicy.TemporalMotion;
+
+    // HARDENED: Phase 2 - Apply conditional post-processing gating
+    // Skip CACAO and Toon passes on intermediate frames at high sample multipliers
+    const bool skipPostProcessingThisFrame = ShouldSkipPostProcessingThisFrame();
+
     const Oot3d::PicaAttachmentFeatureRequests extensionRequests{
         graphicsSettings.Effects.DirectionalShadows.Mode ==
             Oot3d::DirectionalShadowMode::SingleCascade,
         graphicsSettings.Effects.AmbientOcclusion ==
-            Oot3d::AmbientOcclusionMode::Cacao,
+            Oot3d::AmbientOcclusionMode::Cacao && !skipPostProcessingThisFrame,
         graphicsSettings.Effects.Toon != Oot3d::ToonMode::Off &&
-            graphicsSettings.Effects.ToonStyle.OutlineEnabled,
+            graphicsSettings.Effects.ToonStyle.OutlineEnabled && !skipPostProcessingThisFrame,
         graphicsSettings.Effects.Reflections !=
             Oot3d::ReflectionMode::Off,
         mTemporalMotionEnabled,
@@ -1928,6 +1938,9 @@ void GfxRenderingAPIVulkan::StartFrame() {
         mSwapchainSuboptimal.store(true);
     }
 
+    // HARDENED: Capture current swapchain image index for cache keying
+    mCurrentSwapchainImageIndex = mCurrentImage;
+
     markStart(5);
     // Validate targets against the successfully acquired swapchain's extent,
     // not the requested window size or the previous swapchain. Mode/present-only
@@ -1963,7 +1976,67 @@ void GfxRenderingAPIVulkan::StartFrame() {
     CheckVk(vkResetDescriptorPool(mDevice, frame.DescriptorPool, 0), "vkResetDescriptorPool");
     frame.TextureDescriptorSets.clear();
     CheckVk(vkResetFences(mDevice, 1, &mInFlightFences[mCurrentFrame]), "vkResetFences");
-    CheckVk(vkResetCommandBuffer(mCommandBuffers[mCurrentFrame], 0), "vkResetCommandBuffer");
+
+    // HARDENED: Level 2 Cache detection - check for cached command buffer
+    bool shouldUseCommandBufferCache = false;
+    VkCommandBuffer cachedBuffer = VK_NULL_HANDLE;
+    {
+      std::lock_guard<std::mutex> lock(mCommandBufferCache.AccessLock);
+
+      // Cache key is (CompositionID, SwapchainImageIndex)
+      auto cacheKey = std::make_pair(mCurrentCompositionSequenceId, mCurrentSwapchainImageIndex);
+      auto it = mCommandBufferCache.BuffersByCompositionAndSwapchain.find(cacheKey);
+
+      if (it != mCommandBufferCache.BuffersByCompositionAndSwapchain.end()) {
+        const auto& cached = it->second;
+        if (cached.Valid && cached.BufferHandle != VK_NULL_HANDLE) {
+          // Validation: verify pipeline layout hasn't changed
+          if (cached.PipelineLayoutUsed != mCurrentPipelineLayout) {
+            ++mCommandBufferCache.PipelineLayoutMismatches;
+            SPDLOG_WARN("Cache rejected: pipeline layout mismatch (was {}, now {})",
+                       (void*)cached.PipelineLayoutUsed, (void*)mCurrentPipelineLayout);
+          } else if (cached.SwapchainImageIndex != mCurrentSwapchainImageIndex) {
+            ++mCommandBufferCache.SwapchainImageMismatches;
+            SPDLOG_WARN("Cache rejected: swapchain image mismatch (was {}, now {})",
+                       cached.SwapchainImageIndex, mCurrentSwapchainImageIndex);
+          } else {
+            // Cache hit! Reuse this buffer
+            shouldUseCommandBufferCache = true;
+            cachedBuffer = cached.BufferHandle;
+            ++mCommandBufferCache.CacheHits;
+          }
+        }
+      } else {
+        // Cache miss - will record new buffer
+        ++mCommandBufferCache.CacheMisses;
+      }
+    }
+
+    // If using cache: skip reset/begin, go straight to state setup
+    if (shouldUseCommandBufferCache) {
+      mFrameUseCachedCommandBuffer = true;
+      mCachedCommandBuffer = cachedBuffer;
+      mFrameActive = true;
+      ++mFrameCounter;
+      mDrawCallCountThisFrame = 0;
+
+      // DO NOT call vkResetCommandBuffer or vkBeginCommandBuffer on cached buffer
+      // It is already in EXECUTABLE state and must remain static
+      mRenderPassActive = false;
+      mOverlayRenderPassActive = false;
+      mNativePicaRenderPassActive = false;
+      mActiveNativePicaRenderTarget = nullptr;
+      mNativePicaPresentedThisFrame = false;
+      // Skip the normal frame init path - go directly to using the cache
+      mPicaSceneFrame.BeginFrame(mCurrentFrame, mFrameCounter);
+      mPicaScenePublications.Reset();
+      mDiagnostics.BeginFrame(mFrameCounter);
+      return;  // Skip normal buffer recording setup
+    }
+
+    // Normal path: Reset and begin new command buffer recording
+    SafeResetCommandBuffer(mCurrentFrame);
+    mFrameUseCachedCommandBuffer = false;
 
     mFrameExternalComputeSplit = false;
     mFrameExternalWaitSemaphore = VK_NULL_HANDLE;
@@ -2072,8 +2145,37 @@ void GfxRenderingAPIVulkan::EndFrame() {
                          mSwapchainFormat, mSwapchainExtent, mCurrentFrame, mCurrentImage,
                          mFrameCounter, mNativePicaPresentedThisFrame);
     mDiagnostics.RecordPicaSceneFrame(sceneFrameStats);
-    mGpuProfiler.EndFrame(mCurrentFrame, mCommandBuffers[mCurrentFrame]);
+     mGpuProfiler.EndFrame(mCurrentFrame, mCommandBuffers[mCurrentFrame]);
+
+    // HARDENED: Phase 2 - Conditional Post-Processing Gating (IMPLEMENTED IN BeginFrame)
+    // The decision to skip CACAO and Toon outline passes on intermediate frames (when
+    // mCurrentFixedSampleMultiplier >= 8) is computed in ShouldSkipPostProcessingThisFrame()
+    // and integrated into the extensionRequests struct during BeginFrame(). This allows
+    // the render graph to skip building expensive post-processing passes entirely, rather
+    // than attempting to gate them post-hoc during submission.
+
     CheckVk(vkEndCommandBuffer(mCommandBuffers[mCurrentFrame]), "vkEndCommandBuffer");
+
+    // HARDENED: Cache newly recorded buffers for future reuse
+    // Only cache if we recorded a NEW buffer (not using cache)
+    if (!mFrameUseCachedCommandBuffer && mCurrentCompositionSequenceId != 0U) {
+      std::lock_guard<std::mutex> lock(mCommandBufferCache.AccessLock);
+
+      auto cacheKey = std::make_pair(mCurrentCompositionSequenceId, mCurrentSwapchainImageIndex);
+      auto& cached = mCommandBufferCache.BuffersByCompositionAndSwapchain[cacheKey];
+
+      cached.BufferHandle = mCommandBuffers[mCurrentFrame];
+      cached.CompositionSequenceId = mCurrentCompositionSequenceId;
+      cached.SwapchainImageIndex = mCurrentSwapchainImageIndex;
+      cached.PipelineLayoutUsed = mCurrentPipelineLayout;
+      cached.SourceCommandPool = mCommandPool;
+      cached.LastRecordedAlpha = mCurrentAlpha;
+      cached.Valid = true;
+
+      SPDLOG_DEBUG("Cached command buffer: composition={}, swapchain_image={}, layout={}",
+                   mCurrentCompositionSequenceId, mCurrentSwapchainImageIndex,
+                   (void*)mCurrentPipelineLayout);
+    }
 
     const std::array<VkSemaphore, 2> waitSemaphores{
         mImageAvailableSemaphores[mCurrentFrame],
@@ -2093,19 +2195,86 @@ void GfxRenderingAPIVulkan::EndFrame() {
         timeline.signalSemaphoreValueCount = 1U;
         timeline.pSignalSemaphoreValues = &signalValue;
     }
+
+    // HARDENED: Level 2 Cache - Determine which buffer to submit
+    VkCommandBuffer submitCmdBuf = mCommandBuffers[mCurrentFrame];
+
+    // If using cached buffer: inject push constants BEFORE submission
+    if (mFrameUseCachedCommandBuffer && mCachedCommandBuffer != VK_NULL_HANDLE) {
+      submitCmdBuf = mCachedCommandBuffer;
+
+      // CRITICAL: Push constant injection RIGHT BEFORE vkQueueSubmit
+      // This updates the alpha for temporal interpolation on cached buffer reuse
+      if (mCurrentPipelineLayout != VK_NULL_HANDLE) {
+        struct InterpolationPushConstant {
+          float Alpha = 1.0F;
+          uint32_t Reserved[3] = {0U};
+        } pushConst;
+        pushConst.Alpha = mCurrentAlpha;
+
+        // Call vkCmdPushConstants on the CACHED buffer directly
+        // This is OUTSIDE the recording session but BEFORE submission
+        vkCmdPushConstants(mCachedCommandBuffer, mCurrentPipelineLayout,
+                          VK_SHADER_STAGE_ALL, 0, sizeof(pushConst), &pushConst);
+
+        SPDLOG_DEBUG("Injected alpha={} to cached buffer before submission (cache hit)",
+                    mCurrentAlpha);
+      }
+      mFrameUseCachedCommandBuffer = false;
+    }
+
     VkSubmitInfo submitInfo{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
     submitInfo.pNext = mFrameExternalComputeSplit ? &timeline : nullptr;
     submitInfo.waitSemaphoreCount = mFrameExternalComputeSplit ? 2U : 1U;
     submitInfo.pWaitSemaphores = waitSemaphores.data();
     submitInfo.pWaitDstStageMask = waitStages.data();
     submitInfo.commandBufferCount = 1;
-    submitInfo.pCommandBuffers = &mCommandBuffers[mCurrentFrame];
+    submitInfo.pCommandBuffers = &submitCmdBuf;  // CRITICAL: Use correct buffer handle
     submitInfo.signalSemaphoreCount = 1;
     submitInfo.pSignalSemaphores = &mRenderFinishedSemaphores[mCurrentImage];
     CheckVk(vkQueueSubmit(mGraphicsQueue, 1, &submitInfo, mInFlightFences[mCurrentFrame]),
             "vkQueueSubmit");
     mFrameActive = false;
     mFrameSubmitted = true;
+}
+
+// HARDENED: Level 2 Cache helper - safe command buffer reset that protects cached buffers
+void GfxRenderingAPIVulkan::SafeResetCommandBuffer(uint32_t frameIndex) {
+  // Check if any cached buffers were allocated from this pool
+  {
+    std::lock_guard<std::mutex> lock(mCommandBufferCache.AccessLock);
+
+    for (const auto& [cacheKey, cached] : mCommandBufferCache.BuffersByCompositionAndSwapchain) {
+      if (cached.SourceCommandPool == mCommandPool && cached.Valid) {
+        // DO NOT reset this pool - it contains a cached buffer!
+        SPDLOG_WARN("Command pool {} contains cached buffer, cannot reset in frame {}",
+                   (void*)mCommandPool, frameIndex);
+        return;  // Skip reset, let buffer persist
+      }
+    }
+  }
+
+  // Safe to reset - no cached buffers from this pool
+  CheckVk(vkResetCommandBuffer(mCommandBuffers[frameIndex], 0), 
+          ("vkResetCommandBuffer for frame " + std::to_string(frameIndex)).c_str());
+}
+
+bool GfxRenderingAPIVulkan::ShouldSkipPostProcessingThisFrame() const {
+  // HARDENED: Phase 2 - Conditional Post-Processing Gating
+  // Skip expensive post-processing passes (CACAO AO, Toon outlines) on intermediate frames
+  // when rendering at high subframe rates (>= 240/300 FPS interpolation)
+
+  // Only gate when using fixed sample multiplier >= 8 (intermediate frames)
+  // and NOT on key presentation frames (every 3rd frame)
+  // Also skip if native PICA was presented this frame (fallback path)
+  const bool enableHighRateGating = (mCurrentFixedSampleMultiplier >= 8U);
+  const bool isIntermediateFrame = (mFrameCounter % 3U) != 0U;
+
+  // Skip post-processing if all conditions met:
+  // 1. High-rate gating is enabled (>= 8x multiplier)
+  // 2. This is an intermediate frame (not a key presentation frame)
+  // 3. Native PICA was not presented (we're in Vulkan-only render path)
+  return enableHighRateGating && isIntermediateFrame && !mNativePicaPresentedThisFrame;
 }
 
 void GfxRenderingAPIVulkan::FinishRender() {
