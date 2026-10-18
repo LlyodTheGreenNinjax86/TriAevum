@@ -277,7 +277,7 @@ const Renderer3ds::PicaWaterTextureCatalog* GfxRenderingAPIVulkan::WaterTextureC
     if (!mWaterTextureCatalogLoaded) {
         mWaterTextureCatalogLoaded = true;
         if (const char* path = std::getenv("TRIAEVUM_WATER_TEXTURE_CATALOG"); path != nullptr && *path != '\0') {
-            std::ifstream stream(std::filesystem::u8path(path), std::ios::binary);
+            std::ifstream stream(std::filesystem::path(reinterpret_cast<const char*>(path)), std::ios::binary);
             const std::string text((std::istreambuf_iterator<char>(stream)), std::istreambuf_iterator<char>());
             mWaterTextureCatalog = Renderer3ds::PicaWaterTextureCatalog::Parse(text);
             if (mWaterTextureCatalog)
@@ -775,6 +775,12 @@ bool GfxRenderingAPIVulkan::PreparePicaSequenceDraw(
 bool GfxRenderingAPIVulkan::SubmitPicaDraw(
     const GfxNativePicaDrawView& draw, std::string* error) {
     Renderer3ds::SlowStepScope slowStep("pica_draw");
+
+    bool skipPostProcessingThisSubframe = false;
+    if (mCurrentFixedSampleMultiplier >= 8U && (mFrameCounter % 3 != 0) && !mNativePicaPresentedThisFrame) {
+        skipPostProcessingThisSubframe = true;
+    }
+
     try {
         const bool collectCpuTimings = mDiagnostics.Enabled();
         using CpuClock = std::chrono::steady_clock;
@@ -1287,6 +1293,14 @@ bool GfxRenderingAPIVulkan::SubmitPicaDraw(
         if (graphicsSettings.Effects.SurfaceLighting == Oot3d::SurfaceLightingMode::NativePbr &&
             pbrMaterial == nullptr)
             surfaceLighting.reset();
+
+        Oot3d::GraphicsSettings modifiedGraphicsSettings = graphicsSettings;
+        if (skipPostProcessingThisSubframe) {
+            modifiedGraphicsSettings.Effects.AmbientOcclusion = Oot3d::AmbientOcclusionMode::Off;
+            modifiedGraphicsSettings.Effects.Toon = Oot3d::ToonMode::Off;
+            modifiedGraphicsSettings.Effects.ToonStyle.OutlineEnabled = false;
+        }
+
         // AO texture relief reads the one texture whose colour the draw's TEV
         // passes to its output (never a bump or shadow unit); several colour
         // textures leave the draw without relief rather than guess a layer.
@@ -1360,10 +1374,16 @@ bool GfxRenderingAPIVulkan::SubmitPicaDraw(
         bool variantCacheHit = false;
         const auto& shaderVariant =
             mPicaShaderPipelineCache.Resolve(
+<<<<<<< Updated upstream
                 variantRequest, variantEffects, &variantCacheHit);
         // Cache hits too: the recording is of requests, not of misses.
         mPicaVariantRequestRecorder.Observe(draw.CanonicalPipelineId, variantRequest, variantEffects,
                                             graphicsSettings, mFrameGraphicsSettingsRevision, shaderVariant);
+=======
+                variantRequest,
+                nativeMemoryOnly ? nativeMemoryEffects : modifiedGraphicsSettings.Effects,
+                &variantCacheHit);
+>>>>>>> Stashed changes
 #if defined(TRIAEVUM_RENDERER_DEVELOPER_TOOLS)
         if (surfaceCandidate && surfaceDebug.Tracing()) {
             // One candidate: its native colour computation and what Modern did.
